@@ -156,6 +156,9 @@ AppPackages/
 
 # Others
 sql/
+# case-insensitive filesystems (macOS default) match "sql/" above against our
+# Algo/Storages/Sql source folder - explicitly un-ignore it
+!Algo/Storages/Sql/
 *.Cache
 ClientBin/
 [Ss]tyle[Cc]op.*
