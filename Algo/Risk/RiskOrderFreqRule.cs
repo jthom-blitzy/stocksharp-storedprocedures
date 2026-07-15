@@ -3,6 +3,15 @@ namespace StockSharp.Algo.Risk;
 /// <summary>
 /// Risk-rule, tracking orders placing frequency.
 /// </summary>
+/// <remarks>
+/// dbo.usp_ValidatePreTradeRisk (Database/002_StoredProcedures.sql) ports this
+/// same Count/Interval check, but not the same algorithm: this class buckets
+/// time into non-overlapping windows (a burst that straddles a bucket
+/// boundary can dodge the limit), while the SQL version runs a true rolling
+/// COUNT(*) over "now minus Interval seconds". Same configuration can produce
+/// a different accept/reject answer for the same burst pattern depending on
+/// which one evaluates it.
+/// </remarks>
 [Display(
 	ResourceType = typeof(LocalizedStrings),
 	Name = LocalizedStrings.OrderFreqKey,
