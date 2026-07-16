@@ -236,6 +236,80 @@ public class CommissionTests
 	}
 
 	[TestMethod]
+	public void EstimateVsActualCommissionDivergence()
+	{
+		var now = DateTime.UtcNow;
+
+		// Canonical shared commission rate (RiskLimits.commission_rate seed = 0.0005;
+		// AAP 0.6.2 / LEGACY_LAYER.md:L63). The SQL pre-trade gate ESTIMATES commission
+		// pre-fill as qty * estPrice * rate; the C# side computes the ACTUAL commission
+		// post-fill from the executed trade. Same rate, different price basis => they do
+		// NOT agree. This is intentional (different-by-design), not a regression.
+		const decimal rate = 0.0005m;
+
+		const decimal orderVolume = 1000m;
+		const decimal estPrice = 100m;   // price known pre-fill (order/estimate price)
+		const decimal fillPrice = 105m;  // actual execution price (differs from estimate)
+
+		// SQL-style PRE-FILL ESTIMATE for a fresh position (existingNotional = 0):
+		//   estimate = existingNotional*rate + qty*estPrice*rate  =>  qty*estPrice*rate
+		var estimate = orderVolume * estPrice * rate;                // 1000 * 100 * 0.0005 = 50
+
+		// C#-style ACTUAL POST-FILL commission basis, computed off the executed trade
+		// via the (unchanged) CommissionTradePriceRule: TradePrice * TradeVolume * rate.
+		var actualRule = new CommissionTradePriceRule { Value = rate };
+		var actual = actualRule.Process(CreateTradeMessage(fillPrice, orderVolume, Inc(ref now)));
+		actual.AssertEqual(orderVolume * fillPrice * rate);          // 1000 * 105 * 0.0005 = 52.5
+
+		// DIFFERENT-BY-DESIGN: with fillPrice != estPrice the two DO NOT agree.
+		(actual != estimate).AssertTrue();                           // 52.5 != 50
+
+		// SHARED CANONICAL THRESHOLD: when the fill matches the estimate price, the single
+		// shared rate makes the two agree exactly (proving they diverge only on price basis,
+		// not on the threshold/rate).
+		var actualAtEstPrice = new CommissionTradePriceRule { Value = rate }
+			.Process(CreateTradeMessage(estPrice, orderVolume, Inc(ref now)));
+		actualAtEstPrice.AssertEqual(estimate);                      // 1000 * 100 * 0.0005 = 50
+	}
+
+	[TestMethod]
+	public void SqlPreFillCommissionEstimate()
+	{
+		var now = DateTime.UtcNow;
+
+		// Documents the SQL pre-trade gate's PRE-FILL commission ESTIMATE formula from
+		// usp_ValidatePreTradeRisk (AAP 0.6.2): existingNotional*rate + qty*estPrice*rate.
+		// The gate must GUESS commission before the fill because the real commission is only
+		// known once the order executes. This is the SQL "estimate" half of the
+		// different-by-design divergence asserted in EstimateVsActualCommissionDivergence.
+		const decimal rate = 0.0005m;              // canonical shared rate (seed commission_rate)
+
+		const decimal existingQty = 200m;          // shares already held
+		const decimal existingPrice = 90m;         // avg price of the existing position
+		const decimal orderQty = 1000m;            // new order quantity
+		const decimal estPrice = 100m;             // pre-fill estimate price for the new order
+
+		// Full SQL estimate: the existing position's notional is folded in at the same rate.
+		var existingNotional = existingQty * existingPrice;          // 200 * 90 = 18000
+		var estimate = existingNotional * rate + orderQty * estPrice * rate;
+		estimate.AssertEqual(59m);                                   // 18000*0.0005 + 100000*0.0005 = 9 + 50 = 59
+
+		// The C# ACTUAL commission is unknowable pre-fill: the trade-based rule returns null
+		// for an ORDER message (no trade has executed yet) - which is exactly why SQL estimates.
+		var actualRule = new CommissionTradePriceRule { Value = rate };
+		var preFill = actualRule.Process(CreateOrderMessage(estPrice, orderQty, Inc(ref now)));
+		preFill.AssertNull();
+
+		// Even when the fill lands EXACTLY at the estimate price, the ACTUAL reflects ONLY the
+		// executed trade's notional (orderQty * fillPrice * rate) and never the pre-existing
+		// position that the SQL estimate folded in - so estimate != actual by design.
+		const decimal fillPrice = 100m;
+		var actual = actualRule.Process(CreateTradeMessage(fillPrice, orderQty, Inc(ref now)));
+		actual.AssertEqual(orderQty * fillPrice * rate);             // 1000 * 100 * 0.0005 = 50
+		(actual != estimate).AssertTrue();                           // 50 != 59
+	}
+
+	[TestMethod]
 	public void SecurityIdRule()
 	{
 		var now = DateTime.UtcNow;

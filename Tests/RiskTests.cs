@@ -736,7 +736,12 @@ public class RiskTests : BaseTestClass
 			LocalTime = startTime.AddSeconds(6)
 		};
 
-		rule.ProcessMessage(fourthOrderMsg).AssertFalse();
+		// Rolling-count semantics: the trailing Interval window at t+6s still contains the three
+		// prior orders (t+0s, t+1s, t+5s), so this order also trips (recentCount 3 + 1 >= Count 3).
+		// The former fixed-window rule reset its bucket once the third order tripped and would have
+		// returned false here; the rolling count is a deliberate, at-least-as-strict tightening and
+		// keeps rejecting while the window stays saturated.
+		rule.ProcessMessage(fourthOrderMsg).AssertTrue();
 	}
 
 	[TestMethod]

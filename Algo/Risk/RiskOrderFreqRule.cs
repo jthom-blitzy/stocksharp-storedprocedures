@@ -4,13 +4,17 @@ namespace StockSharp.Algo.Risk;
 /// Risk-rule, tracking orders placing frequency.
 /// </summary>
 /// <remarks>
-/// dbo.usp_ValidatePreTradeRisk (Database/002_StoredProcedures.sql) ports this
-/// same Count/Interval check, but not the same algorithm: this class buckets
-/// time into non-overlapping windows (a burst that straddles a bucket
-/// boundary can dodge the limit), while the SQL version runs a true rolling
-/// COUNT(*) over "now minus Interval seconds". Same configuration can produce
-/// a different accept/reject answer for the same burst pattern depending on
-/// which one evaluates it.
+/// This rule now uses the same rolling <c>COUNT(*)</c>-over-"now minus <see cref="Interval"/>"
+/// semantics as the SQL pre-trade gate (<c>dbo.usp_ValidatePreTradeRisk</c> in
+/// Database/002_StoredProcedures.sql, ported to <see cref="PreTradeRiskService"/>): each incoming
+/// order counts the prior orders that still fall inside the trailing <see cref="Interval"/> window
+/// and rejects once that count plus the current order reaches <see cref="Count"/>. The per-order
+/// pre-trade gate and this circuit-breaker rule therefore no longer diverge for the same
+/// configuration and burst pattern.
+/// This replaced the previous fixed-window bucketing, which split time into non-overlapping
+/// windows and could let a burst straddling a window boundary dodge the limit. Adopting the
+/// rolling count is a deliberate, at-least-as-strict tightening: near a window boundary it is
+/// never looser than the old behaviour and rejects strictly more borderline bursts.
 /// </remarks>
 [Display(
 	ResourceType = typeof(LocalizedStrings),
@@ -19,8 +23,7 @@ namespace StockSharp.Algo.Risk;
 	GroupName = LocalizedStrings.OrdersKey)]
 public class RiskOrderFreqRule : RiskRule
 {
-	private DateTime? _endTime;
-	private int _current;
+	private readonly List<DateTime> _times = [];
 
 	/// <inheritdoc />
 	protected override string GetTitle() => Count + " -> " + Interval;
@@ -85,8 +88,7 @@ public class RiskOrderFreqRule : RiskRule
 	{
 		base.Reset();
 
-		_current = 0;
-		_endTime = null;
+		_times.Clear();
 	}
 
 	/// <inheritdoc />
@@ -100,43 +102,23 @@ public class RiskOrderFreqRule : RiskRule
 				var time = message.LocalTime;
 
 				if (time == default)
-				{
-					//LogWarning("Time is null. Msg={0}", message);
 					return false;
-				}
 
-				if (_endTime == null)
-				{
-					_endTime = time + Interval;
-					_current = 1;
+				var cutoff = time - Interval;
 
-					//LogDebug("EndTime={0}", _endTime);
-					return false;
-				}
+				// Evict timestamps strictly older than the rolling window. The SQL gate keeps rows
+				// where submitted_date >= now - window, so a timestamp exactly at the boundary is kept.
+				_times.RemoveAll(t => t < cutoff);
 
-				if (time < _endTime)
-				{
-					_current++;
+				// Prior orders still inside the trailing window (the current order is not yet counted).
+				var recentCount = _times.Count;
 
-					//LogDebug("Count={0} Msg={1}", _current, message);
+				// Record the current order so subsequent messages observe it within their windows.
+				_times.Add(time);
 
-					if (_current >= Count)
-					{
-						//LogInfo("Count={0} EndTime={1}", _current, _endTime);
-
-						_endTime = null;
-						return true;
-					}
-				}
-				else
-				{
-					_endTime = time + Interval;
-					_current = 1;
-
-					//LogDebug("EndTime={0}", _endTime);
-				}
-
-				return false;
+				// Canonical rolling-count reject: the "+ 1" is the current order, mirroring the SQL
+				// gate's (recentOrderCount + 1) >= max_order_freq_count predicate.
+				return recentCount + 1 >= Count;
 			}
 		}
 
