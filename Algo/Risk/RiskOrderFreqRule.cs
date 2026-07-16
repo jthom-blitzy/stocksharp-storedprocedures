@@ -4,13 +4,18 @@ namespace StockSharp.Algo.Risk;
 /// Risk-rule, tracking orders placing frequency.
 /// </summary>
 /// <remarks>
-/// dbo.usp_ValidatePreTradeRisk (Database/002_StoredProcedures.sql) ports this
-/// same Count/Interval check, but not the same algorithm: this class buckets
-/// time into non-overlapping windows (a burst that straddles a bucket
-/// boundary can dodge the limit), while the SQL version runs a true rolling
-/// COUNT(*) over "now minus Interval seconds". Same configuration can produce
-/// a different accept/reject answer for the same burst pattern depending on
-/// which one evaluates it.
+/// Canonical, single source of truth for the order-frequency limit. Both risk
+/// enforcement patterns consume THIS definition: the portfolio-wide
+/// <see cref="RiskManager"/> circuit breaker (fed the live message stream) and
+/// the per-order <see cref="PreTradeRiskService"/> pre-trade gate (fed a
+/// prospective order together with the rolling order count it reads from SQL
+/// Server). The algorithm is a true rolling window: an order counts while its
+/// timestamp lies within [now - Interval, now], and the incoming order is
+/// rejected when the rolling count (including itself) meets or exceeds Count.
+/// This replaces the earlier fixed, non-overlapping window, which admitted a
+/// burst straddling a bucket boundary; the rolling window is strictly stricter
+/// near a boundary, so under the stricter-wins reconciliation rule it is the
+/// canonical algorithm.
 /// </remarks>
 [Display(
 	ResourceType = typeof(LocalizedStrings),
@@ -19,8 +24,9 @@ namespace StockSharp.Algo.Risk;
 	GroupName = LocalizedStrings.OrdersKey)]
 public class RiskOrderFreqRule : RiskRule
 {
-	private DateTime? _endTime;
-	private int _current;
+	// Rolling-window state: timestamps of the orders that currently fall within
+	// the [now - Interval, now] window (see ProcessMessage for the algorithm).
+	private readonly List<DateTime> _recent = [];
 
 	/// <inheritdoc />
 	protected override string GetTitle() => Count + " -> " + Interval;
@@ -85,8 +91,7 @@ public class RiskOrderFreqRule : RiskRule
 	{
 		base.Reset();
 
-		_current = 0;
-		_endTime = null;
+		_recent.Clear();
 	}
 
 	/// <inheritdoc />
@@ -100,47 +105,25 @@ public class RiskOrderFreqRule : RiskRule
 				var time = message.LocalTime;
 
 				if (time == default)
-				{
-					//LogWarning("Time is null. Msg={0}", message);
 					return false;
-				}
 
-				if (_endTime == null)
-				{
-					_endTime = time + Interval;
-					_current = 1;
+				// RECONCILIATION (AAP 0.6.3): the previous algorithm bucketed time into
+				// fixed, non-overlapping windows, so a burst straddling a bucket boundary
+				// could dodge the limit. This is now a TRUE ROLLING window that matches the
+				// SQL usp_ValidatePreTradeRisk RULE 4 (COUNT of orders within "now - window").
+				// Rolling is strictly stricter near a boundary, so under the stricter-wins
+				// hard constraint it is the canonical algorithm. This class is the single
+				// source of truth consumed by both the RiskManager circuit breaker and the
+				// PreTradeRiskService gate. The ">=" reject boundary is preserved (never ">").
+				_recent.RemoveAll(t => t <= time - Interval);
+				_recent.Add(time);
 
-					//LogDebug("EndTime={0}", _endTime);
-					return false;
-				}
-
-				if (time < _endTime)
-				{
-					_current++;
-
-					//LogDebug("Count={0} Msg={1}", _current, message);
-
-					if (_current >= Count)
-					{
-						//LogInfo("Count={0} EndTime={1}", _current, _endTime);
-
-						_endTime = null;
-						return true;
-					}
-				}
-				else
-				{
-					_endTime = time + Interval;
-					_current = 1;
-
-					//LogDebug("EndTime={0}", _endTime);
-				}
-
-				return false;
+				return _recent.Count >= Count;
 			}
-		}
 
-		return false;
+			default:
+				return false;
+		}
 	}
 
 	/// <inheritdoc />

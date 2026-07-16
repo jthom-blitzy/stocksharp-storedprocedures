@@ -4,19 +4,21 @@ namespace StockSharp.Algo.Risk;
 /// The risks control manager.
 /// </summary>
 /// <remarks>
-/// Since the StockSharpLegacy SQL layer was added (see /Database,
-/// Algo/Storages/Sql, and LEGACY_LAYER.md at the repo root), this is no
-/// longer the only place pre-trade risk is enforced, and the two don't cover
-/// the same rules. This engine is a portfolio-wide circuit breaker: a
-/// triggered rule takes a global action (ClosePositions/StopTrading/
-/// CancelOrders via RiskMessageAdapter) rather than rejecting the one order
-/// that tripped it. dbo.usp_ValidatePreTradeRisk is the opposite model - a
-/// classic per-order gate that rejects a single order before it's accepted,
-/// and it also enforces two limits (order notional value, daily traded
-/// volume) that have no rule class here at all. Nothing in this codebase
-/// reconciles the two, which is the point - a caller going through
-/// SqlLegacyOrderGateway gets SQL-side coverage only; a caller going through
-/// this RiskManager gets C#-side coverage only.
+/// Portfolio-wide circuit breaker. It evaluates the live message stream against
+/// its configured <see cref="IRiskRule"/> set and, when a rule trips, drives a
+/// global action (close positions / stop trading / cancel orders) through the
+/// <see cref="RiskMessageAdapter"/>. Following the risk consolidation, every rule
+/// is defined exactly once as an <see cref="IRiskRule"/> subclass — the single
+/// source of truth — and there are two distinct, never-merged enforcement
+/// patterns that consume those same definitions: this stream-based circuit
+/// breaker (which reacts to live state and takes account-level action) and the
+/// per-order <see cref="PreTradeRiskService"/> pre-trade gate (which accepts or
+/// rejects one prospective order). The order-frequency, notional-value and
+/// daily-volume checks now all exist as first-class C# rules
+/// (<see cref="RiskOrderFreqRule"/> with rolling-window semantics,
+/// <see cref="RiskOrderValueRule"/> and <see cref="RiskDailyVolumeRule"/>), so
+/// the two patterns can never diverge in rule definition — only in the input
+/// each supplies (live position/stream vs. a prospective order).
 /// </remarks>
 public class RiskManager : BaseLogReceiver, IRiskManager
 {

@@ -736,7 +736,12 @@ public class RiskTests : BaseTestClass
 			LocalTime = startTime.AddSeconds(6)
 		};
 
-		rule.ProcessMessage(fourthOrderMsg).AssertFalse();
+		// Canonical rolling-window semantics: at +6s all four orders (0s, 1s, 5s, 6s)
+		// still fall inside the 10s window, so the rolling count (4) meets-or-exceeds
+		// the limit (3) and the rule keeps rejecting. The former fixed, non-overlapping
+		// window reset after tripping and would have admitted this order; the rolling
+		// window is strictly stricter near a boundary (stricter-wins reconciliation).
+		rule.ProcessMessage(fourthOrderMsg).AssertTrue();
 	}
 
 	[TestMethod]
@@ -956,7 +961,7 @@ public class RiskTests : BaseTestClass
 		IRiskRuleProvider provider = new InMemoryRiskRuleProvider();
 
 		var rules = provider.All.ToList();
-		rules.Count.AssertEqual(15);
+		rules.Count.AssertEqual(17);
 
 		rules.Count(t => t == typeof(RiskPnLRule)).AssertEqual(1);
 		rules.Count(t => t == typeof(RiskPositionSizeRule)).AssertEqual(1);
@@ -965,6 +970,8 @@ public class RiskTests : BaseTestClass
 		rules.Count(t => t == typeof(RiskSlippageRule)).AssertEqual(1);
 		rules.Count(t => t == typeof(RiskOrderPriceRule)).AssertEqual(1);
 		rules.Count(t => t == typeof(RiskOrderVolumeRule)).AssertEqual(1);
+		rules.Count(t => t == typeof(RiskOrderValueRule)).AssertEqual(1);
+		rules.Count(t => t == typeof(RiskDailyVolumeRule)).AssertEqual(1);
 		rules.Count(t => t == typeof(RiskOrderFreqRule)).AssertEqual(1);
 		rules.Count(t => t == typeof(RiskOrderErrorRule)).AssertEqual(1);
 		rules.Count(t => t == typeof(RiskOrderCommissionRule)).AssertEqual(1);

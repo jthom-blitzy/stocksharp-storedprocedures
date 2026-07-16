@@ -4,8 +4,10 @@
 	Origin: this was split out of the old "OMS_Core" database around the time
 	positions moved off the nightly batch process and onto real-time trade
 	inserts. Portfolio/Position/Order/Trade tables below are the tables the
-	app tier actually depends on. RiskLimits backs usp_ValidatePreTradeRisk
-	(see 002_StoredProcedures.sql).
+	app tier actually depends on. RiskLimits now backs the C# pre-trade risk
+	gate PreTradeRiskService (StockSharp.Algo.Risk, Algo/Risk/PreTradeRiskService.cs);
+	the SQL stored procedures that used to read this table were removed when the
+	risk/position business logic moved to C# (see /LEGACY_LAYER.md).
 
 	Run order: 001 -> 002 -> 003 -> 004 (optional seed data).
 */
@@ -73,7 +75,7 @@ GO
 -- RiskLimits
 --
 -- One row can be scoped to a portfolio, a security, or both (the more
--- specific row wins - see usp_ValidatePreTradeRisk). A row with both columns
+-- specific row wins - see PreTradeRiskService in Algo/Risk). A row with both columns
 -- NULL is meaningless (which single order would it even apply to?) so it's
 -- blocked by CK_RiskLimits_scope.
 --
@@ -93,9 +95,9 @@ CREATE TABLE dbo.RiskLimits
 
 	max_order_price			DECIMAL(18,4)		NULL,	-- ceiling on a single order's price   (mirrors RiskOrderPriceRule)
 	max_order_qty			DECIMAL(18,4)		NULL,	-- ceiling on a single order's qty     (mirrors RiskOrderVolumeRule)
-	max_order_value			DECIMAL(18,4)		NULL,	-- ceiling on qty*price notional       (SQL-side only, no C# equivalent)
+	max_order_value			DECIMAL(18,4)		NULL,	-- ceiling on qty*price notional       (mirrors RiskOrderValueRule)
 	max_position_size		DECIMAL(18,4)		NULL,	-- ceiling on abs(position) post-fill  (mirrors RiskPositionSizeRule)
-	max_daily_volume		DECIMAL(18,4)		NULL,	-- ceiling on cumulative qty per day   (SQL-side only, no C# equivalent)
+	max_daily_volume		DECIMAL(18,4)		NULL,	-- ceiling on cumulative qty per day   (mirrors RiskDailyVolumeRule)
 	max_order_freq_count	INT					NULL,	-- max orders per max_order_freq_window_sec (mirrors RiskOrderFreqRule.Count)
 	max_order_freq_window_sec INT				NULL,	-- window length in seconds                 (mirrors RiskOrderFreqRule.Interval)
 	max_commission_total	DECIMAL(18,4)		NULL,	-- ceiling on cumulative commission    (mirrors RiskCommissionRule/RiskOrderCommissionRule)
@@ -190,11 +192,11 @@ GO
 -- ============================================================================
 -- Positions
 --
--- unrealized_pnl is intentionally NOT maintained by usp_RecalculatePositionOnTrade
--- or the Trades trigger - doing that correctly needs a live market price, which
--- neither the trigger nor the proc has access to. It's refreshed separately by
--- the EOD mark-to-market batch (outside the scope of this brief). Treat this
--- column as stale/EOD-only, not real-time.
+-- unrealized_pnl is intentionally NOT maintained by the C# position recompute
+-- (PositionRecalculationService in Algo/Risk) - doing that correctly needs a live
+-- market price, which the recompute path does not have access to. It's refreshed
+-- separately by the EOD mark-to-market batch (outside the scope of this brief).
+-- Treat this column as stale/EOD-only, not real-time.
 -- ============================================================================
 IF OBJECT_ID(N'dbo.Positions', N'U') IS NOT NULL DROP TABLE dbo.Positions;
 GO

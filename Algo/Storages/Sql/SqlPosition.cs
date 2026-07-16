@@ -24,6 +24,6 @@ public class SqlPosition
 	/// <summary>Stale outside of the EOD mark-to-market batch - do not treat as live.</summary>
 	public decimal UnrealizedPnL { get; init; }
 
-	/// <summary>Last time this row was written by usp_RecalculatePositionOnTrade.</summary>
+	/// <summary>Last time this row was written by <see cref="StockSharp.Algo.Risk.PositionRecalculationService"/> (C#).</summary>
 	public DateTime UpdatedDate { get; init; }
 }
