@@ -49,6 +49,7 @@
     <FSharpControlTaskSeqVer>0.*</FSharpControlTaskSeqVer>
     <FSharpPlusVer>1.*</FSharpPlusVer>
     <MsSqlClientVer>6.*</MsSqlClientVer>
+    <NpgsqlVer>10.0.*</NpgsqlVer>
     <NethereumSignerVer>5.*</NethereumSignerVer>
     <AvaloniaVer>11.*</AvaloniaVer>
     <NewtonsoftVer>13.*</NewtonsoftVer>

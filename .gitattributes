@@ -1,0 +1,13 @@
+# Git LFS: large QA screen recordings (AAP QA-evidence rule, 0.7.2).
+# Scoped intentionally to QA/recordings/ binary formats ONLY. There is no
+# global (`* text=auto`) or repo-wide rule here, so line-ending and diff
+# handling for the rest of the existing StockSharp tree is left unchanged
+# (minimal-change discipline). The small QA screenshots (QA/screenshots/*.png)
+# and any timestamped text transcripts (*.txt/*.md/*.log) are deliberately NOT
+# tracked by LFS so they remain ordinary, inline-viewable Git objects.
+QA/recordings/*.mp4  filter=lfs diff=lfs merge=lfs -text
+QA/recordings/*.mov  filter=lfs diff=lfs merge=lfs -text
+QA/recordings/*.webm filter=lfs diff=lfs merge=lfs -text
+QA/recordings/*.mkv  filter=lfs diff=lfs merge=lfs -text
+QA/recordings/*.gif  filter=lfs diff=lfs merge=lfs -text
+QA/recordings/*.zip  filter=lfs diff=lfs merge=lfs -text
