@@ -1,14 +1,17 @@
 /*
 	StockSharpLegacy - triggers
 	----------------------------------------
-	trg_Trades_PositionRecalc - fires on every Trades insert and drives the
-	position/P&L recalculation. This is the trigger that makes
-	usp_RecalculatePositionOnTrade "automatic" - see the warning on that
-	proc in 002_StoredProcedures.sql about not calling it a second time.
-
 	trg_Orders_StatusAudit - cascades order status changes into
 	OrderStatusHistory. Narrow on purpose: only fires when status actually
-	changed, not on every column update.
+	changed, not on every column update. Pure audit CRUD - no risk thresholds,
+	no accept/reject decisions, no P&L math - so it stays in SQL.
+
+	The old position-recalc trigger on dbo.Trades was removed in the risk/position
+	consolidation: position and realized-P&L recompute now happens exactly once
+	per trade in the C# PositionRecalculationService (Algo/Risk), called by
+	SqlLegacyOrderGateway.RecordTradeAsync after the Trades insert. Moving it to
+	a single explicit C# call also removed the old double-count hazard. See
+	/LEGACY_LAYER.md.
 */
 
 USE StockSharpLegacy;
@@ -16,47 +19,6 @@ GO
 
 SET ANSI_NULLS ON;
 SET QUOTED_IDENTIFIER ON;
-GO
-
--- ============================================================================
--- trg_Trades_PositionRecalc
---
--- Cursor-based on purpose (or at least, that's the polite way to put it -
--- this was written back when multi-row trade inserts were rare enough that
--- nobody optimized for them, and it's never been revisited). Processes
--- inserted rows oldest-first so avg_price/realized_pnl land the same as if
--- the trades had been inserted one at a time.
--- ============================================================================
-CREATE OR ALTER TRIGGER dbo.trg_Trades_PositionRecalc
-ON dbo.Trades
-AFTER INSERT
-AS
-BEGIN
-	SET NOCOUNT ON;
-
-	DECLARE @order_id BIGINT, @qty DECIMAL(18,4), @price DECIMAL(18,4);
-
-	DECLARE trade_cursor CURSOR LOCAL FAST_FORWARD FOR
-		SELECT order_id, qty, price
-		FROM inserted
-		ORDER BY executed_date ASC, trade_id ASC;
-
-	OPEN trade_cursor;
-	FETCH NEXT FROM trade_cursor INTO @order_id, @qty, @price;
-
-	WHILE @@FETCH_STATUS = 0
-	BEGIN
-		EXEC dbo.usp_RecalculatePositionOnTrade
-			@order_id = @order_id,
-			@trade_qty = @qty,
-			@trade_price = @price;
-
-		FETCH NEXT FROM trade_cursor INTO @order_id, @qty, @price;
-	END
-
-	CLOSE trade_cursor;
-	DEALLOCATE trade_cursor;
-END
 GO
 
 -- ============================================================================
