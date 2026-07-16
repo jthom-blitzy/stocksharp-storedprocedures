@@ -4,8 +4,11 @@
 	Origin: this was split out of the old "OMS_Core" database around the time
 	positions moved off the nightly batch process and onto real-time trade
 	inserts. Portfolio/Position/Order/Trade tables below are the tables the
-	app tier actually depends on. RiskLimits backs usp_ValidatePreTradeRisk
-	(see 002_StoredProcedures.sql).
+	app tier actually depends on. RiskLimits now backs the C# canonical
+	RiskLimitSet and the pre-trade gate PreTradeRiskService (namespace
+	StockSharp.Algo.Risk), which read this table at runtime - the risk
+	decisioning that used to live in T-SQL stored procedures has been
+	consolidated into those C# services.
 
 	Run order: 001 -> 002 -> 003 -> 004 (optional seed data).
 */
@@ -73,14 +76,17 @@ GO
 -- RiskLimits
 --
 -- One row can be scoped to a portfolio, a security, or both (the more
--- specific row wins - see usp_ValidatePreTradeRisk). A row with both columns
--- NULL is meaningless (which single order would it even apply to?) so it's
--- blocked by CK_RiskLimits_scope.
+-- specific row wins - the most-specific-row selection precedence is now
+-- performed in C# by PreTradeRiskService, which loads the winning row into
+-- the canonical RiskLimitSet). A row with both columns NULL is meaningless
+-- (which single order would it even apply to?) so it's blocked by
+-- CK_RiskLimits_scope.
 --
 -- All the max_* columns are optional ceilings - NULL/0 means "not enforced",
--- same convention the C# RiskRule classes use (a 0 Commission/Position means
--- "no limit"). Whoever configures this table needs to know that convention;
--- it isn't enforced anywhere else.
+-- a convention that now carries into the C# canonical RiskLimitSet (and the
+-- existing RiskRule classes, where a 0 Commission/Position means "no limit").
+-- Whoever configures this table needs to know that convention; it isn't
+-- enforced anywhere else.
 -- ============================================================================
 IF OBJECT_ID(N'dbo.RiskLimits', N'U') IS NOT NULL DROP TABLE dbo.RiskLimits;
 GO
@@ -91,14 +97,14 @@ CREATE TABLE dbo.RiskLimits
 	portfolio_id			INT					NULL,
 	security_id				INT					NULL,
 
-	max_order_price			DECIMAL(18,4)		NULL,	-- ceiling on a single order's price   (mirrors RiskOrderPriceRule)
-	max_order_qty			DECIMAL(18,4)		NULL,	-- ceiling on a single order's qty     (mirrors RiskOrderVolumeRule)
-	max_order_value			DECIMAL(18,4)		NULL,	-- ceiling on qty*price notional       (SQL-side only, no C# equivalent)
-	max_position_size		DECIMAL(18,4)		NULL,	-- ceiling on abs(position) post-fill  (mirrors RiskPositionSizeRule)
-	max_daily_volume		DECIMAL(18,4)		NULL,	-- ceiling on cumulative qty per day   (SQL-side only, no C# equivalent)
-	max_order_freq_count	INT					NULL,	-- max orders per max_order_freq_window_sec (mirrors RiskOrderFreqRule.Count)
-	max_order_freq_window_sec INT				NULL,	-- window length in seconds                 (mirrors RiskOrderFreqRule.Interval)
-	max_commission_total	DECIMAL(18,4)		NULL,	-- ceiling on cumulative commission    (mirrors RiskCommissionRule/RiskOrderCommissionRule)
+	max_order_price			DECIMAL(18,4)		NULL,	-- ceiling on a single order's price   (read into RiskLimitSet; enforced by RiskOrderPriceRule)
+	max_order_qty			DECIMAL(18,4)		NULL,	-- ceiling on a single order's qty     (read into RiskLimitSet; enforced by RiskOrderVolumeRule)
+	max_order_value			DECIMAL(18,4)		NULL,	-- ceiling on qty*price notional       (read into RiskLimitSet; enforced in C# by RiskOrderValueRule)
+	max_position_size		DECIMAL(18,4)		NULL,	-- ceiling on abs(position) post-fill  (read into RiskLimitSet; enforced by RiskPositionSizeRule)
+	max_daily_volume		DECIMAL(18,4)		NULL,	-- ceiling on cumulative qty per day   (read into RiskLimitSet; enforced in C# by RiskDailyVolumeRule)
+	max_order_freq_count	INT					NULL,	-- max orders per max_order_freq_window_sec (read into RiskLimitSet; enforced by RiskOrderFreqRule.Count)
+	max_order_freq_window_sec INT				NULL,	-- window length in seconds                 (read into RiskLimitSet; enforced by RiskOrderFreqRule.Interval)
+	max_commission_total	DECIMAL(18,4)		NULL,	-- ceiling on cumulative commission    (read into RiskLimitSet; enforced by RiskCommissionRule/RiskOrderCommissionRule)
 	commission_rate			DECIMAL(9,6)		NOT NULL CONSTRAINT DF_RiskLimits_commission_rate DEFAULT (0.0005),
 
 	is_active				BIT					NOT NULL CONSTRAINT DF_RiskLimits_is_active DEFAULT (1),
@@ -190,10 +196,10 @@ GO
 -- ============================================================================
 -- Positions
 --
--- unrealized_pnl is intentionally NOT maintained by usp_RecalculatePositionOnTrade
--- or the Trades trigger - doing that correctly needs a live market price, which
--- neither the trigger nor the proc has access to. It's refreshed separately by
--- the EOD mark-to-market batch (outside the scope of this brief). Treat this
+-- unrealized_pnl is intentionally NOT maintained by the C# PositionRecalculationService
+-- (which now performs the position and realized-P&L recompute) - doing that correctly
+-- needs a live market price, which the service does not have. It's refreshed separately
+-- by the EOD mark-to-market batch (outside the scope of this brief). Treat this
 -- column as stale/EOD-only, not real-time.
 -- ============================================================================
 IF OBJECT_ID(N'dbo.Positions', N'U') IS NOT NULL DROP TABLE dbo.Positions;

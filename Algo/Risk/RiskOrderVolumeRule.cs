@@ -3,6 +3,16 @@ namespace StockSharp.Algo.Risk;
 /// <summary>
 /// Risk-rule, tracking order volume.
 /// </summary>
+/// <remarks>
+/// The quantity ceiling enforced here is the canonical order-quantity limit - the single source
+/// of truth shared between this portfolio-wide circuit-breaker rule and the per-order pre-trade
+/// gate (<see cref="PreTradeRiskService"/>). The shared value originates from
+/// <see cref="RiskLimitSet.MaxOrderQty"/> and is wired into this rule via the
+/// <see cref="RiskManager"/> canonical seed helper, so the threshold is defined exactly once.
+/// Both enforcement patterns apply identical reject-when-<c>qty &gt;= limit</c> semantics, which is
+/// why this rule and its former SQL counterpart (<c>max_order_qty</c>) collapse into one canonical
+/// definition - a duplicative-by-accident merge (AAP §0.6.2).
+/// </remarks>
 [Display(
 	ResourceType = typeof(LocalizedStrings),
 	Name = LocalizedStrings.OrderVolume2Key,

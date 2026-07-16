@@ -1,5 +1,7 @@
 namespace StockSharp.Algo.Storages.Sql;
 
+using StockSharp.Algo.Risk;
+
 /// <summary>
 /// A row from dbo.Positions. unrealized_pnl is not maintained in real time -
 /// see the comment on the Positions table in Database/001_Schema.sql.
@@ -24,6 +26,6 @@ public class SqlPosition
 	/// <summary>Stale outside of the EOD mark-to-market batch - do not treat as live.</summary>
 	public decimal UnrealizedPnL { get; init; }
 
-	/// <summary>Last time this row was written by usp_RecalculatePositionOnTrade.</summary>
+	/// <summary>Last time this row was written by <see cref="PositionRecalculationService"/>.</summary>
 	public DateTime UpdatedDate { get; init; }
 }
