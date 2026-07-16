@@ -3,6 +3,17 @@ namespace StockSharp.Algo.Risk;
 /// <summary>
 /// Risk-rule, tracking commission size.
 /// </summary>
+/// <remarks>
+/// In the portfolio-wide circuit-breaker context this rule tracks the actual commission reported on
+/// money <c>PositionChangeMessage</c>s (the <c>PositionChangeTypes.Commission</c> value), i.e. the real
+/// cost accrued once fills have executed. It is deliberately distinct from the per-order pre-trade gate
+/// (<see cref="PreTradeRiskService"/>), which runs before acceptance and can therefore only estimate
+/// commission pre-fill from the configured rate. Both enforcement patterns read the single canonical
+/// threshold <see cref="RiskLimitSet.MaxCommissionTotal"/>, so the ceiling is defined exactly once. Yet
+/// because one side measures a realized amount while the other measures a pre-fill projection, the two are
+/// different-by-design and will not agree numerically - an intentional non-consolidation preserved rather
+/// than merged (AAP §0.6.2).
+/// </remarks>
 [Display(
 	ResourceType = typeof(LocalizedStrings),
 	Name = LocalizedStrings.CommissionKey,

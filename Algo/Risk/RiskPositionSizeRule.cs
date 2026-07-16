@@ -3,6 +3,20 @@ namespace StockSharp.Algo.Risk;
 /// <summary>
 /// Risk-rule, tracking position size.
 /// </summary>
+/// <remarks>
+/// This is the portfolio-wide circuit-breaker view of the position limit: it inspects the
+/// current position carried on a <see cref="PositionChangeMessage"/> via
+/// <see cref="PositionChangeTypes.CurrentValue"/> and answers "are we already over?".
+/// By contrast, the per-order pre-trade gate <see cref="PreTradeRiskService"/> projects the
+/// hypothetical post-fill position ("would this order put us over?"), because it runs before the
+/// order is accepted rather than after a fill has moved the position.
+/// Both enforcement patterns consume the single canonical threshold
+/// <see cref="RiskLimitSet.MaxPositionSize"/>, yet they are different-by-design: two distinct
+/// evaluation contexts that share one threshold, and are therefore deliberately NOT merged (AAP 0.6.2).
+/// Concretely, a positive <see cref="Position"/> acts as an upper bound (trip when
+/// <c>currValue &gt;= Position</c>), a negative <see cref="Position"/> acts as a short-side lower
+/// bound (trip when <c>currValue &lt;= Position</c>), and a zero <see cref="Position"/> disables the check.
+/// </remarks>
 [Display(
 	ResourceType = typeof(LocalizedStrings),
 	Name = LocalizedStrings.PositionKey,

@@ -3,6 +3,18 @@ namespace StockSharp.Algo.Risk;
 /// <summary>
 /// The base class for risk-rules, tracking commission for own transactions.
 /// </summary>
+/// <remarks>
+/// Subclasses accumulate the actual commission realized post-fill from
+/// <see cref="ExecutionMessage.Commission"/> as executions stream in, enforcing the ceiling within the
+/// portfolio-wide circuit-breaker context driven by <see cref="RiskManager"/>. This is deliberately
+/// different from the per-order pre-trade gate <see cref="PreTradeRiskService"/>, which runs before any
+/// fill exists and can therefore only estimate the commission as
+/// <c>existingNotional * commission_rate + qty * estPrice * commission_rate</c>. Both enforcement
+/// patterns consume the single canonical threshold <see cref="RiskLimitSet.MaxCommissionTotal"/>, yet
+/// because one measures a realized running total while the other projects a pre-fill estimate, the two
+/// are different-by-design and will not agree numerically. This intentional divergence is preserved
+/// rather than force-merged under DRY, per AAP §0.6.2.
+/// </remarks>
 public abstract class RiskTransactionCommissionRule : RiskRule
 {
 	private decimal _commission;
