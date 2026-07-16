@@ -7,18 +7,34 @@ namespace StockSharp.Algo.Risk;
 /// Portfolio-wide circuit breaker. It evaluates the live message stream against
 /// its configured <see cref="IRiskRule"/> set and, when a rule trips, drives a
 /// global action (close positions / stop trading / cancel orders) through the
-/// <see cref="RiskMessageAdapter"/>. Following the risk consolidation, every rule
-/// is defined exactly once as an <see cref="IRiskRule"/> subclass — the single
-/// source of truth — and there are two distinct, never-merged enforcement
-/// patterns that consume those same definitions: this stream-based circuit
-/// breaker (which reacts to live state and takes account-level action) and the
-/// per-order <see cref="PreTradeRiskService"/> pre-trade gate (which accepts or
-/// rejects one prospective order). The order-frequency, notional-value and
-/// daily-volume checks now all exist as first-class C# rules
-/// (<see cref="RiskOrderFreqRule"/> with rolling-window semantics,
-/// <see cref="RiskOrderValueRule"/> and <see cref="RiskDailyVolumeRule"/>), so
-/// the two patterns can never diverge in rule definition — only in the input
-/// each supplies (live position/stream vs. a prospective order).
+/// <see cref="RiskMessageAdapter"/>. Its mechanics are unchanged by the risk
+/// consolidation; only the SOURCE of each rule's threshold and comparison moved.
+///
+/// The consolidation makes each risk rule's threshold-and-comparison the single
+/// source of truth, owned by one <see cref="IRiskRule"/> subclass and reused by
+/// both enforcement patterns rather than re-encoded in each. The two patterns
+/// are distinct and never merged: this stream-based circuit breaker (which
+/// reacts to live state and takes account-level action) and the per-order
+/// <see cref="PreTradeRiskService"/> pre-trade gate (which accepts or rejects a
+/// single prospective order). They consume the SAME definition but supply
+/// different inputs by design - the circuit breaker feeds live stream/position
+/// state, the gate feeds a prospective order and SQL-sourced aggregates:
+/// <list type="bullet">
+/// <item>Order price, quantity and notional value: identical pure-threshold rule
+/// classes (<see cref="RiskOrderPriceRule"/>, <see cref="RiskOrderVolumeRule"/>,
+/// <see cref="RiskOrderValueRule"/>) used by both.</item>
+/// <item>Order frequency (<see cref="RiskOrderFreqRule"/>), resulting position
+/// size (<see cref="RiskPositionSizeRule"/>) and daily traded volume
+/// (<see cref="RiskDailyVolumeRule"/>): the decision is one shared comparison
+/// (<c>IsFrequencyExceeded</c> / <c>IsPositionSizeExceeded</c> /
+/// <c>IsDailyVolumeExceeded</c>); the circuit breaker feeds live streaming state
+/// while the gate feeds a projection/aggregate read from SQL Server.</item>
+/// <item>Cumulative commission is INTENTIONALLY two implementations - the actual
+/// post-fill figure here (off <see cref="Messages.ExecutionMessage"/>) versus the
+/// gate's pre-fill estimate - because the data is available at different times.
+/// This is a documented, by-design difference, not a divergence (see
+/// LEGACY_LAYER.md).</item>
+/// </list>
 /// </remarks>
 public class RiskManager : BaseLogReceiver, IRiskManager
 {

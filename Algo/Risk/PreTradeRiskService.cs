@@ -1,25 +1,54 @@
 namespace StockSharp.Algo.Risk;
 
-using System.Data;
-
 using Microsoft.Data.SqlClient;
 
 /// <summary>
-/// Per-order pre-trade risk GATE. C# replacement for the SQL proc
+/// Per-order pre-trade risk GATE. C# replacement for the retired SQL proc
 /// dbo.usp_ValidatePreTradeRisk: validates a single prospective order against
 /// the most-specific configured RiskLimits row and returns accept/reject with a
 /// descriptive reason on the first failing rule.
 /// </summary>
 /// <remarks>
+/// <para>
 /// One of the two distinct, never-merged enforcement patterns that consume the
 /// canonical <see cref="IRiskRule"/> definitions (the other is the stream-based
-/// <see cref="RiskManager"/> circuit breaker). Where a rule is a pure threshold
-/// comparison the gate executes the canonical rule class
-/// (<see cref="RiskOrderPriceRule"/>, <see cref="RiskOrderVolumeRule"/>,
-/// <see cref="RiskOrderValueRule"/>, <see cref="RiskDailyVolumeRule"/>); where a
-/// rule needs historical/positional data it applies the same canonical threshold
-/// to an aggregate/projection read from SQL Server. Every comparison uses the
-/// ">=" ("meets or exceeds") boundary and a NULL/0 threshold means "not enforced".
+/// <see cref="RiskManager"/> circuit breaker). Each rule is defined exactly once;
+/// the two patterns differ only in the input they supply.
+/// </para>
+/// <para>
+/// The pure-threshold ceilings run the canonical rule classes directly on the
+/// prospective order (<see cref="RiskOrderPriceRule"/>, <see cref="RiskOrderVolumeRule"/>,
+/// <see cref="RiskOrderValueRule"/>). The stateful rules delegate to the canonical
+/// rules' shared decision helpers -
+/// <see cref="RiskOrderFreqRule.IsFrequencyExceeded"/>,
+/// <see cref="RiskPositionSizeRule.IsPositionSizeExceeded"/> and
+/// <see cref="RiskDailyVolumeRule.IsDailyVolumeExceeded"/> - fed an aggregate or
+/// projection read from SQL Server (rolling order count, hypothetical post-fill
+/// position, today's accepted/filled volume). Those same helpers back the
+/// <see cref="RiskManager"/> stream path, so the gate and the circuit breaker can
+/// never disagree on a shared rule.
+/// </para>
+/// <para>
+/// Cumulative commission is the single rule kept deliberately separate (AAP 0.6.4):
+/// the gate can only estimate cost before the fill exists, so it applies
+/// RiskLimits.commission_rate to the order/last price, whereas the circuit-breaker
+/// commission rules read the actual figure off the post-fill ExecutionMessage.
+/// </para>
+/// <para>
+/// Strictness conventions preserved verbatim: every comparison uses the
+/// "&gt;=" ("meets or exceeds") boundary; a NULL or exactly-zero threshold means
+/// "not enforced"; a negative threshold is invalid configuration and fails closed
+/// (rejects) rather than silently disabling the control. All qty/price/value inputs
+/// and aggregates are normalized to the schema's DECIMAL(18,4) scale (commission_rate
+/// to DECIMAL(9,6)) with round-half-away-from-zero before any comparison, matching
+/// how SQL Server coerced the corresponding procedure variables.
+/// </para>
+/// <para>
+/// The primary <see cref="ValidateAsync(SqlConnection, SqlTransaction, int, int, Sides, decimal, decimal?, OrderTypes, string, CancellationToken)"/>
+/// overload runs on a caller-supplied connection and transaction so the caller can
+/// perform validation and the resulting order insert as one atomic, appropriately
+/// isolated unit - closing the check-to-insert race the standalone SQL gate had.
+/// </para>
 /// </remarks>
 public class PreTradeRiskService
 {
@@ -43,25 +72,84 @@ public class PreTradeRiskService
 
 	private SqlConnection CreateConnection() => new(_connectionString);
 
+	// SQL Server coerced every RiskLimits money/qty column and the procedure
+	// variables to DECIMAL(18,4), and commission_rate to DECIMAL(9,6), rounding
+	// half away from zero on assignment. The gate normalizes to the same scale so
+	// a value SQL rounded up to the limit (e.g. 0.99995 -> 1.0000) is rejected here
+	// exactly as it was in the proc, honouring the stricter-wins hard constraint.
+	private static decimal Round4(decimal value) => Math.Round(value, 4, MidpointRounding.AwayFromZero);
+	private static decimal Round6(decimal value) => Math.Round(value, 6, MidpointRounding.AwayFromZero);
+
+	// Rejection/audit text must be byte-identical regardless of host culture.
+	private static string Inv(FormattableString reason) => FormattableString.Invariant(reason);
+
 	/// <summary>
-	/// Validates a prospective order against the applicable RiskLimits, porting
-	/// dbo.usp_ValidatePreTradeRisk RULES 1-7 in order (first failure wins).
+	/// Validates a prospective order on a freshly opened, dedicated connection.
+	/// Convenience entry point for standalone use and tests; the production path
+	/// uses the transaction-aware overload so validation and the order insert share
+	/// one atomic unit.
 	/// </summary>
+	/// <param name="portfolioId">Target portfolio identifier.</param>
+	/// <param name="securityId">Target security identifier.</param>
+	/// <param name="side">Order side; only <see cref="Sides.Buy"/>/<see cref="Sides.Sell"/> are valid.</param>
+	/// <param name="qty">Prospective order quantity (must be positive).</param>
+	/// <param name="price">Limit price, or <see langword="null"/> for a market order.</param>
+	/// <param name="orderType">Order type (LIMIT/MARKET); carried for parity with the retired proc signature.</param>
+	/// <param name="requestedBy">Optional requester identifier; carried for parity with the retired proc signature.</param>
+	/// <param name="cancellationToken">Cancellation token.</param>
+	/// <returns>Accept/reject decision with a reason on the first failing rule.</returns>
 	public async Task<PreTradeRiskResult> ValidateAsync(
 		int portfolioId, int securityId, Sides side, decimal qty, decimal? price,
 		OrderTypes orderType, string requestedBy = null, CancellationToken cancellationToken = default)
 	{
+		await using var connection = CreateConnection();
+		await connection.OpenAsync(cancellationToken);
+
+		return await ValidateAsync(
+			connection, null, portfolioId, securityId, side, qty, price,
+			orderType, requestedBy, cancellationToken);
+	}
+
+	/// <summary>
+	/// Validates a prospective order using a caller-supplied open connection and
+	/// (optionally) the transaction that also inserts the resulting order, so the
+	/// read-decide-insert sequence is one atomic unit under the caller's isolation
+	/// level. Ports dbo.usp_ValidatePreTradeRisk RULES 1-7 in order (first failure wins).
+	/// </summary>
+	/// <param name="connection">Open SQL Server connection.</param>
+	/// <param name="transaction">Ambient transaction for the connection, or <see langword="null"/> for autocommit reads.</param>
+	/// <param name="portfolioId">Target portfolio identifier.</param>
+	/// <param name="securityId">Target security identifier.</param>
+	/// <param name="side">Order side; only <see cref="Sides.Buy"/>/<see cref="Sides.Sell"/> are valid.</param>
+	/// <param name="qty">Prospective order quantity (must be positive).</param>
+	/// <param name="price">Limit price, or <see langword="null"/> for a market order.</param>
+	/// <param name="orderType">Order type (LIMIT/MARKET); carried for parity with the retired proc signature.</param>
+	/// <param name="requestedBy">Optional requester identifier; carried for parity with the retired proc signature.</param>
+	/// <param name="cancellationToken">Cancellation token.</param>
+	/// <returns>Accept/reject decision with a reason on the first failing rule.</returns>
+	public async Task<PreTradeRiskResult> ValidateAsync(
+		SqlConnection connection, SqlTransaction transaction,
+		int portfolioId, int securityId, Sides side, decimal qty, decimal? price,
+		OrderTypes orderType, string requestedBy = null, CancellationToken cancellationToken = default)
+	{
+		if (connection is null)
+			throw new ArgumentNullException(nameof(connection));
+
 		// --- input pre-checks (SQL L73-85) ---------------------------------
 		// Sides only models Buy/Sell, but guard defensively to mirror the SQL
 		// "side NOT IN ('B','S')" pre-check exactly.
 		if (side != Sides.Buy && side != Sides.Sell)
-			return Reject($"Invalid side: {side}");
+			return Reject(Inv($"Invalid side: {side}"));
+
+		// Coerce qty to the schema scale first (the proc parameter was DECIMAL(18,4)),
+		// then apply the positive-quantity pre-check on the coerced value so a sub-tick
+		// quantity that rounds to zero is rejected exactly as SQL rejected it.
+		qty = Round4(qty);
 
 		if (qty <= 0)
 			return Reject("Invalid qty");
 
-		await using var connection = CreateConnection();
-		await connection.OpenAsync(cancellationToken);
+		var normPrice = price.HasValue ? Round4(price.Value) : (decimal?)null;
 
 		// --- most-specific RiskLimits row (SQL L100-118): portfolio+security,
 		//     then portfolio-only, then security-only, newest effective_date ---
@@ -84,7 +172,10 @@ public class PreTradeRiskService
 					 WHEN portfolio_id IS NOT NULL THEN 1
 					 ELSE 2 END,
 				effective_date DESC
-			""", connection))
+			""", connection)
+		{
+			Transaction = transaction,
+		})
 		{
 			limitsCmd.Parameters.AddWithValue("@portfolio_id", portfolioId);
 			limitsCmd.Parameters.AddWithValue("@security_id", securityId);
@@ -119,67 +210,93 @@ public class PreTradeRiskService
 		{
 			Side = side,
 			Volume = qty,
-			Price = price ?? 0m,
+			Price = normPrice ?? 0m,
 		};
 
 		// RULE 1 - order price ceiling (SQL L129-134): canonical RiskOrderPriceRule.
-		// ">=" preserved; NULL/0 = not enforced; only when both price and limit exist.
-		if (price.HasValue && maxOrderPrice > 0)
+		// Only when both a price and a non-zero limit exist. NULL/0 = not enforced;
+		// a negative limit is invalid config and fails closed.
+		if (normPrice.HasValue && maxOrderPrice.HasValue && maxOrderPrice.Value != 0)
 		{
+			if (maxOrderPrice.Value < 0)
+				return Reject(Inv($"Invalid negative max_order_price {maxOrderPrice.Value}; failing closed"));
+
 			if (new RiskOrderPriceRule { Price = maxOrderPrice.Value }.ProcessMessage(orderMessage))
-				return Reject($"Order price {price.Value} meets/exceeds limit {maxOrderPrice.Value}");
+				return Reject(Inv($"Order price {normPrice.Value} meets/exceeds limit {maxOrderPrice.Value}"));
 		}
 
 		// RULE 2 - order qty ceiling (SQL L136-141): canonical RiskOrderVolumeRule.
-		if (maxOrderQty > 0)
+		if (maxOrderQty.HasValue && maxOrderQty.Value != 0)
 		{
+			if (maxOrderQty.Value < 0)
+				return Reject(Inv($"Invalid negative max_order_qty {maxOrderQty.Value}; failing closed"));
+
 			if (new RiskOrderVolumeRule { Volume = maxOrderQty.Value }.ProcessMessage(orderMessage))
-				return Reject($"Order qty {qty} meets/exceeds limit {maxOrderQty.Value}");
+				return Reject(Inv($"Order qty {qty} meets/exceeds limit {maxOrderQty.Value}"));
 		}
 
 		// RULE 3 - notional value ceiling (SQL L143-148): canonical RiskOrderValueRule,
-		// relocated from SQL-only max_order_value. qty*price >= limit.
-		if (price.HasValue && maxOrderValue > 0)
+		// relocated from SQL-only max_order_value. qty*price >= limit (full-precision
+		// product vs the scale-4 limit, exactly as SQL compared @qty*@price).
+		if (normPrice.HasValue && maxOrderValue.HasValue && maxOrderValue.Value != 0)
 		{
+			if (maxOrderValue.Value < 0)
+				return Reject(Inv($"Invalid negative max_order_value {maxOrderValue.Value}; failing closed"));
+
 			if (new RiskOrderValueRule { OrderValue = maxOrderValue.Value }.ProcessMessage(orderMessage))
-				return Reject($"Order value {qty * price.Value} meets/exceeds limit {maxOrderValue.Value}");
+				return Reject(Inv($"Order value {qty * normPrice.Value} meets/exceeds limit {maxOrderValue.Value}"));
 		}
 
-		// RULE 4 - order frequency (SQL L161-175): canonical rolling-window RiskOrderFreqRule.
-		// The rule class owns the rolling algorithm for the stream path; here the gate
-		// reproduces the SAME true rolling COUNT (orders within "now - window") from SQL
-		// and rejects when recentCount + 1 >= count. Rolling wins under stricter-wins
-		// (AAP 0.6.3); ">=" preserved.
-		if (maxOrderFreqCount > 0 && maxOrderFreqWindowSec > 0)
+		// RULE 4 - order frequency (SQL L161-175): canonical rolling-window definition.
+		// The gate supplies the true rolling COUNT (orders within "now - window") read
+		// from SQL and defers the decision to RiskOrderFreqRule.IsFrequencyExceeded -
+		// the SAME helper the stream path calls, so both agree at the boundary. Rolling
+		// wins under stricter-wins (AAP 0.6.3). A non-positive window is disabled, matching
+		// the rule's Interval<=0 semantics; a negative count is invalid config (fails closed).
+		if (maxOrderFreqCount.HasValue && maxOrderFreqCount.Value != 0
+			&& maxOrderFreqWindowSec.HasValue && maxOrderFreqWindowSec.Value > 0)
 		{
+			if (maxOrderFreqCount.Value < 0)
+				return Reject(Inv($"Invalid negative max_order_freq_count {maxOrderFreqCount.Value}; failing closed"));
+
 			int recentCount;
 
 			await using (var freqCmd = new SqlCommand(
 				"SELECT COUNT(*) FROM dbo.Orders WHERE portfolio_id = @portfolio_id AND submitted_date >= DATEADD(SECOND, -@window_sec, SYSUTCDATETIME())",
-				connection))
+				connection)
+			{
+				Transaction = transaction,
+			})
 			{
 				freqCmd.Parameters.AddWithValue("@portfolio_id", portfolioId);
 				freqCmd.Parameters.AddWithValue("@window_sec", maxOrderFreqWindowSec.Value);
 
-				recentCount = (int)(await freqCmd.ExecuteScalarAsync(cancellationToken));
+				recentCount = Convert.ToInt32(await freqCmd.ExecuteScalarAsync(cancellationToken));
 			}
 
-			if (recentCount + 1 >= maxOrderFreqCount.Value)
-				return Reject($"Order frequency {recentCount + 1} in {maxOrderFreqWindowSec.Value}s meets/exceeds limit {maxOrderFreqCount.Value}");
+			if (RiskOrderFreqRule.IsFrequencyExceeded(recentCount, maxOrderFreqCount.Value))
+				return Reject(Inv($"Order frequency {recentCount + 1} in {maxOrderFreqWindowSec.Value}s meets/exceeds limit {maxOrderFreqCount.Value}"));
 		}
 
 		// RULE 5 - resulting position size (SQL L177-192): shared RiskPositionSizeRule
 		// definition applied at the POST-FILL projection (current + signed order qty).
-		// The gate uses a symmetric ABS ceiling (SQL semantics) so the limit is enforced
-		// in both directions before acceptance. Dropping the projection would loosen the
-		// gate and violate the stricter-wins hard constraint (AAP 0.6.2/0.6.4).
-		if (maxPositionSize > 0)
+		// The decision uses RiskPositionSizeRule.IsPositionSizeExceeded (symmetric ABS
+		// ceiling, SQL semantics) - the SAME helper the circuit breaker applies to the
+		// live position. Dropping the projection would loosen the gate and violate the
+		// stricter-wins hard constraint (AAP 0.6.2/0.6.4).
+		if (maxPositionSize.HasValue && maxPositionSize.Value != 0)
 		{
+			if (maxPositionSize.Value < 0)
+				return Reject(Inv($"Invalid negative max_position_size {maxPositionSize.Value}; failing closed"));
+
 			decimal currentQty;
 
 			await using (var posCmd = new SqlCommand(
 				"SELECT qty FROM dbo.Positions WHERE portfolio_id = @portfolio_id AND security_id = @security_id",
-				connection))
+				connection)
+			{
+				Transaction = transaction,
+			})
 			{
 				posCmd.Parameters.AddWithValue("@portfolio_id", portfolioId);
 				posCmd.Parameters.AddWithValue("@security_id", securityId);
@@ -189,10 +306,10 @@ public class PreTradeRiskService
 			}
 
 			var signedDelta = side == Sides.Buy ? qty : -qty;
-			var projected = currentQty + signedDelta;
+			var projected = Round4(currentQty + signedDelta);
 
-			if (Math.Abs(projected) >= maxPositionSize.Value)
-				return Reject($"Resulting position {projected} meets/exceeds limit {maxPositionSize.Value}");
+			if (RiskPositionSizeRule.IsPositionSizeExceeded(projected, maxPositionSize.Value))
+				return Reject(Inv($"Resulting position {projected} meets/exceeds limit {maxPositionSize.Value}"));
 		}
 
 		// RULE 6 - cumulative commission (SQL L199-224): PRE-FILL ESTIMATE. This is
@@ -202,11 +319,16 @@ public class PreTradeRiskService
 		// windows: the gate can only estimate before the trade exists, so it uses
 		// RiskLimits.commission_rate against the order price (or the security's last
 		// traded price for a market order). Kept separate by design (AAP 0.6.4); the
-		// circuit-breaker path keeps the actual figure. ">=" preserved.
-		if (maxCommissionTotal > 0)
+		// circuit-breaker path keeps the actual figure. ">=" preserved. The estimate is
+		// coerced to DECIMAL(18,4) with a single final rounding, exactly as SQL assigned
+		// the @estCommission variable.
+		if (maxCommissionTotal.HasValue && maxCommissionTotal.Value != 0)
 		{
-			var rate = commissionRate ?? _defaultCommissionRate;
-			var estPrice = price;
+			if (maxCommissionTotal.Value < 0)
+				return Reject(Inv($"Invalid negative max_commission_total {maxCommissionTotal.Value}; failing closed"));
+
+			var rate = Round6(commissionRate ?? _defaultCommissionRate);
+			var estPrice = normPrice;
 
 			if (estPrice is null)
 			{
@@ -217,11 +339,14 @@ public class PreTradeRiskService
 					JOIN dbo.Orders o ON o.order_id = t.order_id
 					WHERE o.security_id = @security_id
 					ORDER BY t.executed_date DESC
-					""", connection);
+					""", connection)
+				{
+					Transaction = transaction,
+				};
 				lastPriceCmd.Parameters.AddWithValue("@security_id", securityId);
 
 				var rawPrice = await lastPriceCmd.ExecuteScalarAsync(cancellationToken);
-				estPrice = rawPrice is decimal lp ? lp : (decimal?)null;
+				estPrice = rawPrice is decimal lp ? Round4(lp) : (decimal?)null;
 			}
 
 			decimal existingNotional;
@@ -232,26 +357,38 @@ public class PreTradeRiskService
 				FROM dbo.Trades t
 				JOIN dbo.Orders o ON o.order_id = t.order_id
 				WHERE o.portfolio_id = @portfolio_id
-				""", connection))
+				""", connection)
+			{
+				Transaction = transaction,
+			})
 			{
 				notionalCmd.Parameters.AddWithValue("@portfolio_id", portfolioId);
 
 				var rawNotional = await notionalCmd.ExecuteScalarAsync(cancellationToken);
-				existingNotional = rawNotional is decimal n ? n : 0m;
+				existingNotional = rawNotional is decimal n ? Round4(n) : 0m;
 			}
 
-			var estCommission = existingNotional * rate + qty * (estPrice ?? 0m) * rate;
+			var estCommission = Round4(existingNotional * rate + qty * (estPrice ?? 0m) * rate);
 
 			if (estCommission >= maxCommissionTotal.Value)
-				return Reject($"Estimated cumulative commission {estCommission} meets/exceeds limit {maxCommissionTotal.Value}");
+				return Reject(Inv($"Estimated cumulative commission {estCommission} meets/exceeds limit {maxCommissionTotal.Value}"));
 		}
 
 		// RULE 7 - daily traded volume (SQL L226-243): canonical RiskDailyVolumeRule,
-		// relocated from SQL-only max_daily_volume. The rule holds the threshold + ">=";
-		// the gate supplies today's accepted/filled volume (from SQL) plus the new qty
-		// as the effective volume.
-		if (maxDailyVolume > 0)
+		// relocated from SQL-only max_daily_volume. The decision uses
+		// RiskDailyVolumeRule.IsDailyVolumeExceeded - the SAME helper the stream path
+		// calls - fed today's accepted/filled volume (from SQL) plus the new qty. The
+		// "today" filter is a sargable UTC [dayStart, dayEnd) range over the indexed
+		// submitted_date rather than CAST(... AS DATE), preserving the calendar-day
+		// semantics while remaining index-friendly.
+		if (maxDailyVolume.HasValue && maxDailyVolume.Value != 0)
 		{
+			if (maxDailyVolume.Value < 0)
+				return Reject(Inv($"Invalid negative max_daily_volume {maxDailyVolume.Value}; failing closed"));
+
+			var dayStart = DateTime.UtcNow.Date;
+			var dayEnd = dayStart.AddDays(1);
+
 			decimal todayQty;
 
 			await using (var dailyCmd = new SqlCommand(
@@ -261,20 +398,26 @@ public class PreTradeRiskService
 				WHERE portfolio_id = @portfolio_id
 					AND security_id = @security_id
 					AND status IN ('ACCEPTED','FILLED','PARTFILLED')
-					AND CAST(submitted_date AS DATE) = CAST(SYSUTCDATETIME() AS DATE)
-				""", connection))
+					AND submitted_date >= @day_start
+					AND submitted_date < @day_end
+				""", connection)
+			{
+				Transaction = transaction,
+			})
 			{
 				dailyCmd.Parameters.AddWithValue("@portfolio_id", portfolioId);
 				dailyCmd.Parameters.AddWithValue("@security_id", securityId);
+				dailyCmd.Parameters.AddWithValue("@day_start", dayStart);
+				dailyCmd.Parameters.AddWithValue("@day_end", dayEnd);
 
 				var rawToday = await dailyCmd.ExecuteScalarAsync(cancellationToken);
-				todayQty = rawToday is decimal d ? d : 0m;
+				todayQty = rawToday is decimal d ? Round4(d) : 0m;
 			}
 
-			var dailyMessage = new OrderRegisterMessage { Side = side, Volume = todayQty + qty, Price = price ?? 0m };
+			var effectiveDaily = Round4(todayQty + qty);
 
-			if (new RiskDailyVolumeRule { DailyVolume = maxDailyVolume.Value }.ProcessMessage(dailyMessage))
-				return Reject($"Daily volume {todayQty + qty} meets/exceeds limit {maxDailyVolume.Value}");
+			if (RiskDailyVolumeRule.IsDailyVolumeExceeded(effectiveDaily, maxDailyVolume.Value))
+				return Reject(Inv($"Daily volume {effectiveDaily} meets/exceeds limit {maxDailyVolume.Value}"));
 		}
 
 		return Accept();
@@ -292,7 +435,7 @@ public class PreTradeRiskService
 }
 
 /// <summary>
-/// Result of a <see cref="PreTradeRiskService.ValidateAsync"/> call.
+/// Result of a <see cref="PreTradeRiskService.ValidateAsync(int, int, Sides, decimal, decimal?, OrderTypes, string, CancellationToken)"/> call.
 /// </summary>
 public class PreTradeRiskResult
 {

@@ -4,23 +4,34 @@ using System.Data;
 
 using Microsoft.Data.SqlClient;
 
+using StockSharp.Algo.Risk;
+
 /// <summary>
-/// ADO.NET gateway onto the StockSharpLegacy stored-proc layer (schema and
-/// procs live under /Database at the repo root). Deliberately raw
-/// <see cref="SqlCommand"/> calls, not an ORM - this is meant to look like
-/// the real production call pattern (CommandType.StoredProcedure + output
-/// params), not a clean data-access abstraction.
+/// Pure ADO.NET data-access gateway onto the StockSharpLegacy database (schema
+/// lives under /Database at the repo root). Deliberately raw
+/// <see cref="SqlCommand"/> calls, not an ORM. The gateway holds no risk
+/// thresholds or accept/reject/P&amp;L logic: every decision is delegated to the
+/// canonical C# services - <see cref="PreTradeRiskService"/> for pre-trade
+/// validation and <see cref="PositionRecalculationService"/> for average-cost /
+/// realized-P&amp;L recompute - while the gateway performs only the create/read
+/// operations against dbo.Orders, dbo.Trades and dbo.Positions. The SQL side is
+/// therefore pure data storage (tables, constraints, indexes); the retired
+/// procedures (usp_SubmitOrder, usp_ValidatePreTradeRisk,
+/// usp_RecalculatePositionOnTrade) and the trg_Trades_PositionRecalc trigger are
+/// no longer used or installed.
 ///
 /// This is an adapter that sits <i>alongside</i> <see cref="IEntityRegistry"/>,
 /// not a replacement for it: Securities/Exchanges/subscriptions are still
 /// served by <see cref="Csv.CsvEntityRegistry"/>. Only orders, trades and
-/// positions have been moved to SQL Server so far. That split - some entities
-/// in SQL, some still in CSV, nothing keeping their identifiers in sync - is
-/// the same half-migrated state described in LEGACY_LAYER.md.
+/// positions live in SQL Server - that entity-storage split (nothing keeping the
+/// SQL and CSV identifiers in sync) is described in LEGACY_LAYER.md and is
+/// unrelated to the now-consolidated risk logic.
 /// </summary>
 public class SqlLegacyOrderGateway
 {
 	private readonly string _connectionString;
+	private readonly PreTradeRiskService _preTradeRisk;
+	private readonly PositionRecalculationService _positionRecalc;
 
 	/// <summary>
 	/// Initializes a new instance of the <see cref="SqlLegacyOrderGateway"/>.
@@ -32,6 +43,8 @@ public class SqlLegacyOrderGateway
 			throw new ArgumentNullException(nameof(connectionString));
 
 		_connectionString = connectionString;
+		_preTradeRisk = new PreTradeRiskService(connectionString);
+		_positionRecalc = new PositionRecalculationService(connectionString);
 	}
 
 	private SqlConnection CreateConnection() => new(_connectionString);
@@ -104,8 +117,12 @@ public class SqlLegacyOrderGateway
 	}
 
 	/// <summary>
-	/// Submits an order through usp_SubmitOrder, which runs usp_ValidatePreTradeRisk
-	/// internally before inserting the row (accepted or rejected).
+	/// Submits an order: runs the C# <see cref="PreTradeRiskService"/> pre-trade gate
+	/// and inserts the resulting dbo.Orders row (ACCEPTED, or REJECTED with the reason
+	/// preserved for the audit trail - rejected orders are recorded, not dropped, as
+	/// the retired usp_SubmitOrder did). Validation and the insert run in one
+	/// serializable transaction so a concurrent submission cannot change the
+	/// frequency/volume/position/commission state between the check and the insert.
 	/// </summary>
 	public async Task<SqlOrderSubmitResult> SubmitOrderAsync(
 		int portfolioId, int securityId, Sides side, decimal volume, decimal? price, OrderTypes orderType,
@@ -114,56 +131,87 @@ public class SqlLegacyOrderGateway
 		await using var connection = CreateConnection();
 		await connection.OpenAsync(cancellationToken);
 
-		await using var command = new SqlCommand("dbo.usp_SubmitOrder", connection)
+		await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(IsolationLevel.Serializable, cancellationToken);
+
+		// Canonical C# pre-trade gate; runs on the same connection/transaction as the
+		// insert below so the read-decide-insert sequence is one atomic unit.
+		var validation = await _preTradeRisk.ValidateAsync(
+			connection, transaction, portfolioId, securityId, side, volume, price,
+			orderType, requestedBy, cancellationToken);
+
+		var status = validation.IsValid ? "ACCEPTED" : "REJECTED";
+
+		long orderId;
+
+		await using (var insert = new SqlCommand(
+			"""
+			INSERT INTO dbo.Orders (portfolio_id, security_id, side, qty, price, order_type, status, reject_reason, external_transaction_id)
+				OUTPUT INSERTED.order_id
+				VALUES (@portfolio_id, @security_id, @side, @qty, @price, @order_type, @status, @reject_reason, @external_transaction_id)
+			""", connection)
 		{
-			CommandType = CommandType.StoredProcedure,
-		};
+			Transaction = transaction,
+		})
+		{
+			insert.Parameters.AddWithValue("@portfolio_id", portfolioId);
+			insert.Parameters.AddWithValue("@security_id", securityId);
+			insert.Parameters.AddWithValue("@side", MapSide(side));
+			insert.Parameters.Add(new SqlParameter("@qty", SqlDbType.Decimal) { Precision = 18, Scale = 4, Value = volume });
+			insert.Parameters.Add(new SqlParameter("@price", SqlDbType.Decimal) { Precision = 18, Scale = 4, Value = (object)price ?? DBNull.Value });
+			insert.Parameters.AddWithValue("@order_type", MapOrderType(orderType));
+			insert.Parameters.AddWithValue("@status", status);
+			insert.Parameters.AddWithValue("@reject_reason", (object)validation.RejectReason ?? DBNull.Value);
+			insert.Parameters.AddWithValue("@external_transaction_id", (object)externalTransactionId ?? DBNull.Value);
 
-		command.Parameters.AddWithValue("@portfolio_id", portfolioId);
-		command.Parameters.AddWithValue("@security_id", securityId);
-		command.Parameters.AddWithValue("@side", side == Sides.Buy ? "B" : "S");
-		command.Parameters.AddWithValue("@qty", volume);
-		command.Parameters.AddWithValue("@price", (object)price ?? DBNull.Value);
-		command.Parameters.AddWithValue("@order_type", MapOrderType(orderType));
-		command.Parameters.AddWithValue("@external_transaction_id", (object)externalTransactionId ?? DBNull.Value);
-		command.Parameters.AddWithValue("@requested_by", (object)requestedBy ?? DBNull.Value);
+			orderId = (long)await insert.ExecuteScalarAsync(cancellationToken);
+		}
 
-		var orderIdParam = new SqlParameter("@order_id", SqlDbType.BigInt) { Direction = ParameterDirection.Output };
-		var isValidParam = new SqlParameter("@is_valid", SqlDbType.Bit) { Direction = ParameterDirection.Output };
-		var rejectReasonParam = new SqlParameter("@reject_reason", SqlDbType.NVarChar, 200) { Direction = ParameterDirection.Output };
-
-		command.Parameters.Add(orderIdParam);
-		command.Parameters.Add(isValidParam);
-		command.Parameters.Add(rejectReasonParam);
-
-		await command.ExecuteNonQueryAsync(cancellationToken);
+		await transaction.CommitAsync(cancellationToken);
 
 		return new()
 		{
-			OrderId = (long)orderIdParam.Value,
-			IsValid = (bool)isValidParam.Value,
-			RejectReason = rejectReasonParam.Value as string,
+			OrderId = orderId,
+			IsValid = validation.IsValid,
+			RejectReason = validation.RejectReason,
 		};
 	}
 
 	/// <summary>
-	/// Records a fill against a SQL-side order. Inserting into dbo.Trades fires
-	/// trg_Trades_PositionRecalc automatically, which recomputes the position -
-	/// callers must NOT also invoke usp_RecalculatePositionOnTrade for the same
-	/// trade (see the warning in Database/002_StoredProcedures.sql).
+	/// Records a fill against a SQL-side order: inserts the dbo.Trades row and then
+	/// recomputes the position through the C# <see cref="PositionRecalculationService"/>
+	/// EXACTLY ONCE, both inside one serializable transaction so the trade and its
+	/// position effect commit or roll back together. The old trg_Trades_PositionRecalc
+	/// trigger is gone, so there is a single, unambiguous recompute with no
+	/// double-count hazard.
 	/// </summary>
 	public async Task RecordTradeAsync(long orderId, decimal qty, decimal price, CancellationToken cancellationToken = default)
 	{
 		await using var connection = CreateConnection();
 		await connection.OpenAsync(cancellationToken);
 
-		await using var command = new SqlCommand(
-			"INSERT INTO dbo.Trades (order_id, qty, price) VALUES (@order_id, @qty, @price)", connection);
-		command.Parameters.AddWithValue("@order_id", orderId);
-		command.Parameters.AddWithValue("@qty", qty);
-		command.Parameters.AddWithValue("@price", price);
+		await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(IsolationLevel.Serializable, cancellationToken);
 
-		await command.ExecuteNonQueryAsync(cancellationToken);
+		await using (var insert = new SqlCommand(
+			"INSERT INTO dbo.Trades (order_id, qty, price) VALUES (@order_id, @qty, @price)", connection)
+		{
+			Transaction = transaction,
+		})
+		{
+			insert.Parameters.AddWithValue("@order_id", orderId);
+			insert.Parameters.Add(new SqlParameter("@qty", SqlDbType.Decimal) { Precision = 18, Scale = 4, Value = qty });
+			insert.Parameters.Add(new SqlParameter("@price", SqlDbType.Decimal) { Precision = 18, Scale = 4, Value = price });
+
+			var affected = await insert.ExecuteNonQueryAsync(cancellationToken);
+
+			if (affected != 1)
+				throw new InvalidOperationException(FormattableString.Invariant(
+					$"Trade insert for order {orderId} affected {affected} rows (expected 1)."));
+		}
+
+		// Single recompute per trade, in the same transaction as the insert above.
+		await _positionRecalc.RecalculateAsync(connection, transaction, orderId, qty, price, cancellationToken);
+
+		await transaction.CommitAsync(cancellationToken);
 	}
 
 	/// <summary>
@@ -203,5 +251,12 @@ public class SqlLegacyOrderGateway
 		OrderTypes.Limit => "LIMIT",
 		OrderTypes.Market => "MARKET",
 		_ => throw new NotSupportedException($"Order type '{type}' has no dbo.Orders.order_type mapping (LIMIT/MARKET only)."),
+	};
+
+	private static string MapSide(Sides side) => side switch
+	{
+		Sides.Buy => "B",
+		Sides.Sell => "S",
+		_ => throw new NotSupportedException($"Order side '{side}' has no dbo.Orders.side mapping (Buy/Sell only)."),
 	};
 }

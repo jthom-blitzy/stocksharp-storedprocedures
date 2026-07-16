@@ -1,8 +1,17 @@
 # StockSharpLegacy database
 
+This database is **pure data storage**: tables, constraints, and indexes only. All
+pre-trade risk validation and position/realized-P&L recalculation now live in the
+canonical C# service layer under `Algo/Risk` (`PreTradeRiskService`,
+`PositionRecalculationService`), consumed through `Algo/Storages/Sql/SqlLegacyOrderGateway`.
+SQL Server holds **no** risk thresholds, accept/reject decisions, or P&L arithmetic.
+This keeps every risk rule defined exactly once (in C#) and keeps the schema portable.
+See `/LEGACY_LAYER.md` at the repo root for the full consolidation rationale and the
+rule-by-rule reconciliation.
+
 Run order: `001_Schema.sql` -> `002_StoredProcedures.sql` -> `003_Triggers.sql` -> `004_SeedData.sql` (optional but the C# sample/demo assumes it has run).
 
-Each script is safe to re-run (`001` drops and recreates every table, `002`/`003` use `CREATE OR ALTER`, `004` checks before inserting) - convenient when iterating, but be aware `001` is destructive: rerunning it against a database with real data wipes it.
+Each script is safe to re-run (`001` drops and recreates every table; `002` idempotently `DROP ... IF EXISTS` the three retired procedures; `003` idempotently drops the retired position-recalc trigger and `CREATE OR ALTER`s the audit trigger; `004` checks before inserting) - convenient when iterating, but be aware `001` is destructive: rerunning it against a database with real data wipes it. Running `002`/`003` against a fresh database (nothing to drop) and against a legacy build (retired objects present) both run cleanly.
 
 ## Stand up a local instance (Docker)
 
@@ -41,15 +50,15 @@ Set the environment variable to point at a different instance rather than editin
 dotnet run --project Samples/08_Misc/03_LegacySqlDemo
 ```
 
-Walks through: ensure portfolio/security rows exist, submit a compliant order (accepted), submit one that breaches the seeded `max_order_price` limit (rejected, with reason), record a fill against the accepted order, and print the position that `trg_Trades_PositionRecalc` computed automatically.
+Walks through: ensure portfolio/security rows exist, submit a compliant order (accepted), submit one that breaches the seeded `max_order_price` limit (rejected, with reason), record a fill against the accepted order, and print the position that `PositionRecalculationService` (invoked once by the gateway inside the trade's transaction) recomputed.
 
 ## What's in each file
 
 | File | Contents |
 |---|---|
 | `001_Schema.sql` | Tables: `Portfolios`, `Securities`, `RiskLimits`, `Orders`, `Trades`, `Positions`, `OrderStatusHistory`. |
-| `002_StoredProcedures.sql` | `usp_ValidatePreTradeRisk`, `usp_RecalculatePositionOnTrade`, `usp_SubmitOrder`. |
-| `003_Triggers.sql` | `trg_Trades_PositionRecalc` (AFTER INSERT on `Trades`), `trg_Orders_StatusAudit` (AFTER UPDATE on `Orders`). |
+| `002_StoredProcedures.sql` | Installs no business logic. Idempotently `DROP ... IF EXISTS` the three retired procedures (`usp_ValidatePreTradeRisk`, `usp_RecalculatePositionOnTrade`, `usp_SubmitOrder`) - that logic now lives in the C# service layer (`Algo/Risk`, `Algo/Storages/Sql`). |
+| `003_Triggers.sql` | `trg_Orders_StatusAudit` (AFTER UPDATE on `Orders`) - pure audit CRUD cascading status changes to `OrderStatusHistory`. Idempotently drops the retired `trg_Trades_PositionRecalc`; position/P&L recompute is now a single C# call (`PositionRecalculationService`). |
 | `004_SeedData.sql` | One `DEMO` portfolio, two securities (`AAPL`, `MSFT`), one portfolio-wide `RiskLimits` row. |
 
 See `/LEGACY_LAYER.md` at the repo root for what this layer is modeling and why it was added.
