@@ -4,13 +4,15 @@ namespace StockSharp.Algo.Risk;
 /// Risk-rule, tracking orders placing frequency.
 /// </summary>
 /// <remarks>
-/// dbo.usp_ValidatePreTradeRisk (Database/002_StoredProcedures.sql) ports this
-/// same Count/Interval check, but not the same algorithm: this class buckets
-/// time into non-overlapping windows (a burst that straddles a bucket
-/// boundary can dodge the limit), while the SQL version runs a true rolling
-/// COUNT(*) over "now minus Interval seconds". Same configuration can produce
-/// a different accept/reject answer for the same burst pattern depending on
-/// which one evaluates it.
+/// Order-frequency is now evaluated by the single canonical rolling-window evaluator in
+/// <see cref="CanonicalRiskRules"/>, which is also used by the per-order gate
+/// <see cref="PreTradeRiskService"/>. Because both consume the same definition, the
+/// circuit breaker and the gate can no longer give different accept/reject answers for the
+/// same burst. The previous fixed, non-overlapping bucket algorithm was retired: a burst
+/// straddling a bucket boundary could dodge the limit (looser than the SQL rolling COUNT(*)),
+/// which would violate the threshold-strictness invariant. This rule keeps its circuit-breaker
+/// lifecycle - when the rolling count meets or exceeds <see cref="Count"/> it trips (takes its
+/// configured action) and resets its in-window buffer.
 /// </remarks>
 [Display(
 	ResourceType = typeof(LocalizedStrings),
@@ -19,8 +21,10 @@ namespace StockSharp.Algo.Risk;
 	GroupName = LocalizedStrings.OrdersKey)]
 public class RiskOrderFreqRule : RiskRule
 {
-	private DateTime? _endTime;
-	private int _current;
+	// Rolling-window state: timestamps (message.LocalTime) of recent OrderRegister/OrderReplace
+	// messages. Replaces the old fixed-bucket _endTime/_current pair. The canonical evaluator in
+	// CanonicalRiskRules counts the entries falling in the trailing Interval (AAP 0.6.1).
+	private readonly List<DateTime> _times = [];
 
 	/// <inheritdoc />
 	protected override string GetTitle() => Count + " -> " + Interval;
@@ -85,8 +89,7 @@ public class RiskOrderFreqRule : RiskRule
 	{
 		base.Reset();
 
-		_current = 0;
-		_endTime = null;
+		_times.Clear();
 	}
 
 	/// <inheritdoc />
@@ -100,41 +103,30 @@ public class RiskOrderFreqRule : RiskRule
 				var time = message.LocalTime;
 
 				if (time == default)
-				{
-					//LogWarning("Time is null. Msg={0}", message);
 					return false;
-				}
 
-				if (_endTime == null)
+				// Canonical rolling window (AAP 0.6.1): append this order's time, then ask the
+				// SINGLE shared evaluator - also used by PreTradeRiskService - whether the number
+				// of orders within the trailing Interval meets or exceeds Count. "IncludingCurrent"
+				// because we have already appended the current order (the gate instead counts DB
+				// rows and adds +1; both conventions yield identical answers).
+				_times.Add(time);
+
+				if (CanonicalRiskRules.IsOrderFrequencyBreachedIncludingCurrent(_times, time, Interval, Count))
 				{
-					_endTime = time + Interval;
-					_current = 1;
-
-					//LogDebug("EndTime={0}", _endTime);
-					return false;
+					// Circuit-breaker trip-then-reset lifecycle: mirrors the old `_endTime = null`
+					// reset. Clearing after a trip stops the action from re-firing on every
+					// subsequent order and keeps parity with the existing OrderFreq test. This is
+					// still strictly stricter than the retired fixed-bucket algorithm, which could
+					// let a boundary-straddling burst slip through.
+					_times.Clear();
+					return true;
 				}
 
-				if (time < _endTime)
-				{
-					_current++;
-
-					//LogDebug("Count={0} Msg={1}", _current, message);
-
-					if (_current >= Count)
-					{
-						//LogInfo("Count={0} EndTime={1}", _current, _endTime);
-
-						_endTime = null;
-						return true;
-					}
-				}
-				else
-				{
-					_endTime = time + Interval;
-					_current = 1;
-
-					//LogDebug("EndTime={0}", _endTime);
-				}
+				// Not breached: drop entries that have aged out of the trailing window so the
+				// buffer stays bounded (they cannot affect any future window). The evaluator above
+				// already ignores them, so this is pure memory hygiene and does not change results.
+				_times.RemoveAll(t => t < time - Interval);
 
 				return false;
 			}
