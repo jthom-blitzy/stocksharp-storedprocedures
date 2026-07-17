@@ -20,9 +20,13 @@ namespace StockSharp.Algo.Risk;
 /// different inputs by design - the circuit breaker feeds live stream/position
 /// state, the gate feeds a prospective order and SQL-sourced aggregates:
 /// <list type="bullet">
-/// <item>Order price, quantity and notional value: identical pure-threshold rule
-/// classes (<see cref="RiskOrderPriceRule"/>, <see cref="RiskOrderVolumeRule"/>,
-/// <see cref="RiskOrderValueRule"/>) used by both.</item>
+/// <item>Order price and quantity: one shared comparison
+/// (<see cref="RiskOrderPriceRule.IsOrderPriceExceeded"/> /
+/// <see cref="RiskOrderVolumeRule.IsOrderVolumeExceeded"/>) that owns the
+/// <c>0 = "not enforced"</c> and <c>">="</c> convention; both the circuit
+/// breaker (via <c>ProcessMessage</c>) and the gate call it, so the enable/disable
+/// and comparison semantics do not diverge. Order notional value uses the shared
+/// <see cref="RiskOrderValueRule"/> class (same convention) in both patterns.</item>
 /// <item>Order frequency (<see cref="RiskOrderFreqRule"/>), resulting position
 /// size (<see cref="RiskPositionSizeRule"/>) and daily traded volume
 /// (<see cref="RiskDailyVolumeRule"/>): the decision is one shared comparison

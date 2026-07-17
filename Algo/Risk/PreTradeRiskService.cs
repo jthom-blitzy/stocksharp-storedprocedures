@@ -139,7 +139,7 @@ public class PreTradeRiskService
 		// Sides only models Buy/Sell, but guard defensively to mirror the SQL
 		// "side NOT IN ('B','S')" pre-check exactly.
 		if (side != Sides.Buy && side != Sides.Sell)
-			return Reject(Inv($"Invalid side: {side}"));
+			return RejectInvalid(Inv($"Invalid side: {side}"));
 
 		// Coerce qty to the schema scale first (the proc parameter was DECIMAL(18,4)),
 		// then apply the positive-quantity pre-check on the coerced value so a sub-tick
@@ -147,9 +147,38 @@ public class PreTradeRiskService
 		qty = Round4(qty);
 
 		if (qty <= 0)
-			return Reject("Invalid qty");
+			return RejectInvalid("Invalid qty");
 
 		var normPrice = price.HasValue ? Round4(price.Value) : (decimal?)null;
+
+		// --- order-type-aware price validation (CR-3) ----------------------
+		// The retired SQL proc carried @order_type but only checked "@price IS NOT
+		// NULL" for a LIMIT order - it never validated positivity, so a zero or
+		// NEGATIVE limit price slipped underneath every positive ceiling and was
+		// accepted. Validate the price against the order type BEFORE any RiskLimits
+		// row is loaded or applied. A malformed request is a bad INPUT, not a
+		// risk-limit breach, so it is rejected with the InvalidRequest kind (the
+		// gateway must not persist a REJECTED audit row for it - see MJ-1).
+		//
+		// Only LIMIT and MARKET are supported: the schema's order_type CHECK accepts
+		// exactly these and the gateway maps only these, so anything else (e.g.
+		// Conditional) is a malformed request.
+		if (orderType != OrderTypes.Limit && orderType != OrderTypes.Market)
+			return RejectInvalid(Inv($"Unsupported order type: {orderType}"));
+
+		// A supplied price must be strictly positive for ANY order type; a
+		// non-positive value (including a sub-tick price that rounds to zero at the
+		// schema scale) is malformed and must never be silently accepted.
+		if (normPrice.HasValue && normPrice.Value <= 0)
+			return RejectInvalid(Inv($"Invalid non-positive price {normPrice.Value}"));
+
+		// A LIMIT order MUST carry a price: without one there is no ceiling to test
+		// and the notional/commission estimates are undefined. A MARKET order may
+		// omit the price (null) - the commission estimate falls back to the
+		// security's last traded price - or carry a positive reference price
+		// (already validated positive above).
+		if (orderType == OrderTypes.Limit && normPrice is null)
+			return RejectInvalid("LIMIT order requires a price");
 
 		// --- most-specific RiskLimits row (SQL L100-118): portfolio+security,
 		//     then portfolio-only, then security-only, newest effective_date ---
@@ -204,6 +233,44 @@ public class PreTradeRiskService
 			return Accept();
 		}
 
+		// --- RiskLimits configuration validation (MJ-2) --------------------
+		// Validate the ENTIRE selected row up front, BEFORE any per-rule enable/
+		// disable guard runs. A negative threshold, commission rate, frequency count
+		// or frequency window is invalid configuration and must FAIL CLOSED (reject)
+		// - never silently disable a control. Previously a negative frequency window
+		// was swallowed by the per-rule ">0" guard (the whole frequency check was
+		// skipped => fail OPEN) and a negative commission_rate flowed straight into
+		// the estimate. A NULL threshold is genuinely "not configured" and is left
+		// alone (a nullable "< 0" comparison is false when the value is NULL).
+		if (maxOrderPrice < 0)
+			return Reject(Inv($"Invalid negative max_order_price {maxOrderPrice}; failing closed"));
+		if (maxOrderQty < 0)
+			return Reject(Inv($"Invalid negative max_order_qty {maxOrderQty}; failing closed"));
+		if (maxOrderValue < 0)
+			return Reject(Inv($"Invalid negative max_order_value {maxOrderValue}; failing closed"));
+		if (maxPositionSize < 0)
+			return Reject(Inv($"Invalid negative max_position_size {maxPositionSize}; failing closed"));
+		if (maxDailyVolume < 0)
+			return Reject(Inv($"Invalid negative max_daily_volume {maxDailyVolume}; failing closed"));
+		if (maxCommissionTotal < 0)
+			return Reject(Inv($"Invalid negative max_commission_total {maxCommissionTotal}; failing closed"));
+		if (commissionRate < 0)
+			return Reject(Inv($"Invalid negative commission_rate {commissionRate}; failing closed"));
+		if (maxOrderFreqCount < 0)
+			return Reject(Inv($"Invalid negative max_order_freq_count {maxOrderFreqCount}; failing closed"));
+		if (maxOrderFreqWindowSec < 0)
+			return Reject(Inv($"Invalid negative max_order_freq_window_sec {maxOrderFreqWindowSec}; failing closed"));
+
+		// Frequency fields must be internally consistent: the rolling-window check
+		// needs BOTH a positive count and a positive window. If exactly one side is
+		// configured (the other NULL or zero) the rule cannot be evaluated - fail
+		// closed rather than silently not enforcing it. When both are NULL/0 the
+		// frequency check is simply "not enforced".
+		var freqCountSet = maxOrderFreqCount is not null && maxOrderFreqCount.Value != 0;
+		var freqWindowSet = maxOrderFreqWindowSec is not null && maxOrderFreqWindowSec.Value != 0;
+		if (freqCountSet != freqWindowSet)
+			return Reject(Inv($"Inconsistent frequency config: count={maxOrderFreqCount}, window_sec={maxOrderFreqWindowSec}; failing closed"));
+
 		// Prospective-order message fed to the canonical pure-threshold rules: the
 		// gate executes the SAME rule comparison the RiskManager circuit breaker uses.
 		var orderMessage = new OrderRegisterMessage
@@ -213,36 +280,33 @@ public class PreTradeRiskService
 			Price = normPrice ?? 0m,
 		};
 
-		// RULE 1 - order price ceiling (SQL L129-134): canonical RiskOrderPriceRule.
-		// Only when both a price and a non-zero limit exist. NULL/0 = not enforced;
-		// a negative limit is invalid config and fails closed.
-		if (normPrice.HasValue && maxOrderPrice.HasValue && maxOrderPrice.Value != 0)
+		// RULE 1 - order price ceiling (SQL L129-134): the gate routes through the
+		// canonical RiskOrderPriceRule.IsOrderPriceExceeded helper - the SAME 0 = "not
+		// enforced" + ">=" comparison the RiskManager stream path uses - so the two
+		// enforcement patterns can never diverge on the enable/disable convention (MJ-3).
+		// Negative configuration already failed closed in the validation block above (MJ-2).
+		if (normPrice.HasValue && maxOrderPrice.HasValue)
 		{
-			if (maxOrderPrice.Value < 0)
-				return Reject(Inv($"Invalid negative max_order_price {maxOrderPrice.Value}; failing closed"));
-
-			if (new RiskOrderPriceRule { Price = maxOrderPrice.Value }.ProcessMessage(orderMessage))
+			if (RiskOrderPriceRule.IsOrderPriceExceeded(normPrice.Value, maxOrderPrice.Value))
 				return Reject(Inv($"Order price {normPrice.Value} meets/exceeds limit {maxOrderPrice.Value}"));
 		}
 
-		// RULE 2 - order qty ceiling (SQL L136-141): canonical RiskOrderVolumeRule.
-		if (maxOrderQty.HasValue && maxOrderQty.Value != 0)
+		// RULE 2 - order qty ceiling (SQL L136-141): the gate routes through the
+		// canonical RiskOrderVolumeRule.IsOrderVolumeExceeded helper - the SAME
+		// 0 = "not enforced" + ">=" comparison the RiskManager stream path uses (MJ-3).
+		// Negative configuration already failed closed in the validation block above (MJ-2).
+		if (maxOrderQty.HasValue)
 		{
-			if (maxOrderQty.Value < 0)
-				return Reject(Inv($"Invalid negative max_order_qty {maxOrderQty.Value}; failing closed"));
-
-			if (new RiskOrderVolumeRule { Volume = maxOrderQty.Value }.ProcessMessage(orderMessage))
+			if (RiskOrderVolumeRule.IsOrderVolumeExceeded(qty, maxOrderQty.Value))
 				return Reject(Inv($"Order qty {qty} meets/exceeds limit {maxOrderQty.Value}"));
 		}
 
 		// RULE 3 - notional value ceiling (SQL L143-148): canonical RiskOrderValueRule,
 		// relocated from SQL-only max_order_value. qty*price >= limit (full-precision
-		// product vs the scale-4 limit, exactly as SQL compared @qty*@price).
+		// product vs the scale-4 limit, exactly as SQL compared @qty*@price). Negative
+		// configuration already failed closed in the validation block above (MJ-2).
 		if (normPrice.HasValue && maxOrderValue.HasValue && maxOrderValue.Value != 0)
 		{
-			if (maxOrderValue.Value < 0)
-				return Reject(Inv($"Invalid negative max_order_value {maxOrderValue.Value}; failing closed"));
-
 			if (new RiskOrderValueRule { OrderValue = maxOrderValue.Value }.ProcessMessage(orderMessage))
 				return Reject(Inv($"Order value {qty * normPrice.Value} meets/exceeds limit {maxOrderValue.Value}"));
 		}
@@ -251,14 +315,13 @@ public class PreTradeRiskService
 		// The gate supplies the true rolling COUNT (orders within "now - window") read
 		// from SQL and defers the decision to RiskOrderFreqRule.IsFrequencyExceeded -
 		// the SAME helper the stream path calls, so both agree at the boundary. Rolling
-		// wins under stricter-wins (AAP 0.6.3). A non-positive window is disabled, matching
-		// the rule's Interval<=0 semantics; a negative count is invalid config (fails closed).
-		if (maxOrderFreqCount.HasValue && maxOrderFreqCount.Value != 0
-			&& maxOrderFreqWindowSec.HasValue && maxOrderFreqWindowSec.Value > 0)
+		// wins under stricter-wins (AAP 0.6.3). The validation block above guarantees
+		// that when a frequency limit is configured BOTH the count and window are
+		// positive (negative or half-configured values already failed closed - MJ-2),
+		// so the rolling-window check runs whenever freqCountSet is true. This closes
+		// the earlier fail-OPEN hole where a negative window silently skipped the check.
+		if (freqCountSet)
 		{
-			if (maxOrderFreqCount.Value < 0)
-				return Reject(Inv($"Invalid negative max_order_freq_count {maxOrderFreqCount.Value}; failing closed"));
-
 			int recentCount;
 
 			await using (var freqCmd = new SqlCommand(
@@ -286,9 +349,6 @@ public class PreTradeRiskService
 		// stricter-wins hard constraint (AAP 0.6.2/0.6.4).
 		if (maxPositionSize.HasValue && maxPositionSize.Value != 0)
 		{
-			if (maxPositionSize.Value < 0)
-				return Reject(Inv($"Invalid negative max_position_size {maxPositionSize.Value}; failing closed"));
-
 			decimal currentQty;
 
 			await using (var posCmd = new SqlCommand(
@@ -324,9 +384,6 @@ public class PreTradeRiskService
 		// the @estCommission variable.
 		if (maxCommissionTotal.HasValue && maxCommissionTotal.Value != 0)
 		{
-			if (maxCommissionTotal.Value < 0)
-				return Reject(Inv($"Invalid negative max_commission_total {maxCommissionTotal.Value}; failing closed"));
-
 			var rate = Round6(commissionRate ?? _defaultCommissionRate);
 			var estPrice = normPrice;
 
@@ -377,18 +434,16 @@ public class PreTradeRiskService
 		// RULE 7 - daily traded volume (SQL L226-243): canonical RiskDailyVolumeRule,
 		// relocated from SQL-only max_daily_volume. The decision uses
 		// RiskDailyVolumeRule.IsDailyVolumeExceeded - the SAME helper the stream path
-		// calls - fed today's accepted/filled volume (from SQL) plus the new qty. The
-		// "today" filter is a sargable UTC [dayStart, dayEnd) range over the indexed
-		// submitted_date rather than CAST(... AS DATE), preserving the calendar-day
-		// semantics while remaining index-friendly.
+		// calls - fed today's accepted/filled volume (from SQL) plus the new qty.
+		// The "today" boundary is derived from the DATABASE clock inside the same
+		// transaction (CAST(SYSUTCDATETIME() AS DATE)), matching the retired SQL proc
+		// which compared CAST(submitted_date AS DATE) = CAST(SYSUTCDATETIME() AS DATE).
+		// Using the DB clock rather than the client's DateTime.UtcNow avoids clock skew
+		// and midnight-race UNDERcounting (MJ-7); the filter stays a sargable half-open
+		// range over the indexed submitted_date rather than wrapping the column in CAST.
+		// Negative configuration already failed closed in the validation block above (MJ-2).
 		if (maxDailyVolume.HasValue && maxDailyVolume.Value != 0)
 		{
-			if (maxDailyVolume.Value < 0)
-				return Reject(Inv($"Invalid negative max_daily_volume {maxDailyVolume.Value}; failing closed"));
-
-			var dayStart = DateTime.UtcNow.Date;
-			var dayEnd = dayStart.AddDays(1);
-
 			decimal todayQty;
 
 			await using (var dailyCmd = new SqlCommand(
@@ -398,8 +453,8 @@ public class PreTradeRiskService
 				WHERE portfolio_id = @portfolio_id
 					AND security_id = @security_id
 					AND status IN ('ACCEPTED','FILLED','PARTFILLED')
-					AND submitted_date >= @day_start
-					AND submitted_date < @day_end
+					AND submitted_date >= CAST(SYSUTCDATETIME() AS DATE)
+					AND submitted_date < DATEADD(DAY, 1, CAST(SYSUTCDATETIME() AS DATE))
 				""", connection)
 			{
 				Transaction = transaction,
@@ -407,8 +462,6 @@ public class PreTradeRiskService
 			{
 				dailyCmd.Parameters.AddWithValue("@portfolio_id", portfolioId);
 				dailyCmd.Parameters.AddWithValue("@security_id", securityId);
-				dailyCmd.Parameters.AddWithValue("@day_start", dayStart);
-				dailyCmd.Parameters.AddWithValue("@day_end", dayEnd);
 
 				var rawToday = await dailyCmd.ExecuteScalarAsync(cancellationToken);
 				todayQty = rawToday is decimal d ? Round4(d) : 0m;
@@ -423,15 +476,51 @@ public class PreTradeRiskService
 		return Accept();
 	}
 
-	private static PreTradeRiskResult Accept() => new() { IsValid = true };
+	private static PreTradeRiskResult Accept() => new() { IsValid = true, RejectionKind = PreTradeRejectionKind.None };
 
-	private static PreTradeRiskResult Reject(string reason) => new() { IsValid = false, RejectReason = reason };
+	// A risk-LIMIT rejection: the request was well-formed but breached a configured
+	// (or fail-closed misconfigured) risk control. The gateway persists a REJECTED
+	// audit row for these (MJ-1).
+	private static PreTradeRiskResult Reject(string reason)
+		=> new() { IsValid = false, RejectReason = reason, RejectionKind = PreTradeRejectionKind.RiskLimit };
+
+	// A malformed-REQUEST rejection: the order itself is invalid (bad side, order
+	// type, quantity or price) and could never be persisted - it would violate a
+	// schema CHECK constraint or has no valid enum mapping. The gateway returns the
+	// result WITHOUT inserting anything (MJ-1), so an invalid input never throws or
+	// leaves a spurious audit row.
+	private static PreTradeRiskResult RejectInvalid(string reason)
+		=> new() { IsValid = false, RejectReason = reason, RejectionKind = PreTradeRejectionKind.InvalidRequest };
 
 	private static decimal? GetNullableDecimal(SqlDataReader reader, int ordinal)
 		=> reader.IsDBNull(ordinal) ? null : reader.GetDecimal(ordinal);
 
 	private static int? GetNullableInt(SqlDataReader reader, int ordinal)
 		=> reader.IsDBNull(ordinal) ? null : reader.GetInt32(ordinal);
+}
+
+/// <summary>
+/// Classifies why a pre-trade validation rejected an order so the caller can react
+/// correctly - persisting a risk-limit rejection as an audit row versus returning a
+/// malformed request that could never be stored.
+/// </summary>
+public enum PreTradeRejectionKind
+{
+	/// <summary>The order was accepted; there is no rejection.</summary>
+	None,
+
+	/// <summary>
+	/// The request itself is malformed (invalid side, order type, quantity or price).
+	/// It cannot be persisted (it would violate a schema CHECK constraint or has no
+	/// valid mapping) and must be returned to the caller without any database side effect.
+	/// </summary>
+	InvalidRequest,
+
+	/// <summary>
+	/// The request was well-formed but breached a configured (or fail-closed
+	/// misconfigured) risk control. A REJECTED audit row may be persisted for it.
+	/// </summary>
+	RiskLimit,
 }
 
 /// <summary>
@@ -449,4 +538,12 @@ public class PreTradeRiskResult
 	/// <see langword="false"/>; otherwise <see langword="null"/>.
 	/// </summary>
 	public string RejectReason { get; init; }
+
+	/// <summary>
+	/// Classifies the rejection when <see cref="IsValid"/> is <see langword="false"/>
+	/// (<see cref="PreTradeRejectionKind.InvalidRequest"/> for a malformed order,
+	/// <see cref="PreTradeRejectionKind.RiskLimit"/> for a risk-control breach);
+	/// <see cref="PreTradeRejectionKind.None"/> when the order was accepted.
+	/// </summary>
+	public PreTradeRejectionKind RejectionKind { get; init; }
 }

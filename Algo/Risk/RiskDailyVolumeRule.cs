@@ -121,30 +121,55 @@ public class RiskDailyVolumeRule : RiskRule
 				break;
 
 			case MessageTypes.OrderReplace:
-			{
 				volume = ((OrderReplaceMessage)message).Volume;
-
-				if (volume <= 0)
-					return false;
-
 				break;
-			}
 
 			default:
 				return false;
 		}
 
+		// A non-positive order volume must NEVER move the authoritative daily
+		// accumulator: a negative volume would silently REDUCE today's running
+		// total (loosening the control, which stricter-wins forbids) and a zero
+		// volume carries no traded quantity. Applied to BOTH OrderRegister and
+		// OrderReplace so the two message paths cannot disagree (CR-2 - previously
+		// only OrderReplace guarded this, letting a negative OrderRegister erode
+		// the total).
+		if (volume <= 0)
+			return false;
+
+		var time = message.LocalTime;
+
+		// Ignore a default/unset timestamp: bucketing it as day 0001-01-01 would
+		// otherwise be treated as an out-of-order older day and, under the old
+		// logic, destructively reset the authoritative current-day total (CR-2).
+		if (time == default)
+			return false;
+
+		// Normalize to UTC so the day boundary is consistent regardless of the
+		// timestamp's DateTimeKind: a Local-kind time is converted; Utc and
+		// Unspecified are already day-consistent and used as-is.
+		if (time.Kind == DateTimeKind.Local)
+			time = time.ToUniversalTime();
+
+		var day = time.Date;
+
 		lock (_sync)
 		{
-			// Bucket by the message timestamp's date and reset when the day rolls
-			// over. The gate supplies the authoritative SQL UTC-day total instead
-			// of this streaming accumulator.
-			var day = message.LocalTime.Date;
-
-			if (day != _accumulatedDate)
+			// Bucket by the (UTC-normalized) message date. The authoritative
+			// current-day state advances FORWARD only and is never rolled back
+			// (CR-2): a genuinely newer day starts a fresh total, while an
+			// out-of-order OLDER-day message is ignored so it cannot erase today's
+			// accumulated volume. The gate supplies the authoritative SQL UTC-day
+			// total instead of this streaming accumulator.
+			if (day > _accumulatedDate)
 			{
 				_accumulatedDate = day;
 				_accumulatedVolume = 0;
+			}
+			else if (day < _accumulatedDate)
+			{
+				return false;
 			}
 
 			_accumulatedVolume += volume;

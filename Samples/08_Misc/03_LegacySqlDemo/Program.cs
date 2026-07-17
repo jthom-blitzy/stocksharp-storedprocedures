@@ -13,8 +13,9 @@ using StockSharp.Messages;
 /// record a fill, and show the position being recomputed in C#. Pre-trade
 /// validation now runs in the C# PreTradeRiskService and position recompute in
 /// the C# PositionRecalculationService (both in StockSharp.Algo.Risk); the SQL
-/// side is pure data storage. See LEGACY_LAYER.md at the repo root for the full
-/// writeup of what this layer is and why it exists.
+/// side holds data only (tables, the RiskLimits threshold values, and a pure
+/// audit trigger) with no risk-decision or P&amp;L logic. See LEGACY_LAYER.md at the
+/// repo root for the full writeup of what this layer is and why it exists.
 ///
 /// Requires a running SQL Server with the StockSharpLegacy database - see
 /// Database/README.md for the one-line Docker command, or set
@@ -60,17 +61,20 @@ class Program
 		Console.WriteLine("     Note: this rejection comes from the C# PreTradeRiskService (Algo/Risk), the");
 		Console.WriteLine("     per-order pre-trade gate. Risk rules are now defined once as canonical");
 		Console.WriteLine("     IRiskRule classes; the RiskManager circuit breaker and this pre-trade gate");
-		Console.WriteLine("     are two distinct patterns that share those definitions - they no longer diverge.");
+		Console.WriteLine("     are two distinct patterns that share those canonical definitions (the same");
+		Console.WriteLine("     intended comparisons) where a rule exists in both.");
 		Console.WriteLine();
 
 		if (!order1.IsValid)
 			return;
 
 		// --- record a fill against the accepted order; RecordTradeAsync inserts the
-		//     trade and then calls PositionRecalculationService exactly once to
-		//     recompute dbo.Positions (no trigger, no double-count) ---
+		//     trade and then calls PositionRecalculationService once, inside one
+		//     transaction, to recompute dbo.Positions. There is no auto-recompute
+		//     trigger; passing an execution key would additionally make a retried
+		//     fill idempotent (the fill is applied exactly once end-to-end). ---
 		Console.WriteLine("Recording a trade: 100 @ 150.00 against order #1...");
-		await gateway.RecordTradeAsync(order1.OrderId, 100m, 150.00m);
+		await gateway.RecordTradeAsync(order1.OrderId.Value, 100m, 150.00m);
 
 		var position = await gateway.GetPositionAsync(portfolioId, securityId);
 		Console.WriteLine($"  -> position after recompute: qty={position.Quantity} avg_price={position.AveragePrice} realized_pnl={position.RealizedPnL}");

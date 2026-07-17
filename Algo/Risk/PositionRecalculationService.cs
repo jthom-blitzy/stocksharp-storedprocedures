@@ -17,10 +17,18 @@ using Microsoft.Data.SqlClient;
 /// a trade (see LEGACY_LAYER.md). This service is the single, unambiguous source of
 /// recompute: the gateway calls the transaction-aware
 /// <see cref="RecalculateAsync(SqlConnection, SqlTransaction, long, decimal, decimal, CancellationToken)"/>
-/// EXACTLY ONCE, inside the very transaction that inserts the trade, so the trade
-/// row and its position effect commit or roll back together. Exactly-once is
-/// therefore structural - a single call within one atomic unit - which removes the
-/// legacy double-count hazard without needing a per-trade idempotency column.
+/// exactly once per trade, inside the very transaction that inserts the trade, so the
+/// trade row and its position effect commit or roll back together.
+/// </para>
+/// <para>
+/// A single call within one atomic transaction guarantees each trade is applied once
+/// <em>for that insert</em>, but it cannot by itself make a RETRY safe: re-running the
+/// same logical fill would insert a second trade and apply the delta again. Replay
+/// safety is therefore provided by the Trades.execution_id idempotency key
+/// (001_Schema.sql): the gateway records a trade under that key, and a duplicate key
+/// skips both the insert and this recompute, so a retried fill is applied exactly
+/// once end-to-end. The former standalone mutator overload was removed because it
+/// mutated the position with no trade row and no key to detect such a replay (CR-4).
 /// </para>
 /// <para>
 /// The position row is read under WITH (UPDLOCK, HOLDLOCK) so concurrent fills for
@@ -143,35 +151,25 @@ public class PositionRecalculationService
 		return (Round4(newQty), Round4(newAvgPrice), Round4(newRealizedPnl));
 	}
 
-	/// <summary>
-	/// Reads the order and its current position, recomputes from the given trade and
-	/// persists the result on a freshly opened, dedicated serializable transaction.
-	/// Convenience entry point for standalone use and tests; the production path uses
-	/// the transaction-aware overload so the recompute shares the trade-insert
-	/// transaction.
-	/// </summary>
-	/// <param name="orderId">Identifier of the order the trade belongs to; its portfolio, security and side drive the recompute.</param>
-	/// <param name="tradeQty">Executed trade quantity (must be positive).</param>
-	/// <param name="tradePrice">Executed trade price (must be positive).</param>
-	/// <param name="cancellationToken">Token used to cancel the asynchronous operation.</param>
-	public async Task RecalculateAsync(long orderId, decimal tradeQty, decimal tradePrice, CancellationToken cancellationToken = default)
-	{
-		await using var connection = CreateConnection();
-		await connection.OpenAsync(cancellationToken);
-
-		await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(IsolationLevel.Serializable, cancellationToken);
-
-		await RecalculateAsync(connection, transaction, orderId, tradeQty, tradePrice, cancellationToken);
-
-		await transaction.CommitAsync(cancellationToken);
-	}
+	// NOTE (CR-4): the standalone RecalculateAsync(orderId, qty, price) convenience
+	// overload was intentionally removed. It opened its own transaction and mutated
+	// the stored position from raw (qty, price) arguments WITHOUT inserting - or even
+	// identifying - a Trade row, so nothing tied the mutation to a specific execution.
+	// Calling it twice (a retry, or a manual re-run) applied the same position delta
+	// twice with no way to detect the replay - a silent double-count. The only
+	// supported way to drive a recompute is now the transaction-aware overload below,
+	// which the gateway invokes exactly once inside the same transaction that inserts
+	// the trade, under the Trades.execution_id idempotency key. The pure, side-effect-
+	// free Recalculate(...) above remains available for computation and unit tests.
 
 	/// <summary>
 	/// Reads the order and its current position, recomputes from the given trade and
 	/// persists the result using a caller-supplied open connection and transaction -
 	/// the same transaction that inserts the trade, so the trade and its position
-	/// effect are one atomic, exactly-once unit. This is the single recompute entry
-	/// point per trade (the old auto-recompute trigger no longer exists).
+	/// effect are one atomic unit. This is the single recompute entry point per trade
+	/// (the old auto-recompute trigger no longer exists); the gateway calls it exactly
+	/// once per trade insert, and the Trades.execution_id idempotency key ensures a
+	/// retried trade neither re-inserts nor re-applies its position effect.
 	/// </summary>
 	/// <param name="connection">Open SQL Server connection.</param>
 	/// <param name="transaction">Transaction that also performs the trade insert.</param>

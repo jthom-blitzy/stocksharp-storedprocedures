@@ -1,8 +1,12 @@
 ﻿namespace StockSharp.Tests;
 
 using System.ComponentModel;
+using System.Data;
+
+using Microsoft.Data.SqlClient;
 
 using StockSharp.Algo.Risk;
+using StockSharp.Algo.Storages.Sql;
 using StockSharp.Algo.Testing;
 
 [TestClass]
@@ -1728,6 +1732,47 @@ public class RiskTests : BaseTestClass
 		RiskOrderFreqRule.IsFrequencyExceeded(3, 3).AssertTrue();  // 4 >= 3
 	}
 
+	[TestMethod]
+	public void OrderPriceExceededHelperParity()
+	{
+		// MJ-3: single shared decision for the order-price ceiling. Both the
+		// RiskManager stream rule (ProcessMessage) and the PreTradeRiskService gate
+		// route through IsOrderPriceExceeded, so 0 = "not enforced" and the ">="
+		// boundary can never diverge between the two enforcement patterns.
+		RiskOrderPriceRule.IsOrderPriceExceeded(90m, 100m).AssertFalse();
+		RiskOrderPriceRule.IsOrderPriceExceeded(100m, 100m).AssertTrue();   // boundary (">=")
+		RiskOrderPriceRule.IsOrderPriceExceeded(110m, 100m).AssertTrue();
+		RiskOrderPriceRule.IsOrderPriceExceeded(1_000m, 0m).AssertFalse();  // 0 = not enforced
+
+		// The canonical rule's ProcessMessage MUST agree with the helper, including
+		// the 0 = "not enforced" case: before MJ-3 the rule tripped at price >= 0
+		// (0 meant "always reject") while the gate treated 0 as disabled - divergent.
+		var enforced = new RiskOrderPriceRule { Price = 100m };
+		enforced.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Price = 100m }).AssertTrue();
+		enforced.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Price = 90m }).AssertFalse();
+
+		var disabled = new RiskOrderPriceRule { Price = 0m };
+		disabled.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Price = 1_000m }).AssertFalse();
+	}
+
+	[TestMethod]
+	public void OrderVolumeExceededHelperParity()
+	{
+		// MJ-3: single shared decision for the order-quantity ceiling, mirroring the
+		// price rule. Both enforcement patterns route through IsOrderVolumeExceeded.
+		RiskOrderVolumeRule.IsOrderVolumeExceeded(500m, 1_000m).AssertFalse();
+		RiskOrderVolumeRule.IsOrderVolumeExceeded(1_000m, 1_000m).AssertTrue();  // boundary (">=")
+		RiskOrderVolumeRule.IsOrderVolumeExceeded(1_500m, 1_000m).AssertTrue();
+		RiskOrderVolumeRule.IsOrderVolumeExceeded(1_000_000m, 0m).AssertFalse(); // 0 = not enforced
+
+		var enforced = new RiskOrderVolumeRule { Volume = 1_000m };
+		enforced.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Volume = 1_000m }).AssertTrue();
+		enforced.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Volume = 500m }).AssertFalse();
+
+		var disabled = new RiskOrderVolumeRule { Volume = 0m };
+		disabled.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Volume = 1_000_000m }).AssertFalse();
+	}
+
 	// --- Position size: canonical SYMMETRIC-ABSOLUTE comparison --------------
 
 	[TestMethod]
@@ -1818,6 +1863,76 @@ public class RiskTests : BaseTestClass
 		ThrowsExactly<ArgumentOutOfRangeException>(() => rule.DailyVolume = -1);
 	}
 
+	[TestMethod]
+	public void DailyVolumeIgnoresNonPositiveVolume()
+	{
+		// CR-2: a negative or zero order volume must NEVER move the authoritative
+		// daily accumulator. Before the fix a negative OrderRegister volume
+		// silently REDUCED today's running total, loosening the control.
+		var rule = new RiskDailyVolumeRule { DailyVolume = 100 };
+		var day = new DateTime(2024, 1, 2, 10, 0, 0, DateTimeKind.Utc);
+
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Volume = 90m, LocalTime = day }).AssertFalse();                    // 90
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Volume = -1000m, LocalTime = day.AddMinutes(1) }).AssertFalse();  // ignored, still 90
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Volume = 0m, LocalTime = day.AddMinutes(2) }).AssertFalse();      // ignored, still 90
+		// A real +10 now reaches the limit, proving the 90 was preserved intact.
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Volume = 10m, LocalTime = day.AddMinutes(3) }).AssertTrue();       // 100 >= 100
+	}
+
+	[TestMethod]
+	public void DailyVolumeIgnoresDefaultTimestamp()
+	{
+		// CR-2: a message with a default/unset timestamp must not be bucketed as
+		// day 0001-01-01 and destructively reset the authoritative current-day total.
+		var rule = new RiskDailyVolumeRule { DailyVolume = 100 };
+		var day = new DateTime(2024, 1, 2, 10, 0, 0, DateTimeKind.Utc);
+
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Volume = 90m, LocalTime = day }).AssertFalse();          // 90
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Volume = 50m, LocalTime = default }).AssertFalse();     // ignored, still 90
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Volume = 10m, LocalTime = day.AddMinutes(1) }).AssertTrue(); // 100 - current-day state survived
+	}
+
+	[TestMethod]
+	public void DailyVolumeIgnoresOutOfOrderOlderDay()
+	{
+		// CR-2: once today's authoritative total is established, an out-of-order
+		// message stamped for an EARLIER day must never roll the state backward and
+		// erase today's accumulated volume.
+		var rule = new RiskDailyVolumeRule { DailyVolume = 100 };
+		var today = new DateTime(2024, 1, 3, 10, 0, 0, DateTimeKind.Utc);
+		var yesterday = new DateTime(2024, 1, 2, 23, 0, 0, DateTimeKind.Utc);
+
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Volume = 90m, LocalTime = today }).AssertFalse();     // today: 90
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Volume = 90m, LocalTime = yesterday }).AssertFalse(); // older day ignored, today still 90
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Volume = 10m, LocalTime = today.AddMinutes(1) }).AssertTrue(); // today: 100
+	}
+
+	[TestMethod]
+	public void DailyVolumeStaysTrippedOnceOverLimit()
+	{
+		// CR-2: current-day totals at/over the limit keep tripping - the fix
+		// preserves the authoritative running total rather than losing it.
+		var rule = new RiskDailyVolumeRule { DailyVolume = 100 };
+		var day = new DateTime(2024, 1, 2, 10, 0, 0, DateTimeKind.Utc);
+
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Volume = 120m, LocalTime = day }).AssertTrue();               // 120 >= 100
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Volume = 1m, LocalTime = day.AddMinutes(1) }).AssertTrue();  // 121 >= 100
+	}
+
+	[TestMethod]
+	public void DailyVolumeNormalizesLocalTimestampToUtc()
+	{
+		// CR-2: Local-kind timestamps are converted to UTC before bucketing so the
+		// day boundary is consistent. A UTC instant and the equivalent Local-kind
+		// time fall in the SAME UTC day and accumulate together.
+		var rule = new RiskDailyVolumeRule { DailyVolume = 100 };
+		var utc = new DateTime(2024, 6, 15, 12, 0, 0, DateTimeKind.Utc);
+		var localSameInstant = utc.ToLocalTime(); // Local kind, same instant
+
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Volume = 60m, LocalTime = utc }).AssertFalse();                          // day: 60
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Volume = 60m, LocalTime = localSameInstant.AddMinutes(1) }).AssertTrue(); // same UTC day: 120 >= 100
+	}
+
 	// --- Position recalculation: pure average-cost + realized-P&L port -------
 
 	[TestMethod]
@@ -1901,5 +2016,828 @@ public class RiskTests : BaseTestClass
 
 		// An unrecognised side is never silently treated as a sell.
 		ThrowsExactly<ArgumentOutOfRangeException>(() => _ = PositionRecalculationService.Recalculate(0m, 0m, 0m, (Sides)999, 100m, 150m));
+	}
+
+	// =====================================================================
+	// DB-integration tests for the pre-trade gate (PreTradeRiskService)
+	// against a live StockSharpLegacy SQL Server. These exercise the gate
+	// end-to-end on real RiskLimits/Orders data: CR-3 order-type-aware price
+	// validation, MJ-2 fail-closed configuration validation, MJ-7 DB-clock
+	// daily scope, and the MJ-1 malformed-request classification. When the
+	// database is unreachable the test is reported INCONCLUSIVE (not failed)
+	// so the pure-unit suite still runs where SQL Server is absent. Each test
+	// creates a uniquely-named portfolio/security so it is isolated from the
+	// seeded DEMO data and from every other test.
+	// =====================================================================
+
+	private static async Task<SqlConnection> OpenLegacyOrInconclusiveAsync(CancellationToken ct = default)
+	{
+		var connection = new SqlConnection(SqlLegacyConnection.Resolve());
+
+		try
+		{
+			await connection.OpenAsync(ct);
+		}
+		catch (Exception ex)
+		{
+			await connection.DisposeAsync();
+			Assert.Inconclusive($"StockSharpLegacy SQL Server is not reachable; skipping integration test. {ex.Message}");
+			throw; // unreachable - Assert.Inconclusive always throws
+		}
+
+		return connection;
+	}
+
+	private static async Task<int> InsertPortfolioAsync(SqlConnection conn, CancellationToken ct = default)
+	{
+		await using var cmd = new SqlCommand(
+			"INSERT INTO dbo.Portfolios (name) OUTPUT INSERTED.portfolio_id VALUES (@name)", conn);
+		cmd.Parameters.AddWithValue("@name", "ITPF_" + Guid.NewGuid().ToString("N"));
+		return (int)await cmd.ExecuteScalarAsync(ct);
+	}
+
+	private static async Task<int> InsertSecurityAsync(SqlConnection conn, CancellationToken ct = default)
+	{
+		await using var cmd = new SqlCommand(
+			"INSERT INTO dbo.Securities (security_code, board_code, security_type) OUTPUT INSERTED.security_id VALUES (@code, @board, @type)", conn);
+		cmd.Parameters.AddWithValue("@code", "ITSEC_" + Guid.NewGuid().ToString("N"));
+		cmd.Parameters.AddWithValue("@board", "ITBRD");
+		cmd.Parameters.AddWithValue("@type", "Stock");
+		return (int)await cmd.ExecuteScalarAsync(ct);
+	}
+
+	private static async Task InsertRiskLimitAsync(
+		SqlConnection conn, int portfolioId, int? securityId = null,
+		decimal? maxOrderPrice = null, decimal? maxOrderQty = null, decimal? maxOrderValue = null,
+		decimal? maxPositionSize = null, decimal? maxDailyVolume = null,
+		int? maxOrderFreqCount = null, int? maxOrderFreqWindowSec = null,
+		decimal? maxCommissionTotal = null, decimal commissionRate = 0.0005m,
+		CancellationToken ct = default)
+	{
+		await using var cmd = new SqlCommand(
+			"""
+			INSERT INTO dbo.RiskLimits
+				(portfolio_id, security_id, max_order_price, max_order_qty, max_order_value,
+				 max_position_size, max_daily_volume, max_order_freq_count, max_order_freq_window_sec,
+				 max_commission_total, commission_rate)
+			VALUES (@pf, @sec, @price, @qty, @value, @pos, @daily, @fc, @fw, @comm, @rate)
+			""", conn);
+		cmd.Parameters.AddWithValue("@pf", portfolioId);
+		cmd.Parameters.AddWithValue("@sec", (object)securityId ?? DBNull.Value);
+		cmd.Parameters.AddWithValue("@price", (object)maxOrderPrice ?? DBNull.Value);
+		cmd.Parameters.AddWithValue("@qty", (object)maxOrderQty ?? DBNull.Value);
+		cmd.Parameters.AddWithValue("@value", (object)maxOrderValue ?? DBNull.Value);
+		cmd.Parameters.AddWithValue("@pos", (object)maxPositionSize ?? DBNull.Value);
+		cmd.Parameters.AddWithValue("@daily", (object)maxDailyVolume ?? DBNull.Value);
+		cmd.Parameters.AddWithValue("@fc", (object)maxOrderFreqCount ?? DBNull.Value);
+		cmd.Parameters.AddWithValue("@fw", (object)maxOrderFreqWindowSec ?? DBNull.Value);
+		cmd.Parameters.AddWithValue("@comm", (object)maxCommissionTotal ?? DBNull.Value);
+		cmd.Parameters.AddWithValue("@rate", commissionRate);
+		await cmd.ExecuteNonQueryAsync(ct);
+	}
+
+	// Inserts an ACCEPTED order with an explicit submitted_date computed from a
+	// trusted DB-clock SQL expression (never user input, so no injection risk).
+	private static async Task InsertAcceptedOrderAsync(
+		SqlConnection conn, int portfolioId, int securityId, decimal qty, string submittedDateSql, CancellationToken ct = default)
+	{
+		await using var cmd = new SqlCommand(
+			$"""
+			INSERT INTO dbo.Orders (portfolio_id, security_id, side, qty, price, order_type, status, submitted_date)
+			VALUES (@pf, @sec, 'B', @qty, 100.0, 'LIMIT', 'ACCEPTED', {submittedDateSql})
+			""", conn);
+		cmd.Parameters.AddWithValue("@pf", portfolioId);
+		cmd.Parameters.AddWithValue("@sec", securityId);
+		cmd.Parameters.Add(new SqlParameter("@qty", SqlDbType.Decimal) { Precision = 18, Scale = 4, Value = qty });
+		await cmd.ExecuteNonQueryAsync(ct);
+	}
+
+	private static PreTradeRiskService NewGateService() => new(SqlLegacyConnection.Resolve());
+
+	[TestMethod]
+	public async Task GateAcceptsInLimitsLimitOrder()
+	{
+		await using var conn = await OpenLegacyOrInconclusiveAsync();
+		var pfId = await InsertPortfolioAsync(conn);
+		var secId = await InsertSecurityAsync(conn);
+		await InsertRiskLimitAsync(conn, pfId, maxOrderPrice: 500m, maxOrderQty: 10000m);
+
+		var result = await NewGateService().ValidateAsync(pfId, secId, Sides.Buy, 100m, 150m, OrderTypes.Limit);
+
+		result.IsValid.AssertTrue();
+		result.RejectionKind.AssertEqual(PreTradeRejectionKind.None);
+	}
+
+	[TestMethod]
+	public async Task GateRejectsPriceCeilingBreachAsRiskLimit()
+	{
+		await using var conn = await OpenLegacyOrInconclusiveAsync();
+		var pfId = await InsertPortfolioAsync(conn);
+		var secId = await InsertSecurityAsync(conn);
+		await InsertRiskLimitAsync(conn, pfId, maxOrderPrice: 500m);
+
+		var result = await NewGateService().ValidateAsync(pfId, secId, Sides.Buy, 1m, 999m, OrderTypes.Limit);
+
+		result.IsValid.AssertFalse();
+		result.RejectionKind.AssertEqual(PreTradeRejectionKind.RiskLimit);
+	}
+
+	[TestMethod]
+	public async Task GateRejectsLimitOrderWithNullPriceAsInvalidRequest()
+	{
+		// CR-3: a LIMIT order with no price is malformed - validated BEFORE any
+		// limit is applied - and classified InvalidRequest (MJ-1), not RiskLimit.
+		await using var conn = await OpenLegacyOrInconclusiveAsync();
+		var pfId = await InsertPortfolioAsync(conn);
+		var secId = await InsertSecurityAsync(conn);
+		await InsertRiskLimitAsync(conn, pfId, maxOrderPrice: 500m);
+
+		var result = await NewGateService().ValidateAsync(pfId, secId, Sides.Buy, 10m, null, OrderTypes.Limit);
+
+		result.IsValid.AssertFalse();
+		result.RejectionKind.AssertEqual(PreTradeRejectionKind.InvalidRequest);
+	}
+
+	[TestMethod]
+	public async Task GateRejectsNonPositivePriceAsInvalidRequest()
+	{
+		// CR-3: a zero or NEGATIVE price is malformed for ANY order type and must
+		// never slip underneath the positive ceilings (as it did in the SQL proc).
+		await using var conn = await OpenLegacyOrInconclusiveAsync();
+		var pfId = await InsertPortfolioAsync(conn);
+		var secId = await InsertSecurityAsync(conn);
+		await InsertRiskLimitAsync(conn, pfId, maxOrderPrice: 500m);
+
+		var svc = NewGateService();
+
+		var negative = await svc.ValidateAsync(pfId, secId, Sides.Buy, 10m, -5m, OrderTypes.Limit);
+		negative.IsValid.AssertFalse();
+		negative.RejectionKind.AssertEqual(PreTradeRejectionKind.InvalidRequest);
+
+		var zero = await svc.ValidateAsync(pfId, secId, Sides.Buy, 10m, 0m, OrderTypes.Limit);
+		zero.IsValid.AssertFalse();
+		zero.RejectionKind.AssertEqual(PreTradeRejectionKind.InvalidRequest);
+	}
+
+	[TestMethod]
+	public async Task GateRejectsUnsupportedOrderTypeAsInvalidRequest()
+	{
+		// CR-3/MJ-1: only LIMIT/MARKET map to the schema; Conditional is malformed.
+		await using var conn = await OpenLegacyOrInconclusiveAsync();
+		var pfId = await InsertPortfolioAsync(conn);
+		var secId = await InsertSecurityAsync(conn);
+		await InsertRiskLimitAsync(conn, pfId, maxOrderPrice: 500m);
+
+		var result = await NewGateService().ValidateAsync(pfId, secId, Sides.Buy, 10m, 150m, OrderTypes.Conditional);
+
+		result.IsValid.AssertFalse();
+		result.RejectionKind.AssertEqual(PreTradeRejectionKind.InvalidRequest);
+	}
+
+	[TestMethod]
+	public async Task GateRejectsInvalidInputsAsInvalidRequest()
+	{
+		// MJ-1 (service side): a malformed side or non-positive quantity is an
+		// InvalidRequest returned as a result - the gate never throws and never
+		// maps an unknown side to a valid one.
+		await using var conn = await OpenLegacyOrInconclusiveAsync();
+		var pfId = await InsertPortfolioAsync(conn);
+		var secId = await InsertSecurityAsync(conn);
+		await InsertRiskLimitAsync(conn, pfId, maxOrderPrice: 500m);
+
+		var svc = NewGateService();
+
+		var badSide = await svc.ValidateAsync(pfId, secId, (Sides)999, 10m, 150m, OrderTypes.Limit);
+		badSide.IsValid.AssertFalse();
+		badSide.RejectionKind.AssertEqual(PreTradeRejectionKind.InvalidRequest);
+
+		var badQty = await svc.ValidateAsync(pfId, secId, Sides.Buy, 0m, 150m, OrderTypes.Limit);
+		badQty.IsValid.AssertFalse();
+		badQty.RejectionKind.AssertEqual(PreTradeRejectionKind.InvalidRequest);
+	}
+
+	[TestMethod]
+	public async Task GateAcceptsMarketOrderWithNullPrice()
+	{
+		// A MARKET order may omit the price; the price ceiling simply does not apply.
+		await using var conn = await OpenLegacyOrInconclusiveAsync();
+		var pfId = await InsertPortfolioAsync(conn);
+		var secId = await InsertSecurityAsync(conn);
+		await InsertRiskLimitAsync(conn, pfId, maxOrderPrice: 500m);
+
+		var result = await NewGateService().ValidateAsync(pfId, secId, Sides.Buy, 10m, null, OrderTypes.Market);
+
+		result.IsValid.AssertTrue();
+	}
+
+	[TestMethod]
+	public async Task GateFailsClosedOnNegativeFreqWindow()
+	{
+		// MJ-2: a negative frequency window is invalid config. Previously the
+		// per-rule ">0" guard swallowed it (freq check skipped => fail OPEN). Now the
+		// up-front validation rejects it (fail CLOSED).
+		await using var conn = await OpenLegacyOrInconclusiveAsync();
+		var pfId = await InsertPortfolioAsync(conn);
+		var secId = await InsertSecurityAsync(conn);
+		await InsertRiskLimitAsync(conn, pfId, maxOrderFreqCount: 5, maxOrderFreqWindowSec: -60);
+
+		var result = await NewGateService().ValidateAsync(pfId, secId, Sides.Buy, 1m, 150m, OrderTypes.Limit);
+
+		result.IsValid.AssertFalse();
+		result.RejectionKind.AssertEqual(PreTradeRejectionKind.RiskLimit);
+	}
+
+	[TestMethod]
+	public async Task GateFailsClosedOnNegativeCommissionRate()
+	{
+		// MJ-2: a negative commission_rate previously flowed straight into the
+		// estimate (never tripping => fail OPEN); now it fails CLOSED.
+		await using var conn = await OpenLegacyOrInconclusiveAsync();
+		var pfId = await InsertPortfolioAsync(conn);
+		var secId = await InsertSecurityAsync(conn);
+		await InsertRiskLimitAsync(conn, pfId, maxCommissionTotal: 5000m, commissionRate: -0.5m);
+
+		var result = await NewGateService().ValidateAsync(pfId, secId, Sides.Buy, 1m, 150m, OrderTypes.Limit);
+
+		result.IsValid.AssertFalse();
+		result.RejectionKind.AssertEqual(PreTradeRejectionKind.RiskLimit);
+	}
+
+	[TestMethod]
+	public async Task GateFailsClosedOnInconsistentFreqConfig()
+	{
+		// MJ-2: a frequency count with no window (or vice versa) cannot be
+		// evaluated; the gate fails closed rather than silently not enforcing it.
+		await using var conn = await OpenLegacyOrInconclusiveAsync();
+		var pfId = await InsertPortfolioAsync(conn);
+		var secId = await InsertSecurityAsync(conn);
+		await InsertRiskLimitAsync(conn, pfId, maxOrderFreqCount: 5, maxOrderFreqWindowSec: null);
+
+		var result = await NewGateService().ValidateAsync(pfId, secId, Sides.Buy, 1m, 150m, OrderTypes.Limit);
+
+		result.IsValid.AssertFalse();
+		result.RejectionKind.AssertEqual(PreTradeRejectionKind.RiskLimit);
+	}
+
+	[TestMethod]
+	public async Task GateSelectsMostSpecificRiskLimits()
+	{
+		// The gate must select the most-specific RiskLimits row: portfolio+security
+		// wins over portfolio-only. A lenient portfolio-only ceiling must NOT mask a
+		// strict portfolio+security ceiling.
+		await using var conn = await OpenLegacyOrInconclusiveAsync();
+		var pfId = await InsertPortfolioAsync(conn);
+		var secId = await InsertSecurityAsync(conn);
+		await InsertRiskLimitAsync(conn, pfId, securityId: null, maxOrderPrice: 1000m); // portfolio-only, lenient
+		await InsertRiskLimitAsync(conn, pfId, securityId: secId, maxOrderPrice: 100m); // portfolio+security, strict
+
+		var result = await NewGateService().ValidateAsync(pfId, secId, Sides.Buy, 1m, 150m, OrderTypes.Limit);
+
+		// 150 >= 100 (strict row) => rejected. If the lenient row were chosen, 150 < 1000 => accepted.
+		result.IsValid.AssertFalse();
+		result.RejectionKind.AssertEqual(PreTradeRejectionKind.RiskLimit);
+	}
+
+	[TestMethod]
+	public async Task GateDailyVolumeUsesDbDayScope()
+	{
+		// MJ-7: the daily "today" boundary is derived from the DATABASE clock
+		// (SYSUTCDATETIME) inside the transaction. An accepted order dated YESTERDAY
+		// (per the DB clock) must be excluded; only TODAY's accepted volume counts.
+		await using var conn = await OpenLegacyOrInconclusiveAsync();
+		var pfId = await InsertPortfolioAsync(conn);
+		var secId = await InsertSecurityAsync(conn);
+		await InsertRiskLimitAsync(conn, pfId, maxDailyVolume: 100m);
+
+		// Yesterday's accepted 90 must NOT count toward today.
+		await InsertAcceptedOrderAsync(conn, pfId, secId, 90m, "DATEADD(DAY, -1, SYSUTCDATETIME())");
+
+		var svc = NewGateService();
+
+		// today 0 + new 30 = 30 < 100 => accepted (proves yesterday's 90 excluded).
+		var accepted = await svc.ValidateAsync(pfId, secId, Sides.Buy, 30m, 100m, OrderTypes.Limit);
+		accepted.IsValid.AssertTrue();
+
+		// Now add today's accepted 80.
+		await InsertAcceptedOrderAsync(conn, pfId, secId, 80m, "SYSUTCDATETIME()");
+
+		// today 80 + new 30 = 110 >= 100 => rejected (proves today's volume counts).
+		var rejected = await svc.ValidateAsync(pfId, secId, Sides.Buy, 30m, 100m, OrderTypes.Limit);
+		rejected.IsValid.AssertFalse();
+		rejected.RejectionKind.AssertEqual(PreTradeRejectionKind.RiskLimit);
+	}
+
+	// =====================================================================
+	// DB-integration tests for the gateway (SqlLegacyOrderGateway) against a
+	// live StockSharpLegacy SQL Server. These exercise CR-4 idempotency
+	// (submission + trade recording), the MJ-1 malformed-vs-risk persistence
+	// contract, MJ-4 concurrency, and the end-to-end DB position recompute.
+	// Each test uses a uniquely-named portfolio/security and a random 64-bit
+	// idempotency key so it is isolated from seeded data, from other tests, and
+	// from prior runs (the idempotency indexes are global, not per-portfolio).
+	// =====================================================================
+
+	private static SqlLegacyOrderGateway NewGateway() => new(SqlLegacyConnection.Resolve());
+
+	// Random 64-bit idempotency key. Guid entropy makes cross-run collisions on the
+	// global UX_Orders_external_transaction_id / UX_Trades_execution_id indexes negligible.
+	private static long NextKey() => BitConverter.ToInt64(Guid.NewGuid().ToByteArray(), 0);
+
+	private static async Task<int> CountOrdersByTransactionAsync(SqlConnection conn, long externalTransactionId, CancellationToken ct = default)
+	{
+		await using var cmd = new SqlCommand(
+			"SELECT COUNT(*) FROM dbo.Orders WHERE external_transaction_id = @txn", conn);
+		cmd.Parameters.AddWithValue("@txn", externalTransactionId);
+		return (int)await cmd.ExecuteScalarAsync(ct);
+	}
+
+	private static async Task<int> CountOrdersByPortfolioAsync(SqlConnection conn, int portfolioId, CancellationToken ct = default)
+	{
+		await using var cmd = new SqlCommand(
+			"SELECT COUNT(*) FROM dbo.Orders WHERE portfolio_id = @pf", conn);
+		cmd.Parameters.AddWithValue("@pf", portfolioId);
+		return (int)await cmd.ExecuteScalarAsync(ct);
+	}
+
+	private static async Task<int> CountTradesByExecutionAsync(SqlConnection conn, long executionId, CancellationToken ct = default)
+	{
+		await using var cmd = new SqlCommand(
+			"SELECT COUNT(*) FROM dbo.Trades WHERE execution_id = @exec", conn);
+		cmd.Parameters.AddWithValue("@exec", executionId);
+		return (int)await cmd.ExecuteScalarAsync(ct);
+	}
+
+	private static async Task<(string Status, string RejectReason)> ReadOrderStatusAsync(SqlConnection conn, long orderId, CancellationToken ct = default)
+	{
+		await using var cmd = new SqlCommand(
+			"SELECT status, reject_reason FROM dbo.Orders WHERE order_id = @id", conn);
+		cmd.Parameters.AddWithValue("@id", orderId);
+		await using var reader = await cmd.ExecuteReaderAsync(ct);
+		await reader.ReadAsync(ct);
+		return (reader.GetString(0), await reader.IsDBNullAsync(1, ct) ? null : reader.GetString(1));
+	}
+
+	[TestMethod]
+	public async Task GatewaySubmitIsIdempotentOnTransactionId()
+	{
+		// CR-4: a retried submit with the same external_transaction_id must return the
+		// ORIGINAL order's outcome and never create a second order row.
+		await using var conn = await OpenLegacyOrInconclusiveAsync();
+		var pfId = await InsertPortfolioAsync(conn);
+		var secId = await InsertSecurityAsync(conn);
+		await InsertRiskLimitAsync(conn, pfId, maxOrderPrice: 1_000_000m);
+
+		var gateway = NewGateway();
+		var txnId = NextKey();
+
+		var first = await gateway.SubmitOrderAsync(pfId, secId, Sides.Buy, 100m, 150m, OrderTypes.Limit, externalTransactionId: txnId);
+		var second = await gateway.SubmitOrderAsync(pfId, secId, Sides.Buy, 100m, 150m, OrderTypes.Limit, externalTransactionId: txnId);
+
+		first.IsValid.AssertTrue();
+		first.OrderId.AssertNotNull();
+		second.IsValid.AssertTrue();
+		second.OrderId.AssertEqual(first.OrderId); // same order returned, not a new one
+		(await CountOrdersByTransactionAsync(conn, txnId)).AssertEqual(1);
+	}
+
+	[TestMethod]
+	public async Task GatewayRecordTradeIsIdempotentOnExecutionId()
+	{
+		// CR-4: a retried RecordTrade with the same execution_id must insert exactly one
+		// trade and apply the position effect exactly once (no double-count).
+		await using var conn = await OpenLegacyOrInconclusiveAsync();
+		var pfId = await InsertPortfolioAsync(conn);
+		var secId = await InsertSecurityAsync(conn);
+		await InsertRiskLimitAsync(conn, pfId, maxOrderPrice: 1_000_000m);
+
+		var gateway = NewGateway();
+
+		var submit = await gateway.SubmitOrderAsync(pfId, secId, Sides.Buy, 100m, 150m, OrderTypes.Limit);
+		submit.OrderId.AssertNotNull();
+		var orderId = submit.OrderId.Value;
+		var execId = NextKey();
+
+		await gateway.RecordTradeAsync(orderId, 100m, 150m, executionId: execId);
+		await gateway.RecordTradeAsync(orderId, 100m, 150m, executionId: execId); // replay
+
+		(await CountTradesByExecutionAsync(conn, execId)).AssertEqual(1);
+
+		var position = await gateway.GetPositionAsync(pfId, secId);
+		position.AssertNotNull();
+		position.Quantity.AssertEqual(100m);   // applied once, not 200
+		position.AveragePrice.AssertEqual(150m);
+	}
+
+	[TestMethod]
+	public async Task GatewaySubmitInvalidRequestReturnsResultWithoutPersisting()
+	{
+		// MJ-1: a malformed request (bad side / non-positive qty) returns a rejection
+		// RESULT (no throw) and does NOT persist an Orders row (OrderId is null).
+		await using var conn = await OpenLegacyOrInconclusiveAsync();
+		var pfId = await InsertPortfolioAsync(conn);
+		var secId = await InsertSecurityAsync(conn);
+		await InsertRiskLimitAsync(conn, pfId, maxOrderPrice: 1_000_000m);
+
+		var gateway = NewGateway();
+
+		var badSide = await gateway.SubmitOrderAsync(pfId, secId, (Sides)999, 100m, 150m, OrderTypes.Limit);
+		badSide.IsValid.AssertFalse();
+		badSide.OrderId.AssertNull();
+
+		var badQty = await gateway.SubmitOrderAsync(pfId, secId, Sides.Buy, 0m, 150m, OrderTypes.Limit);
+		badQty.IsValid.AssertFalse();
+		badQty.OrderId.AssertNull();
+
+		// Nothing was written for either malformed request.
+		(await CountOrdersByPortfolioAsync(conn, pfId)).AssertEqual(0);
+	}
+
+	[TestMethod]
+	public async Task GatewaySubmitRiskRejectedPersistsRejectedRow()
+	{
+		// MJ-1: a well-formed order that breaches a risk limit is RECORDED as REJECTED
+		// (with a reason) for the audit trail - OrderId is populated, unlike a malformed
+		// request.
+		await using var conn = await OpenLegacyOrInconclusiveAsync();
+		var pfId = await InsertPortfolioAsync(conn);
+		var secId = await InsertSecurityAsync(conn);
+		await InsertRiskLimitAsync(conn, pfId, maxOrderPrice: 500m);
+
+		var gateway = NewGateway();
+
+		var result = await gateway.SubmitOrderAsync(pfId, secId, Sides.Buy, 10m, 999m, OrderTypes.Limit);
+
+		result.IsValid.AssertFalse();
+		result.OrderId.AssertNotNull();       // persisted for audit
+		result.RejectReason.AssertNotNull();
+
+		var (status, reason) = await ReadOrderStatusAsync(conn, result.OrderId.Value);
+		status.AssertEqual("REJECTED");
+		reason.AssertNotNull();
+	}
+
+	[TestMethod]
+	public async Task GatewaySubmitConcurrentSameTransactionIdPersistsExactlyOne()
+	{
+		// MJ-4 + CR-4: several submits racing on the SAME transaction id must all
+		// complete (deadlocks retried, unique-violation re-reads the winner), return the
+		// same order id, and leave exactly ONE persisted order.
+		await using var conn = await OpenLegacyOrInconclusiveAsync();
+		var pfId = await InsertPortfolioAsync(conn);
+		var secId = await InsertSecurityAsync(conn);
+		await InsertRiskLimitAsync(conn, pfId, maxOrderPrice: 1_000_000m);
+
+		var gateway = NewGateway();
+		var txnId = NextKey();
+
+		var tasks = Enumerable.Range(0, 4)
+			.Select(_ => gateway.SubmitOrderAsync(pfId, secId, Sides.Buy, 100m, 150m, OrderTypes.Limit, externalTransactionId: txnId))
+			.ToArray();
+
+		var results = await Task.WhenAll(tasks);
+
+		foreach (var r in results)
+		{
+			r.IsValid.AssertTrue();
+			r.OrderId.AssertNotNull();
+			r.OrderId.AssertEqual(results[0].OrderId); // all observed the same winning order
+		}
+
+		(await CountOrdersByTransactionAsync(conn, txnId)).AssertEqual(1);
+	}
+
+	[TestMethod]
+	public async Task GatewayRecordTradeRecomputesPositionEndToEnd()
+	{
+		// End-to-end DB recompute: submitting an accepted order and recording its fill
+		// updates dbo.Positions (quantity/average price) via PositionRecalculationService.
+		// Also covers the no-execution-id path (the demo's behaviour).
+		await using var conn = await OpenLegacyOrInconclusiveAsync();
+		var pfId = await InsertPortfolioAsync(conn);
+		var secId = await InsertSecurityAsync(conn);
+		await InsertRiskLimitAsync(conn, pfId, maxOrderPrice: 1_000_000m);
+
+		var gateway = NewGateway();
+
+		(await gateway.GetPositionAsync(pfId, secId)).AssertNull(); // flat before any trade
+
+		var submit = await gateway.SubmitOrderAsync(pfId, secId, Sides.Buy, 100m, 150m, OrderTypes.Limit);
+		submit.IsValid.AssertTrue();
+
+		await gateway.RecordTradeAsync(submit.OrderId.Value, 100m, 150m);
+
+		var position = await gateway.GetPositionAsync(pfId, secId);
+		position.AssertNotNull();
+		position.Quantity.AssertEqual(100m);
+		position.AveragePrice.AssertEqual(150m);
+		position.RealizedPnL.AssertEqual(0m);
+	}
+
+	[TestMethod]
+	public async Task GatewayRecordTradeShortThenPartialCoverRealizesPnlEndToEnd()
+	{
+		// Fuller DB recompute path: open a SHORT then partially cover it, realizing P&L.
+		// SELL 100 @ 150  -> qty -100, avg 150
+		// BUY   60 @ 140  -> covers 60 of the short at 140: realized = (150-140)*60 = 600,
+		//                    remaining qty -40, avg unchanged 150.
+		await using var conn = await OpenLegacyOrInconclusiveAsync();
+		var pfId = await InsertPortfolioAsync(conn);
+		var secId = await InsertSecurityAsync(conn);
+		await InsertRiskLimitAsync(conn, pfId, maxOrderPrice: 1_000_000m);
+
+		var gateway = NewGateway();
+
+		var sell = await gateway.SubmitOrderAsync(pfId, secId, Sides.Sell, 100m, 150m, OrderTypes.Limit);
+		sell.IsValid.AssertTrue();
+		await gateway.RecordTradeAsync(sell.OrderId.Value, 100m, 150m, executionId: NextKey());
+
+		var shortPos = await gateway.GetPositionAsync(pfId, secId);
+		shortPos.Quantity.AssertEqual(-100m);
+		shortPos.AveragePrice.AssertEqual(150m);
+
+		var buy = await gateway.SubmitOrderAsync(pfId, secId, Sides.Buy, 60m, 140m, OrderTypes.Limit);
+		buy.IsValid.AssertTrue();
+		await gateway.RecordTradeAsync(buy.OrderId.Value, 60m, 140m, executionId: NextKey());
+
+		var covered = await gateway.GetPositionAsync(pfId, secId);
+		covered.Quantity.AssertEqual(-40m);
+		covered.AveragePrice.AssertEqual(150m);
+		covered.RealizedPnL.AssertEqual(600m);
+	}
+
+	// ---------------------------------------------------------------------------
+	// MJ-5 - remaining coverage: retained fixed-window characterization,
+	// commission estimate-vs-actual (kept-separate-by-design), prior realized-P&L
+	// accumulation, daily-volume status scope, and gate position-size projection.
+	// ---------------------------------------------------------------------------
+
+	/// <summary>
+	/// Frozen, executable reference of the RETIRED fixed, non-overlapping window
+	/// order-frequency algorithm (the pre-consolidation <see cref="RiskOrderFreqRule"/>
+	/// body: the <c>_endTime</c>/<c>_current</c> state machine). Retained per the
+	/// characterization-first discipline so the behaviour the canonical rolling
+	/// window replaced stays documented and executable. This is NOT production code -
+	/// it is used only by
+	/// <see cref="OrderFreqRetiredFixedWindowCharacterizationAdmitsBoundaryBurst"/> and
+	/// reproduces the original Algo/Risk/RiskOrderFreqRule.cs ProcessMessage exactly as
+	/// it stood before the rolling-window reconciliation (stricter-wins, AAP 0.6.3).
+	/// </summary>
+	private sealed class RetiredFixedWindowFreqReference
+	{
+		private readonly int _count;
+		private readonly TimeSpan _interval;
+		private DateTime? _endTime;
+		private int _current;
+
+		public RetiredFixedWindowFreqReference(int count, TimeSpan interval)
+		{
+			_count = count;
+			_interval = interval;
+		}
+
+		/// <summary>
+		/// Returns <see langword="true"/> when the incoming order at <paramref name="localTime"/>
+		/// trips the limit, mirroring the retired fixed-window logic verbatim: open a
+		/// window on the first order, increment while inside it, trip (and reset) when the
+		/// count meets the limit, and open a fresh window once the current one expires.
+		/// </summary>
+		public bool Process(DateTime localTime)
+		{
+			if (localTime == default)
+				return false;
+
+			if (_endTime == null)
+			{
+				_endTime = localTime + _interval;
+				_current = 1;
+				return false;
+			}
+
+			if (localTime < _endTime)
+			{
+				_current++;
+
+				if (_current >= _count)
+				{
+					_endTime = null;
+					return true;
+				}
+			}
+			else
+			{
+				_endTime = localTime + _interval;
+				_current = 1;
+			}
+
+			return false;
+		}
+	}
+
+	[TestMethod]
+	public void OrderFreqRetiredFixedWindowCharacterizationAdmitsBoundaryBurst()
+	{
+		// CHARACTERIZATION (retained executable reference, MJ-5): the RETIRED fixed,
+		// non-overlapping window admitted a boundary burst that the canonical rolling
+		// window now rejects. Same config (Count=3, Interval=10s) and the same order
+		// arrival sequence {0s, 1s, 5s, 6s} produce DIFFERENT answers for the 4th order:
+		// the retired window trips at 5s then RESETS, so it ADMITS the order at 6s; the
+		// rolling window still counts {0,1,5,6}=4 within the 10s interval and REJECTS it.
+		// This is exactly the strictness gap the consolidation closed (stricter-wins,
+		// AAP 0.6.3) - documented here so the retired behaviour is not silently lost.
+		var start = new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+		var offsets = new[] { 0, 1, 5, 6 };
+
+		// --- retired fixed-window reference: admits the 4th order (the dodge) ---
+		var retired = new RetiredFixedWindowFreqReference(3, TimeSpan.FromSeconds(10));
+		var retiredResults = new bool[offsets.Length];
+		for (var i = 0; i < offsets.Length; i++)
+			retiredResults[i] = retired.Process(start.AddSeconds(offsets[i]));
+
+		retiredResults[0].AssertFalse();
+		retiredResults[1].AssertFalse();
+		retiredResults[2].AssertTrue();   // trips at 5s, then resets the window
+		retiredResults[3].AssertFalse();  // 6s ADMITTED - the boundary-burst dodge
+
+		// --- canonical rolling window: rejects the 4th order (strictly stricter) ---
+		var canonical = new RiskOrderFreqRule
+		{
+			Count = 3,
+			Interval = TimeSpan.FromSeconds(10),
+			Action = RiskActions.CancelOrders
+		};
+		var canonicalResults = new bool[offsets.Length];
+		for (var i = 0; i < offsets.Length; i++)
+		{
+			var msg = new OrderRegisterMessage
+			{
+				SecurityId = Helper.CreateSecurityId(),
+				LocalTime = start.AddSeconds(offsets[i])
+			};
+			canonicalResults[i] = canonical.ProcessMessage(msg);
+		}
+
+		canonicalResults[0].AssertFalse();
+		canonicalResults[1].AssertFalse();
+		canonicalResults[2].AssertTrue();
+		canonicalResults[3].AssertTrue();  // 6s REJECTED - rolling is strictly stricter
+
+		// Prove the strictness gap at the boundary explicitly: the retired window
+		// admitted precisely the order the canonical window rejects.
+		retiredResults[3].AssertFalse();
+		canonicalResults[3].AssertTrue();
+	}
+
+	[TestMethod]
+	public void RecalculateAccumulatesPriorRealizedPnl()
+	{
+		// Prior realized P&L must ACCUMULATE, not be overwritten. Start long 100 @ 150
+		// with 250 already realized from earlier activity; sell 40 @ 170 realizes an
+		// additional 40*(170-150)=800 on the closed portion, so realized becomes
+		// 250 + 800 = 1050 (60 remain at the original average price).
+		var result = PositionRecalculationService.Recalculate(
+			existingQty: 100m, existingAvgPrice: 150m, existingRealizedPnl: 250m,
+			side: Sides.Sell, tradeQty: 40m, tradePrice: 170m);
+
+		result.Quantity.AssertEqual(60m);
+		result.AveragePrice.AssertEqual(150m);
+		result.RealizedPnl.AssertEqual(1050m);
+	}
+
+	[TestMethod]
+	public async Task GateCommissionEstimateRejectsWhileActualControlAccepts()
+	{
+		// KEEP-SEPARATE-BY-DESIGN (AAP 0.6.4, MJ-5): the pre-trade gate uses a PRE-FILL
+		// ESTIMATE (commission_rate * notional) while the circuit-breaker path uses the
+		// ACTUAL commission read off the message stream after the fill. They consume the
+		// same max_commission_total limit but compute different figures, so the SAME
+		// order/limit can decide differently. Here the rate-based estimate crosses the
+		// limit (gate REJECTS) while the actual commission that ends up on the fill is
+		// well under it (the actual-commission control ACCEPTS) - proving the two are
+		// distinct implementations that are intentionally NOT merged.
+		await using var conn = await OpenLegacyOrInconclusiveAsync();
+		var pfId = await InsertPortfolioAsync(conn);
+		var secId = await InsertSecurityAsync(conn);
+
+		// limit 10; rate 1% => estimate for qty 100 @ 50 = 100*50*0.01 = 50 >= 10.
+		await InsertRiskLimitAsync(conn, pfId, maxCommissionTotal: 10m, commissionRate: 0.01m);
+
+		var gate = NewGateService();
+		var estimateRejected = await gate.ValidateAsync(pfId, secId, Sides.Buy, 100m, 50m, OrderTypes.Limit);
+		estimateRejected.IsValid.AssertFalse();
+		estimateRejected.RejectionKind.AssertEqual(PreTradeRejectionKind.RiskLimit);
+
+		// The ACTUAL post-fill control on the SAME limit (10) sees the real commission
+		// (5) and does NOT trip - a different answer for the same order/limit, because
+		// the actual figure is not the rate-based estimate.
+		var actualRule = new RiskCommissionRule
+		{
+			Commission = 10m,
+			Action = RiskActions.StopTrading
+		};
+		var posMsg = new PositionChangeMessage
+		{
+			SecurityId = SecurityId.Money,
+			ServerTime = DateTime.UtcNow,
+			PortfolioName = _pfName
+		};
+		posMsg.Add(PositionChangeTypes.Commission, 5m);
+		actualRule.ProcessMessage(posMsg).AssertFalse();
+	}
+
+	[TestMethod]
+	public async Task GateDailyVolumeExcludesNonAcceptedStatuses()
+	{
+		// The daily-volume aggregate counts only orders whose status is in
+		// (ACCEPTED, FILLED, PARTFILLED); a PENDING/REJECTED/CANCELLED order does NOT
+		// consume today's budget. Insert a large REJECTED order today and prove it is
+		// excluded, then a same-size ACCEPTED order and prove that one DOES count.
+		await using var conn = await OpenLegacyOrInconclusiveAsync();
+		var pfId = await InsertPortfolioAsync(conn);
+		var secId = await InsertSecurityAsync(conn);
+		await InsertRiskLimitAsync(conn, pfId, maxDailyVolume: 100m);
+
+		// A REJECTED order today for 90 must NOT count toward the daily budget.
+		await InsertOrderWithStatusAsync(conn, pfId, secId, 90m, "REJECTED", "SYSUTCDATETIME()");
+
+		var svc = NewGateService();
+
+		// counted today = 0 (the rejected 90 is excluded) + new 80 = 80 < 100 => accepted.
+		var accepted = await svc.ValidateAsync(pfId, secId, Sides.Buy, 80m, 100m, OrderTypes.Limit);
+		accepted.IsValid.AssertTrue();
+
+		// Control: an ACCEPTED order today for 90 DOES count, so +80 => 170 >= 100 rejected.
+		await InsertAcceptedOrderAsync(conn, pfId, secId, 90m, "SYSUTCDATETIME()");
+		var rejected = await svc.ValidateAsync(pfId, secId, Sides.Buy, 80m, 100m, OrderTypes.Limit);
+		rejected.IsValid.AssertFalse();
+		rejected.RejectionKind.AssertEqual(PreTradeRejectionKind.RiskLimit);
+	}
+
+	[TestMethod]
+	public async Task GatePositionSizeUsesPostFillProjection()
+	{
+		// The gate enforces max_position_size against the POST-FILL PROJECTION
+		// (current signed position + signed order qty), not the current position -
+		// preserving the pre-trade control (AAP 0.6.4). With a current long of 60 and a
+		// limit of 100, a further BUY 50 projects to 110 >= 100 and must be rejected even
+		// though the current position (60) is within the limit; a BUY 30 projects to 90
+		// and is accepted.
+		await using var conn = await OpenLegacyOrInconclusiveAsync();
+		var pfId = await InsertPortfolioAsync(conn);
+		var secId = await InsertSecurityAsync(conn);
+		await InsertRiskLimitAsync(conn, pfId, maxPositionSize: 100m);
+
+		// Seed a current long position of 60 (within the limit).
+		await InsertPositionAsync(conn, pfId, secId, 60m, 150m);
+
+		var svc = NewGateService();
+
+		// BUY 50 => projected 60 + 50 = 110 >= 100 => rejected on the projection.
+		var rejected = await svc.ValidateAsync(pfId, secId, Sides.Buy, 50m, 150m, OrderTypes.Limit);
+		rejected.IsValid.AssertFalse();
+		rejected.RejectionKind.AssertEqual(PreTradeRejectionKind.RiskLimit);
+
+		// BUY 30 => projected 60 + 30 = 90 < 100 => accepted (current 60 within limit).
+		var accepted = await svc.ValidateAsync(pfId, secId, Sides.Buy, 30m, 150m, OrderTypes.Limit);
+		accepted.IsValid.AssertTrue();
+	}
+
+	/// <summary>
+	/// Inserts an order with an explicit <paramref name="status"/> and a trusted
+	/// (DB-clock) <paramref name="submittedDateSql"/> expression, for exercising the
+	/// daily-volume status/date scope.
+	/// </summary>
+	private static async Task InsertOrderWithStatusAsync(
+		SqlConnection conn, int portfolioId, int securityId, decimal qty, string status, string submittedDateSql, CancellationToken ct = default)
+	{
+		await using var cmd = new SqlCommand(
+			$"""
+			INSERT INTO dbo.Orders (portfolio_id, security_id, side, qty, price, order_type, status, reject_reason, submitted_date)
+			VALUES (@pf, @sec, 'B', @qty, 100.0, 'LIMIT', @status, NULL, {submittedDateSql})
+			""", conn);
+		cmd.Parameters.AddWithValue("@pf", portfolioId);
+		cmd.Parameters.AddWithValue("@sec", securityId);
+		cmd.Parameters.Add(new SqlParameter("@qty", SqlDbType.Decimal) { Precision = 18, Scale = 4, Value = qty });
+		cmd.Parameters.AddWithValue("@status", status);
+		await cmd.ExecuteNonQueryAsync(ct);
+	}
+
+	/// <summary>
+	/// Seeds a current <c>dbo.Positions</c> row (signed <paramref name="qty"/>,
+	/// <paramref name="avgPrice"/>) so the gate's position-size projection has a live
+	/// starting position to project from.
+	/// </summary>
+	private static async Task InsertPositionAsync(
+		SqlConnection conn, int portfolioId, int securityId, decimal qty, decimal avgPrice, CancellationToken ct = default)
+	{
+		await using var cmd = new SqlCommand(
+			"""
+			INSERT INTO dbo.Positions (portfolio_id, security_id, qty, avg_price)
+			VALUES (@pf, @sec, @qty, @avg)
+			""", conn);
+		cmd.Parameters.AddWithValue("@pf", portfolioId);
+		cmd.Parameters.AddWithValue("@sec", securityId);
+		cmd.Parameters.Add(new SqlParameter("@qty", SqlDbType.Decimal) { Precision = 18, Scale = 4, Value = qty });
+		cmd.Parameters.Add(new SqlParameter("@avg", SqlDbType.Decimal) { Precision = 18, Scale = 4, Value = avgPrice });
+		await cmd.ExecuteNonQueryAsync(ct);
 	}
 }

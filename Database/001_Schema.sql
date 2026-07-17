@@ -28,10 +28,36 @@ SET QUOTED_IDENTIFIER ON;
 GO
 
 -- ============================================================================
--- Portfolios
+-- Idempotent teardown (drop existing objects before re-creating them)
+--
+-- This script is meant to be re-runnable: applying it against a database that
+-- already has these tables must succeed, not fail. Tables are therefore dropped
+-- in REVERSE foreign-key-dependency order (children before parents) in a single
+-- up-front block. Dropping a parent (e.g. Portfolios) while a child that still
+-- references it (Orders/Positions/RiskLimits) exists raises SQL error 3726
+-- ("could not drop object ... referenced by a FOREIGN KEY constraint"), which is
+-- exactly what happened when each DROP sat inline in forward creation order.
+--
+-- Dependency edges (child -> parent):
+--   OrderStatusHistory -> Orders
+--   Trades             -> Orders
+--   Positions          -> Portfolios, Securities
+--   Orders             -> Portfolios, Securities
+--   RiskLimits         -> Portfolios, Securities
+--   (Securities, Portfolios have no outgoing FKs)
 -- ============================================================================
+IF OBJECT_ID(N'dbo.OrderStatusHistory', N'U') IS NOT NULL DROP TABLE dbo.OrderStatusHistory;
+IF OBJECT_ID(N'dbo.Trades', N'U') IS NOT NULL DROP TABLE dbo.Trades;
+IF OBJECT_ID(N'dbo.Positions', N'U') IS NOT NULL DROP TABLE dbo.Positions;
+IF OBJECT_ID(N'dbo.Orders', N'U') IS NOT NULL DROP TABLE dbo.Orders;
+IF OBJECT_ID(N'dbo.RiskLimits', N'U') IS NOT NULL DROP TABLE dbo.RiskLimits;
+IF OBJECT_ID(N'dbo.Securities', N'U') IS NOT NULL DROP TABLE dbo.Securities;
 IF OBJECT_ID(N'dbo.Portfolios', N'U') IS NOT NULL DROP TABLE dbo.Portfolios;
 GO
+
+-- ============================================================================
+-- Portfolios
+-- ============================================================================
 
 CREATE TABLE dbo.Portfolios
 (
@@ -56,9 +82,6 @@ GO
 -- still the C#-side Security/ISecurityStorage catalog). security_code is the
 -- StockSharp Code@Board id so the two sides can be joined/reconciled.
 -- ============================================================================
-IF OBJECT_ID(N'dbo.Securities', N'U') IS NOT NULL DROP TABLE dbo.Securities;
-GO
-
 CREATE TABLE dbo.Securities
 (
 	security_id		INT IDENTITY(1,1)		NOT NULL,
@@ -84,9 +107,6 @@ GO
 -- "no limit"). Whoever configures this table needs to know that convention;
 -- it isn't enforced anywhere else.
 -- ============================================================================
-IF OBJECT_ID(N'dbo.RiskLimits', N'U') IS NOT NULL DROP TABLE dbo.RiskLimits;
-GO
-
 CREATE TABLE dbo.RiskLimits
 (
 	risk_limit_id			INT IDENTITY(1,1)	NOT NULL,
@@ -125,9 +145,6 @@ GO
 -- three years of stored procs and nobody wanted to touch it. Same story
 -- elsewhere in this schema.
 -- ============================================================================
-IF OBJECT_ID(N'dbo.Orders', N'U') IS NOT NULL DROP TABLE dbo.Orders;
-GO
-
 CREATE TABLE dbo.Orders
 (
 	order_id				BIGINT IDENTITY(1,1)	NOT NULL,
@@ -164,18 +181,34 @@ CREATE NONCLUSTERED INDEX IX_Orders_security ON dbo.Orders (security_id);
 CREATE NONCLUSTERED INDEX IX_Orders_status ON dbo.Orders (status);
 GO
 
+-- Idempotency key for order submission (CR-4). external_transaction_id is the
+-- caller-supplied dedup key correlating this row to the in-memory
+-- Order.TransactionId. A FILTERED unique index enforces at-most-one order per
+-- non-NULL key so a retried SubmitOrder cannot create a duplicate order, while
+-- still permitting many NULLs (legacy rows and callers that supply no key). The
+-- gateway relies on this index: it looks up the prior row on replay and treats a
+-- unique-violation on insert as a benign race, re-reading the winning row.
+CREATE UNIQUE NONCLUSTERED INDEX UX_Orders_external_transaction_id ON dbo.Orders (external_transaction_id) WHERE external_transaction_id IS NOT NULL;
+GO
+
 -- ============================================================================
 -- Trades
 -- ============================================================================
-IF OBJECT_ID(N'dbo.Trades', N'U') IS NOT NULL DROP TABLE dbo.Trades;
-GO
-
 CREATE TABLE dbo.Trades
 (
 	trade_id		BIGINT IDENTITY(1,1)	NOT NULL,
 	order_id		BIGINT					NOT NULL,
 	qty				DECIMAL(18,4)			NOT NULL,
 	price			DECIMAL(18,4)			NOT NULL,
+
+	-- Idempotency key for trade recording (CR-4). Optional caller-supplied
+	-- execution identifier (e.g. the venue fill id / ExecutionMessage id). When
+	-- supplied it is unique (UX_Trades_execution_id below) so recording the same
+	-- fill twice inserts exactly one trade and drives exactly one position
+	-- recompute. NULL is allowed for callers that do not supply a key (many NULLs
+	-- are permitted by the filtered index).
+	execution_id	BIGINT					NULL,
+
 	executed_date	DATETIME2(3)			NOT NULL CONSTRAINT DF_Trades_executed_date DEFAULT (SYSUTCDATETIME()),
 
 	CONSTRAINT PK_Trades PRIMARY KEY CLUSTERED (trade_id),
@@ -189,6 +222,13 @@ CREATE NONCLUSTERED INDEX IX_Trades_order ON dbo.Trades (order_id);
 CREATE NONCLUSTERED INDEX IX_Trades_executed_date ON dbo.Trades (executed_date);
 GO
 
+-- Idempotency key for trade recording (CR-4). A FILTERED unique index enforces
+-- at-most-one trade per non-NULL execution_id so a retried RecordTrade cannot
+-- double-insert a fill (and therefore cannot double-count the position), while
+-- still permitting many NULLs for callers that supply no key.
+CREATE UNIQUE NONCLUSTERED INDEX UX_Trades_execution_id ON dbo.Trades (execution_id) WHERE execution_id IS NOT NULL;
+GO
+
 -- ============================================================================
 -- Positions
 --
@@ -198,9 +238,6 @@ GO
 -- separately by the EOD mark-to-market batch (outside the scope of this brief).
 -- Treat this column as stale/EOD-only, not real-time.
 -- ============================================================================
-IF OBJECT_ID(N'dbo.Positions', N'U') IS NOT NULL DROP TABLE dbo.Positions;
-GO
-
 CREATE TABLE dbo.Positions
 (
 	position_id		INT IDENTITY(1,1)		NOT NULL,
@@ -226,9 +263,6 @@ GO
 -- audit/history cascade the compliance team asked for - append-only, nothing
 -- in this schema ever updates or deletes from it.
 -- ============================================================================
-IF OBJECT_ID(N'dbo.OrderStatusHistory', N'U') IS NOT NULL DROP TABLE dbo.OrderStatusHistory;
-GO
-
 CREATE TABLE dbo.OrderStatusHistory
 (
 	history_id		BIGINT IDENTITY(1,1)	NOT NULL,
