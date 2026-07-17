@@ -102,12 +102,19 @@ public class RiskTests : BaseTestClass
 
 		manager.ApplyCanonicalLimits(limits);
 
-		// Exactly the enforced ceilings produced a rule: price, qty, value, position, frequency.
-		manager.Rules.Count.AssertEqual(5);
+		// Exactly the enforced ceilings produced a rule: price, qty, value, a SYMMETRIC PAIR of position
+		// rules (+/-limit), and frequency = 6 rules total.
+		manager.Rules.Count.AssertEqual(6);
 		manager.Rules.OfType<RiskOrderPriceRule>().Single().Price.AssertEqual(500m);
 		manager.Rules.OfType<RiskOrderVolumeRule>().Single().Volume.AssertEqual(1000m);
 		manager.Rules.OfType<RiskOrderValueRule>().Single().Value.AssertEqual(250000m);
-		manager.Rules.OfType<RiskPositionSizeRule>().Single().Position.AssertEqual(100m);
+
+		// One position ceiling maps to TWO signed rules so a long AND a short build-up are both caught,
+		// matching the gate's absolute-magnitude semantics (CR-2).
+		var posRules = manager.Rules.OfType<RiskPositionSizeRule>().OrderByDescending(r => r.Position).ToArray();
+		posRules.Length.AssertEqual(2);
+		posRules[0].Position.AssertEqual(100m);
+		posRules[1].Position.AssertEqual(-100m);
 
 		var freq = manager.Rules.OfType<RiskOrderFreqRule>().Single();
 		freq.Count.AssertEqual(5);
@@ -116,6 +123,7 @@ public class RiskTests : BaseTestClass
 		// Not-enforced ceilings contribute no rule, so they can never trip - this is what avoids the
 		// circuit-breaker rules' "a zero >= ceiling always trips" hazard.
 		manager.Rules.OfType<RiskDailyVolumeRule>().Any().AssertFalse();
+		manager.Rules.OfType<RiskOrderCommissionRule>().Any().AssertFalse();
 		manager.Rules.OfType<RiskCommissionRule>().Any().AssertFalse();
 
 		// The seeded price rule enforces the SAME canonical threshold as the pre-trade gate would:
@@ -137,6 +145,293 @@ public class RiskTests : BaseTestClass
 		var manager = new RiskManager();
 
 		ThrowsExactly<ArgumentNullException>(() => manager.ApplyCanonicalLimits(null));
+		ThrowsExactly<ArgumentNullException>(() => manager.ApplyCanonicalLimits(null, RiskActions.StopTrading));
+		ThrowsExactly<ArgumentNullException>(() => RiskManager.CreateRules(null, RiskActions.StopTrading));
+	}
+
+	[TestMethod]
+	public void ManagerCreateRulesMapsDailyVolumeAndCommission()
+	{
+		// Positive daily-volume and commission ceilings must map to first-class rules, and the commission
+		// ceiling must map to the EXECUTION-context rule (RiskOrderCommissionRule), not the money
+		// PositionChange rule (RiskCommissionRule), which the standard fill pipeline never feeds (MA-5).
+		var limits = new RiskLimitSet
+		{
+			MaxDailyVolume = 250000m,
+			MaxCommissionTotal = 5000m,
+		};
+
+		var rules = RiskManager.CreateRules(limits, RiskActions.ClosePositions);
+
+		rules.OfType<RiskDailyVolumeRule>().Single().Volume.AssertEqual(250000m);
+		rules.OfType<RiskOrderCommissionRule>().Single().Commission.AssertEqual(5000m);
+		// The PositionChange-based commission rule must NOT be seeded.
+		rules.Any(r => r.GetType() == typeof(RiskCommissionRule)).AssertFalse();
+	}
+
+	[TestMethod]
+	public void ManagerCreateRulesPropagatesAction()
+	{
+		// Every generated rule must carry the requested action, not the enum default (MA-2).
+		var limits = new RiskLimitSet
+		{
+			MaxOrderPrice = 500m,
+			MaxOrderQty = 1000m,
+			MaxOrderValue = 250000m,
+			MaxPositionSize = 100m,
+			MaxDailyVolume = 250000m,
+			MaxOrderFreqCount = 5,
+			MaxOrderFreqWindowSeconds = 60,
+			MaxCommissionTotal = 5000m,
+		};
+
+		foreach (var action in new[] { RiskActions.ClosePositions, RiskActions.StopTrading, RiskActions.CancelOrders })
+		{
+			var rules = RiskManager.CreateRules(limits, action);
+			// price, qty, value, +pos, -pos, daily, freq, commission = 8
+			rules.Count.AssertEqual(8);
+			rules.All(r => ((RiskRule)r).Action == action).AssertTrue();
+		}
+	}
+
+	[TestMethod]
+	public void ManagerCreateRulesDeterministicOrder()
+	{
+		var limits = new RiskLimitSet
+		{
+			MaxOrderPrice = 500m,
+			MaxOrderQty = 1000m,
+			MaxOrderValue = 250000m,
+			MaxPositionSize = 100m,
+			MaxDailyVolume = 250000m,
+			MaxOrderFreqCount = 5,
+			MaxOrderFreqWindowSeconds = 60,
+			MaxCommissionTotal = 5000m,
+		};
+
+		// Two independent builds must yield the same ordered sequence of rule types.
+		var expected = new[]
+		{
+			typeof(RiskOrderPriceRule), typeof(RiskOrderVolumeRule), typeof(RiskOrderValueRule),
+			typeof(RiskPositionSizeRule), typeof(RiskPositionSizeRule), typeof(RiskDailyVolumeRule),
+			typeof(RiskOrderFreqRule), typeof(RiskOrderCommissionRule),
+		};
+
+		var a = RiskManager.CreateRules(limits, RiskActions.ClosePositions).Select(r => r.GetType()).ToArray();
+		var b = RiskManager.CreateRules(limits, RiskActions.ClosePositions).Select(r => r.GetType()).ToArray();
+
+		a.SequenceEqual(expected).AssertTrue();
+		a.SequenceEqual(b).AssertTrue();
+	}
+
+	[TestMethod]
+	public void ManagerCreateRulesMalformedFrequencyThrows()
+	{
+		// A half-specified frequency pair is a configuration error, not a silently-dropped limit (MA-2).
+		ThrowsExactly<ArgumentException>(() => RiskManager.CreateRules(new RiskLimitSet { MaxOrderFreqCount = 5 }, RiskActions.StopTrading));
+		ThrowsExactly<ArgumentException>(() => RiskManager.CreateRules(new RiskLimitSet { MaxOrderFreqWindowSeconds = 60 }, RiskActions.StopTrading));
+		ThrowsExactly<ArgumentException>(() => RiskManager.CreateRules(new RiskLimitSet { MaxOrderFreqCount = 5, MaxOrderFreqWindowSeconds = 0 }, RiskActions.StopTrading));
+
+		// A malformed apply must leave the existing configuration untouched.
+		var manager = new RiskManager();
+		manager.ApplyCanonicalLimits(new RiskLimitSet { MaxOrderPrice = 500m });
+		manager.Rules.Count.AssertEqual(1);
+		ThrowsExactly<ArgumentException>(() => manager.ApplyCanonicalLimits(new RiskLimitSet { MaxOrderFreqCount = 5 }));
+		manager.Rules.Count.AssertEqual(1);
+		manager.Rules.OfType<RiskOrderPriceRule>().Single().Price.AssertEqual(500m);
+	}
+
+	[TestMethod]
+	public void ManagerCreateRulesDisabledValuesProduceNoRule()
+	{
+		// Null and non-positive ceilings, and a fully-null frequency pair, are all "not enforced".
+		var limits = new RiskLimitSet
+		{
+			MaxOrderPrice = 0m,
+			MaxOrderQty = null,
+			MaxOrderValue = -1m,
+			MaxPositionSize = 0m,
+			MaxDailyVolume = null,
+			MaxCommissionTotal = 0m,
+			// no frequency configured (both null) => disabled, NOT malformed
+		};
+
+		RiskManager.CreateRules(limits, RiskActions.ClosePositions).Count.AssertEqual(0);
+
+		var manager = new RiskManager();
+		manager.ApplyCanonicalLimits(limits);
+		manager.Rules.Count.AssertEqual(0);
+	}
+
+	[TestMethod]
+	public void ManagerApplyCanonicalLimitsShortSymmetry()
+	{
+		// One position ceiling must catch BOTH a long build-up and a short build-up (CR-2).
+		var manager = new RiskManager();
+		manager.ApplyCanonicalLimits(new RiskLimitSet { MaxPositionSize = 100m });
+
+		var pos = manager.Rules.OfType<RiskPositionSizeRule>().ToArray();
+		pos.Length.AssertEqual(2);
+
+		var secId = Helper.CreateSecurityId();
+
+		bool Trips(decimal current)
+		{
+			var msg = new PositionChangeMessage { SecurityId = secId, ServerTime = DateTime.UtcNow, PortfolioName = _pfName }
+				.Add(PositionChangeTypes.CurrentValue, current);
+			return manager.ProcessRules(msg).Any();
+		}
+
+		Trips(150m).AssertTrue();   // long over the +100 ceiling
+		Trips(-150m).AssertTrue();  // short past the -100 floor (would be missed by a single positive rule)
+		Trips(50m).AssertFalse();   // within bounds
+		Trips(-50m).AssertFalse();
+	}
+
+	[TestMethod]
+	public void ManagerApplyCanonicalLimitsPreservesUnrelatedRules()
+	{
+		// Applying canonical limits must not erase rules the manager already holds (MA-4).
+		var manager = new RiskManager();
+
+		var pnl = new RiskPnLRule { PnL = new() { Value = -1000, Type = UnitTypes.Absolute }, Action = RiskActions.StopTrading };
+		var slippage = new RiskSlippageRule { Slippage = 5m, Action = RiskActions.CancelOrders };
+		manager.Rules.Add(pnl);
+		manager.Rules.Add(slippage);
+
+		manager.ApplyCanonicalLimits(new RiskLimitSet { MaxOrderPrice = 500m, MaxOrderQty = 1000m });
+
+		// Both unrelated rules survive, alongside the two canonical rules.
+		manager.Rules.Contains(pnl).AssertTrue();
+		manager.Rules.Contains(slippage).AssertTrue();
+		manager.Rules.OfType<RiskOrderPriceRule>().Single().Price.AssertEqual(500m);
+		manager.Rules.OfType<RiskOrderVolumeRule>().Single().Volume.AssertEqual(1000m);
+		manager.Rules.Count.AssertEqual(4);
+
+		// Re-apply with a different set: only the previous canonical rules are replaced; unrelated rules stay.
+		manager.ApplyCanonicalLimits(new RiskLimitSet { MaxOrderValue = 999m });
+		manager.Rules.Contains(pnl).AssertTrue();
+		manager.Rules.Contains(slippage).AssertTrue();
+		manager.Rules.OfType<RiskOrderPriceRule>().Any().AssertFalse();
+		manager.Rules.OfType<RiskOrderVolumeRule>().Any().AssertFalse();
+		manager.Rules.OfType<RiskOrderValueRule>().Single().Value.AssertEqual(999m);
+		manager.Rules.Count.AssertEqual(3);
+	}
+
+	[TestMethod]
+	public async Task ManagerApplyCanonicalLimitsConcurrent()
+	{
+		// Reconfiguration must be atomic relative to processing: a concurrent processor must never observe
+		// a half-built rule set (MA-3). We hammer apply and process together and assert every snapshot is a
+		// COMPLETE set (never a partial count) and nothing throws.
+		var manager = new RiskManager();
+		var limits = new RiskLimitSet { MaxOrderPrice = 500m, MaxOrderQty = 1000m, MaxOrderValue = 250000m };
+		manager.ApplyCanonicalLimits(limits);
+
+		using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+		var secId = Helper.CreateSecurityId();
+		Exception failure = null;
+
+		var writer = Task.Run(() =>
+		{
+			try
+			{
+				while (!cts.IsCancellationRequested)
+					manager.ApplyCanonicalLimits(limits);
+			}
+			catch (Exception ex) { failure = ex; }
+		});
+
+		var readers = Enumerable.Range(0, 4).Select(_ => Task.Run(() =>
+		{
+			try
+			{
+				while (!cts.IsCancellationRequested)
+				{
+					var msg = new OrderRegisterMessage { SecurityId = secId, Price = 1m, Volume = 1m };
+					// Snapshots must always contain the full canonical set (3 rules), never a partial state.
+					var count = manager.Rules.Count;
+					(count == 0 || count == 3).AssertTrue();
+					manager.ProcessRules(msg).ToArray();
+				}
+			}
+			catch (Exception ex) { failure = ex; }
+		})).ToArray();
+
+		await Task.WhenAll(readers.Append(writer));
+
+		((object)failure).AssertNull();
+		manager.Rules.Count.AssertEqual(3);
+	}
+
+	[TestMethod]
+	public async Task ManagerApplyCanonicalLimitsThroughAdapterPipeline()
+	{
+		// MA-1: the canonical configuration must work through the REAL RiskMessageAdapter pipeline, not
+		// just via direct ProcessRules, and the propagated action must take effect. Configure a position
+		// ceiling with StopTrading, trip it via a PositionChange, then prove a subsequent order is blocked.
+		var token = CancellationToken;
+		var testAdapter = new TestInnerAdapter();
+		var riskManager = new RiskManager();
+		IRiskManager asAbstraction = riskManager; // drive configuration purely through the abstraction (MA-1)
+		var adapter = new RiskMessageAdapter(testAdapter, riskManager);
+
+		var messages = new List<Message>();
+		adapter.NewOutMessageAsync += (m, ct) => { messages.Add(m); return default; };
+
+		asAbstraction.ApplyCanonicalLimits(new RiskLimitSet { MaxPositionSize = 100m }, RiskActions.StopTrading);
+
+		// Trip the SHORT side to also exercise CR-2 through the pipeline.
+		await adapter.SendInMessageAsync(new PositionChangeMessage
+		{
+			SecurityId = Helper.CreateSecurityId(),
+			ServerTime = DateTime.UtcNow,
+			PortfolioName = _pfName
+		}.Add(PositionChangeTypes.CurrentValue, -150m), token);
+
+		await adapter.SendInMessageAsync(new OrderRegisterMessage
+		{
+			TransactionId = 42,
+			SecurityId = Helper.CreateSecurityId(),
+			Side = Sides.Buy,
+			Price = 100,
+			Volume = 10,
+			PortfolioName = _pfName
+		}, token);
+
+		var rejected = messages.OfType<ExecutionMessage>()
+			.FirstOrDefault(x => x.OriginalTransactionId == 42 && x.OrderState == OrderStates.Failed);
+		rejected.AssertNotNull();
+		rejected.Error.AssertNotNull();
+	}
+
+	[TestMethod]
+	public void ManagerApplyCanonicalLimitsSaveLoadClone()
+	{
+		var manager = new RiskManager();
+		manager.ApplyCanonicalLimits(new RiskLimitSet
+		{
+			MaxOrderPrice = 500m,
+			MaxPositionSize = 100m,
+			MaxCommissionTotal = 5000m,
+		}, RiskActions.StopTrading);
+
+		var originalCount = manager.Rules.Count; // price + (+pos,-pos) + commission = 4
+
+		// Save/Load round-trip preserves the generated rules and their action.
+		var storage = new SettingsStorage();
+		manager.Save(storage);
+		var loaded = new RiskManager();
+		loaded.Load(storage);
+		loaded.Rules.Count.AssertEqual(originalCount);
+		loaded.Rules.OfType<RiskOrderCommissionRule>().Single().Commission.AssertEqual(5000m);
+		loaded.Rules.OfType<RiskPositionSizeRule>().Count().AssertEqual(2);
+		loaded.Rules.All(r => ((RiskRule)r).Action == RiskActions.StopTrading).AssertTrue();
+
+		// Clone preserves them too.
+		var clone = manager.Clone();
+		clone.Rules.Count.AssertEqual(originalCount);
+		clone.Rules.OfType<RiskPositionSizeRule>().Count().AssertEqual(2);
 	}
 
 	[TestMethod]
@@ -1142,6 +1437,43 @@ public class RiskTests : BaseTestClass
 		var rule = new RiskDailyVolumeRule();
 
 		ThrowsExactly<ArgumentOutOfRangeException>(() => rule.Volume = -100);
+	}
+
+	[TestMethod]
+	public void DailyVolumeFutureTimestampCannotDisableEnforcement()
+	{
+		// CR-3 adversarial timestamp test. A future-dated message (adversarial input or clock skew)
+		// must NOT be able to advance the active UTC day and clear the current day's totals - which,
+		// pre-fix, made every subsequent REAL current-day message look stale (day < _currentUtcDay) and
+		// be silently ignored, disabling daily-volume enforcement until the wall clock caught up. The
+		// fix clamps a future-dated message's effective day to the wall-clock UTC day, so it accumulates
+		// against today rather than erasing it, and later current-day messages remain enforced.
+		var rule = new RiskDailyVolumeRule
+		{
+			Volume = 1000,
+			Action = RiskActions.StopTrading,
+		};
+
+		var pf = Helper.CreatePortfolio().Name;
+		var sec = Helper.CreateSecurityId();
+
+		var now = DateTime.UtcNow;
+		var future = now.AddDays(5); // far-future adversarial timestamp
+
+		// 1) A future-dated message arrives first. Pre-fix this advanced the active day to +5d and
+		//    cleared/created that future partition; post-fix it is clamped to today and accumulates
+		//    600 against today's (pf, sec) partition (600 < 1000, so no trip yet).
+		rule.ProcessMessage(new OrderRegisterMessage { PortfolioName = pf, SecurityId = sec, Volume = 600, LocalTime = future }).AssertFalse();
+
+		// 2) A REAL current-day message. Pre-fix: now < _currentUtcDay(+5d) -> treated as stale ->
+		//    IGNORED (returns false), so enforcement was silently disabled and this could never trip.
+		//    Post-fix: today's partition already holds 600 (from the clamped future message), so this
+		//    adds 600 -> 1200 >= 1000 and correctly trips - proving current-day enforcement is intact.
+		rule.ProcessMessage(new OrderRegisterMessage { PortfolioName = pf, SecurityId = sec, Volume = 600, LocalTime = now }).AssertTrue();
+
+		// 3) A genuinely PAST-dated message from an already-closed earlier day is still treated as stale
+		//    and not accumulated (historical replay/backtests are unaffected by the CR-3 clamp).
+		rule.ProcessMessage(new OrderRegisterMessage { PortfolioName = pf, SecurityId = sec, Volume = 5000, LocalTime = now.AddDays(-3) }).AssertFalse();
 	}
 
 	[TestMethod]

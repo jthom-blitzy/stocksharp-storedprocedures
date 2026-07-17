@@ -27,7 +27,9 @@
 	a pass-through proc would add a round-trip plus a second place to keep in sync
 	without adding value. After this script runs, NO stored procedure in this database
 	contains a threshold, an accept/reject decision, or any P&L math - the procedures
-	tier holds only pure data storage, keeping the DDL vendor-neutral.
+	tier holds only pure data storage. The DDL is SQL Server-specific in syntax but
+	deliberately migration-friendly: with no business logic left to port, moving to
+	another engine is a mechanical DDL translation rather than a logic rewrite.
 
 	This script is idempotent: it DROPs the relocated procedures if they exist, so it
 	correctly transitions an already-provisioned StockSharpLegacy database to the

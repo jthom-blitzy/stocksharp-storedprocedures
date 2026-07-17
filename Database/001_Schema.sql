@@ -11,6 +11,18 @@
 	consolidated into those C# services.
 
 	Run order: 001 -> 002 -> 003 -> 004 (optional seed data).
+
+	Idempotent / non-destructive (review findings MA-11, CR-5). Every object is
+	created only if it is missing - there are no DROP TABLE statements - so this
+	script is safe to re-run against an already-provisioned database: it neither
+	hits the parent-before-child foreign-key drop error (SQL Msg 3726) that the
+	old drop-and-recreate form raised on a rerun, nor discards any existing data.
+	It also UPGRADES an older database in place: in particular it adds
+	dbo.Trades.external_trade_id and its filtered unique index when a database
+	predates that idempotency key, so the keyed SqlLegacyOrderGateway.RecordTradeAsync
+	path works after an in-place upgrade and not only on a freshly created instance.
+	(002/003 are likewise rerunnable via DROP ... IF EXISTS / CREATE OR ALTER, and
+	004 guards every seed insert with an existence check.)
 */
 
 IF DB_ID(N'StockSharpLegacy') IS NULL
@@ -22,8 +34,9 @@ GO
 USE StockSharpLegacy;
 GO
 
--- filtered indexes (IX_RiskLimits_portfolio/_security below) require these,
--- and sqlcmd/some drivers don't default them the way SSMS does
+-- filtered indexes (IX_RiskLimits_portfolio/_security below, and the Trades
+-- idempotency-key index) require these, and sqlcmd/some drivers don't default
+-- them the way SSMS does
 SET ANSI_NULLS ON;
 SET QUOTED_IDENTIFIER ON;
 GO
@@ -31,20 +44,20 @@ GO
 -- ============================================================================
 -- Portfolios
 -- ============================================================================
-IF OBJECT_ID(N'dbo.Portfolios', N'U') IS NOT NULL DROP TABLE dbo.Portfolios;
-GO
+IF OBJECT_ID(N'dbo.Portfolios', N'U') IS NULL
+BEGIN
+	CREATE TABLE dbo.Portfolios
+	(
+		portfolio_id	INT IDENTITY(1,1)		NOT NULL,
+		name			NVARCHAR(100)			NOT NULL,
+		currency		CHAR(3)					NOT NULL CONSTRAINT DF_Portfolios_currency DEFAULT ('USD'),
+		created_date	DATETIME2(3)			NOT NULL CONSTRAINT DF_Portfolios_created_date DEFAULT (SYSUTCDATETIME()),
+		is_active		BIT						NOT NULL CONSTRAINT DF_Portfolios_is_active DEFAULT (1),
 
-CREATE TABLE dbo.Portfolios
-(
-	portfolio_id	INT IDENTITY(1,1)		NOT NULL,
-	name			NVARCHAR(100)			NOT NULL,
-	currency		CHAR(3)					NOT NULL CONSTRAINT DF_Portfolios_currency DEFAULT ('USD'),
-	created_date	DATETIME2(3)			NOT NULL CONSTRAINT DF_Portfolios_created_date DEFAULT (SYSUTCDATETIME()),
-	is_active		BIT						NOT NULL CONSTRAINT DF_Portfolios_is_active DEFAULT (1),
-
-	CONSTRAINT PK_Portfolios PRIMARY KEY CLUSTERED (portfolio_id),
-	CONSTRAINT UQ_Portfolios_name UNIQUE (name)
-);
+		CONSTRAINT PK_Portfolios PRIMARY KEY CLUSTERED (portfolio_id),
+		CONSTRAINT UQ_Portfolios_name UNIQUE (name)
+	);
+END
 GO
 
 -- ============================================================================
@@ -57,19 +70,19 @@ GO
 -- still the C#-side Security/ISecurityStorage catalog). security_code is the
 -- StockSharp Code@Board id so the two sides can be joined/reconciled.
 -- ============================================================================
-IF OBJECT_ID(N'dbo.Securities', N'U') IS NOT NULL DROP TABLE dbo.Securities;
-GO
+IF OBJECT_ID(N'dbo.Securities', N'U') IS NULL
+BEGIN
+	CREATE TABLE dbo.Securities
+	(
+		security_id		INT IDENTITY(1,1)		NOT NULL,
+		security_code	NVARCHAR(50)			NOT NULL,	-- e.g. "AAPL"
+		board_code		NVARCHAR(20)			NULL,		-- e.g. "NASDAQ"
+		security_type	NVARCHAR(20)			NULL,		-- Stock/Future/Option/...
 
-CREATE TABLE dbo.Securities
-(
-	security_id		INT IDENTITY(1,1)		NOT NULL,
-	security_code	NVARCHAR(50)			NOT NULL,	-- e.g. "AAPL"
-	board_code		NVARCHAR(20)			NULL,		-- e.g. "NASDAQ"
-	security_type	NVARCHAR(20)			NULL,		-- Stock/Future/Option/...
-
-	CONSTRAINT PK_Securities PRIMARY KEY CLUSTERED (security_id),
-	CONSTRAINT UQ_Securities_code_board UNIQUE (security_code, board_code)
-);
+		CONSTRAINT PK_Securities PRIMARY KEY CLUSTERED (security_id),
+		CONSTRAINT UQ_Securities_code_board UNIQUE (security_code, board_code)
+	);
+END
 GO
 
 -- ============================================================================
@@ -88,37 +101,41 @@ GO
 -- Whoever configures this table needs to know that convention; it isn't
 -- enforced anywhere else.
 -- ============================================================================
-IF OBJECT_ID(N'dbo.RiskLimits', N'U') IS NOT NULL DROP TABLE dbo.RiskLimits;
+IF OBJECT_ID(N'dbo.RiskLimits', N'U') IS NULL
+BEGIN
+	CREATE TABLE dbo.RiskLimits
+	(
+		risk_limit_id			INT IDENTITY(1,1)	NOT NULL,
+		portfolio_id			INT					NULL,
+		security_id				INT					NULL,
+
+		max_order_price			DECIMAL(18,4)		NULL,	-- ceiling on a single order's price   (read into RiskLimitSet; enforced by RiskOrderPriceRule)
+		max_order_qty			DECIMAL(18,4)		NULL,	-- ceiling on a single order's qty     (read into RiskLimitSet; enforced by RiskOrderVolumeRule)
+		max_order_value			DECIMAL(18,4)		NULL,	-- ceiling on qty*price notional       (read into RiskLimitSet; enforced in C# by RiskOrderValueRule)
+		max_position_size		DECIMAL(18,4)		NULL,	-- ceiling on abs(position) post-fill  (read into RiskLimitSet; enforced in C# by a SYMMETRIC +limit/-limit PAIR of RiskPositionSizeRule so long and short breaches are caught the same way)
+		max_daily_volume		DECIMAL(18,4)		NULL,	-- ceiling on cumulative qty per day   (read into RiskLimitSet; enforced in C# by RiskDailyVolumeRule)
+		max_order_freq_count	INT					NULL,	-- max orders per max_order_freq_window_sec (read into RiskLimitSet; enforced by RiskOrderFreqRule.Count)
+		max_order_freq_window_sec INT				NULL,	-- window length in seconds                 (read into RiskLimitSet; enforced by RiskOrderFreqRule.Interval)
+		max_commission_total	DECIMAL(18,4)		NULL,	-- ceiling on cumulative commission    (read into RiskLimitSet; the canonical factory seeds RiskOrderCommissionRule, which sums actual ExecutionMessage.Commission - see RiskManager.CreateRules and LEGACY_LAYER.md)
+		commission_rate			DECIMAL(9,6)		NOT NULL CONSTRAINT DF_RiskLimits_commission_rate DEFAULT (0.0005),
+
+		is_active				BIT					NOT NULL CONSTRAINT DF_RiskLimits_is_active DEFAULT (1),
+		effective_date			DATETIME2(3)		NOT NULL CONSTRAINT DF_RiskLimits_effective_date DEFAULT (SYSUTCDATETIME()),
+
+		CONSTRAINT PK_RiskLimits PRIMARY KEY CLUSTERED (risk_limit_id),
+		CONSTRAINT FK_RiskLimits_Portfolios FOREIGN KEY (portfolio_id) REFERENCES dbo.Portfolios (portfolio_id),
+		CONSTRAINT FK_RiskLimits_Securities FOREIGN KEY (security_id) REFERENCES dbo.Securities (security_id),
+		CONSTRAINT CK_RiskLimits_scope CHECK (portfolio_id IS NOT NULL OR security_id IS NOT NULL)
+	);
+END
 GO
 
-CREATE TABLE dbo.RiskLimits
-(
-	risk_limit_id			INT IDENTITY(1,1)	NOT NULL,
-	portfolio_id			INT					NULL,
-	security_id				INT					NULL,
-
-	max_order_price			DECIMAL(18,4)		NULL,	-- ceiling on a single order's price   (read into RiskLimitSet; enforced by RiskOrderPriceRule)
-	max_order_qty			DECIMAL(18,4)		NULL,	-- ceiling on a single order's qty     (read into RiskLimitSet; enforced by RiskOrderVolumeRule)
-	max_order_value			DECIMAL(18,4)		NULL,	-- ceiling on qty*price notional       (read into RiskLimitSet; enforced in C# by RiskOrderValueRule)
-	max_position_size		DECIMAL(18,4)		NULL,	-- ceiling on abs(position) post-fill  (read into RiskLimitSet; enforced by RiskPositionSizeRule)
-	max_daily_volume		DECIMAL(18,4)		NULL,	-- ceiling on cumulative qty per day   (read into RiskLimitSet; enforced in C# by RiskDailyVolumeRule)
-	max_order_freq_count	INT					NULL,	-- max orders per max_order_freq_window_sec (read into RiskLimitSet; enforced by RiskOrderFreqRule.Count)
-	max_order_freq_window_sec INT				NULL,	-- window length in seconds                 (read into RiskLimitSet; enforced by RiskOrderFreqRule.Interval)
-	max_commission_total	DECIMAL(18,4)		NULL,	-- ceiling on cumulative commission    (read into RiskLimitSet; enforced by RiskCommissionRule/RiskOrderCommissionRule)
-	commission_rate			DECIMAL(9,6)		NOT NULL CONSTRAINT DF_RiskLimits_commission_rate DEFAULT (0.0005),
-
-	is_active				BIT					NOT NULL CONSTRAINT DF_RiskLimits_is_active DEFAULT (1),
-	effective_date			DATETIME2(3)		NOT NULL CONSTRAINT DF_RiskLimits_effective_date DEFAULT (SYSUTCDATETIME()),
-
-	CONSTRAINT PK_RiskLimits PRIMARY KEY CLUSTERED (risk_limit_id),
-	CONSTRAINT FK_RiskLimits_Portfolios FOREIGN KEY (portfolio_id) REFERENCES dbo.Portfolios (portfolio_id),
-	CONSTRAINT FK_RiskLimits_Securities FOREIGN KEY (security_id) REFERENCES dbo.Securities (security_id),
-	CONSTRAINT CK_RiskLimits_scope CHECK (portfolio_id IS NOT NULL OR security_id IS NOT NULL)
-);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_RiskLimits_portfolio' AND object_id = OBJECT_ID(N'dbo.RiskLimits'))
+	CREATE NONCLUSTERED INDEX IX_RiskLimits_portfolio ON dbo.RiskLimits (portfolio_id) WHERE portfolio_id IS NOT NULL;
 GO
 
-CREATE NONCLUSTERED INDEX IX_RiskLimits_portfolio ON dbo.RiskLimits (portfolio_id) WHERE portfolio_id IS NOT NULL;
-CREATE NONCLUSTERED INDEX IX_RiskLimits_security ON dbo.RiskLimits (security_id) WHERE security_id IS NOT NULL;
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_RiskLimits_security' AND object_id = OBJECT_ID(N'dbo.RiskLimits'))
+	CREATE NONCLUSTERED INDEX IX_RiskLimits_security ON dbo.RiskLimits (security_id) WHERE security_id IS NOT NULL;
 GO
 
 -- ============================================================================
@@ -129,43 +146,50 @@ GO
 -- three years of stored procs and nobody wanted to touch it. Same story
 -- elsewhere in this schema.
 -- ============================================================================
-IF OBJECT_ID(N'dbo.Orders', N'U') IS NOT NULL DROP TABLE dbo.Orders;
+IF OBJECT_ID(N'dbo.Orders', N'U') IS NULL
+BEGIN
+	CREATE TABLE dbo.Orders
+	(
+		order_id				BIGINT IDENTITY(1,1)	NOT NULL,
+		portfolio_id			INT						NOT NULL,
+		security_id				INT						NOT NULL,
+		side					CHAR(1)					NOT NULL,	-- 'B' = Buy, 'S' = Sell
+		qty						DECIMAL(18,4)			NOT NULL,
+		price					DECIMAL(18,4)			NULL,		-- NULL allowed for market orders
+		order_type				VARCHAR(10)				NOT NULL CONSTRAINT DF_Orders_order_type DEFAULT ('LIMIT'),
+		status					VARCHAR(12)				NOT NULL CONSTRAINT DF_Orders_status DEFAULT ('PENDING'),
+		reject_reason			NVARCHAR(200)			NULL,
+
+		-- carried over from the C# side so a support engineer can correlate a row
+		-- in this table back to the in-memory Order.TransactionId when chasing a
+		-- ticket. Added in a hurry, never made NOT NULL, never back-filled for
+		-- older rows.
+		external_transaction_id BIGINT					NULL,
+
+		submitted_date			DATETIME2(3)			NOT NULL CONSTRAINT DF_Orders_submitted_date DEFAULT (SYSUTCDATETIME()),
+		last_updated			DATETIME2(3)			NOT NULL CONSTRAINT DF_Orders_last_updated DEFAULT (SYSUTCDATETIME()),
+
+		CONSTRAINT PK_Orders PRIMARY KEY CLUSTERED (order_id),
+		CONSTRAINT FK_Orders_Portfolios FOREIGN KEY (portfolio_id) REFERENCES dbo.Portfolios (portfolio_id),
+		CONSTRAINT FK_Orders_Securities FOREIGN KEY (security_id) REFERENCES dbo.Securities (security_id),
+		CONSTRAINT CK_Orders_side CHECK (side IN ('B','S')),
+		CONSTRAINT CK_Orders_qty CHECK (qty > 0),
+		CONSTRAINT CK_Orders_order_type CHECK (order_type IN ('LIMIT','MARKET')),
+		CONSTRAINT CK_Orders_status CHECK (status IN ('PENDING','ACCEPTED','REJECTED','FILLED','PARTFILLED','CANCELLED'))
+	);
+END
 GO
 
-CREATE TABLE dbo.Orders
-(
-	order_id				BIGINT IDENTITY(1,1)	NOT NULL,
-	portfolio_id			INT						NOT NULL,
-	security_id				INT						NOT NULL,
-	side					CHAR(1)					NOT NULL,	-- 'B' = Buy, 'S' = Sell
-	qty						DECIMAL(18,4)			NOT NULL,
-	price					DECIMAL(18,4)			NULL,		-- NULL allowed for market orders
-	order_type				VARCHAR(10)				NOT NULL CONSTRAINT DF_Orders_order_type DEFAULT ('LIMIT'),
-	status					VARCHAR(12)				NOT NULL CONSTRAINT DF_Orders_status DEFAULT ('PENDING'),
-	reject_reason			NVARCHAR(200)			NULL,
-
-	-- carried over from the C# side so a support engineer can correlate a row
-	-- in this table back to the in-memory Order.TransactionId when chasing a
-	-- ticket. Added in a hurry, never made NOT NULL, never back-filled for
-	-- older rows.
-	external_transaction_id BIGINT					NULL,
-
-	submitted_date			DATETIME2(3)			NOT NULL CONSTRAINT DF_Orders_submitted_date DEFAULT (SYSUTCDATETIME()),
-	last_updated			DATETIME2(3)			NOT NULL CONSTRAINT DF_Orders_last_updated DEFAULT (SYSUTCDATETIME()),
-
-	CONSTRAINT PK_Orders PRIMARY KEY CLUSTERED (order_id),
-	CONSTRAINT FK_Orders_Portfolios FOREIGN KEY (portfolio_id) REFERENCES dbo.Portfolios (portfolio_id),
-	CONSTRAINT FK_Orders_Securities FOREIGN KEY (security_id) REFERENCES dbo.Securities (security_id),
-	CONSTRAINT CK_Orders_side CHECK (side IN ('B','S')),
-	CONSTRAINT CK_Orders_qty CHECK (qty > 0),
-	CONSTRAINT CK_Orders_order_type CHECK (order_type IN ('LIMIT','MARKET')),
-	CONSTRAINT CK_Orders_status CHECK (status IN ('PENDING','ACCEPTED','REJECTED','FILLED','PARTFILLED','CANCELLED'))
-);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_Orders_portfolio_submitted' AND object_id = OBJECT_ID(N'dbo.Orders'))
+	CREATE NONCLUSTERED INDEX IX_Orders_portfolio_submitted ON dbo.Orders (portfolio_id, submitted_date);
 GO
 
-CREATE NONCLUSTERED INDEX IX_Orders_portfolio_submitted ON dbo.Orders (portfolio_id, submitted_date);
-CREATE NONCLUSTERED INDEX IX_Orders_security ON dbo.Orders (security_id);
-CREATE NONCLUSTERED INDEX IX_Orders_status ON dbo.Orders (status);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_Orders_security' AND object_id = OBJECT_ID(N'dbo.Orders'))
+	CREATE NONCLUSTERED INDEX IX_Orders_security ON dbo.Orders (security_id);
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_Orders_status' AND object_id = OBJECT_ID(N'dbo.Orders'))
+	CREATE NONCLUSTERED INDEX IX_Orders_status ON dbo.Orders (status);
 GO
 
 -- ============================================================================
@@ -175,45 +199,66 @@ GO
 -- execution/trade id of a logical fill). It was added so trade recording can be
 -- made exactly-once under client and deadlock retries: when a caller supplies it,
 -- SqlLegacyOrderGateway.RecordTradeAsync records the fill at most once and a retry
--- cannot double-count the position (QA finding F2; AAP 0.6.4 "exactly once per
--- successful logical trade"). This is still pure storage - the column plus the
--- filtered unique index UQ_Trades_external_trade_id enforce uniqueness only; no
--- business decisioning or P&L math lives in this schema.
+-- cannot double-count the position (QA finding F2; AAP 0.6.4). This is still pure
+-- storage - the column plus the filtered unique index UQ_Trades_external_trade_id
+-- enforce uniqueness only; no business decisioning or P&L math lives in this schema.
+--
+-- CR-5 upgrade path: because this script no longer drops and recreates the table,
+-- the CREATE below only runs on a brand-new database. The guarded ALTER further
+-- down adds external_trade_id (and then the guarded index adds its unique index)
+-- to a pre-existing database that predates the key, so an in-place upgrade gets
+-- the column and index too - not only a freshly created instance.
 -- ============================================================================
-IF OBJECT_ID(N'dbo.Trades', N'U') IS NOT NULL DROP TABLE dbo.Trades;
+IF OBJECT_ID(N'dbo.Trades', N'U') IS NULL
+BEGIN
+	CREATE TABLE dbo.Trades
+	(
+		trade_id		BIGINT IDENTITY(1,1)	NOT NULL,
+		order_id		BIGINT					NOT NULL,
+		qty				DECIMAL(18,4)			NOT NULL,
+		price			DECIMAL(18,4)			NOT NULL,
+		executed_date	DATETIME2(3)			NOT NULL CONSTRAINT DF_Trades_executed_date DEFAULT (SYSUTCDATETIME()),
+
+		-- optional business idempotency key; NULL (the default) means "no key" and is
+		-- exempt from UQ_Trades_external_trade_id, so unlimited un-keyed fills are allowed
+		external_trade_id BIGINT				NULL,
+
+		CONSTRAINT PK_Trades PRIMARY KEY CLUSTERED (trade_id),
+		CONSTRAINT FK_Trades_Orders FOREIGN KEY (order_id) REFERENCES dbo.Orders (order_id),
+		CONSTRAINT CK_Trades_qty CHECK (qty > 0),
+		CONSTRAINT CK_Trades_price CHECK (price > 0)
+	);
+END
 GO
 
-CREATE TABLE dbo.Trades
-(
-	trade_id		BIGINT IDENTITY(1,1)	NOT NULL,
-	order_id		BIGINT					NOT NULL,
-	qty				DECIMAL(18,4)			NOT NULL,
-	price			DECIMAL(18,4)			NOT NULL,
-	executed_date	DATETIME2(3)			NOT NULL CONSTRAINT DF_Trades_executed_date DEFAULT (SYSUTCDATETIME()),
-
-	-- optional business idempotency key; NULL (the default) means "no key" and is
-	-- exempt from UQ_Trades_external_trade_id, so unlimited un-keyed fills are allowed
-	external_trade_id BIGINT				NULL,
-
-	CONSTRAINT PK_Trades PRIMARY KEY CLUSTERED (trade_id),
-	CONSTRAINT FK_Trades_Orders FOREIGN KEY (order_id) REFERENCES dbo.Orders (order_id),
-	CONSTRAINT CK_Trades_qty CHECK (qty > 0),
-	CONSTRAINT CK_Trades_price CHECK (price > 0)
-);
+-- CR-5: guarded, repeatable, non-destructive upgrade. Adds the idempotency key to a
+-- database created before external_trade_id existed (the create-if-missing block above
+-- is skipped for an existing table, so an in-place upgrade would otherwise never receive
+-- the column and the keyed RecordTradeAsync path would fail at runtime). No-op once the
+-- column is present, so this is safe to re-run.
+IF COL_LENGTH(N'dbo.Trades', N'external_trade_id') IS NULL
+	ALTER TABLE dbo.Trades ADD external_trade_id BIGINT NULL;
 GO
 
-CREATE NONCLUSTERED INDEX IX_Trades_order ON dbo.Trades (order_id);
-CREATE NONCLUSTERED INDEX IX_Trades_executed_date ON dbo.Trades (executed_date);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_Trades_order' AND object_id = OBJECT_ID(N'dbo.Trades'))
+	CREATE NONCLUSTERED INDEX IX_Trades_order ON dbo.Trades (order_id);
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_Trades_executed_date' AND object_id = OBJECT_ID(N'dbo.Trades'))
+	CREATE NONCLUSTERED INDEX IX_Trades_executed_date ON dbo.Trades (executed_date);
 GO
 
 -- Enforces at-most-one trade per business idempotency key. Filtered on IS NOT NULL so
 -- NULL (un-keyed) fills are unlimited while any non-null external_trade_id is unique -
 -- this is what lets RecordTradeAsync no-op on a duplicate and makes trade recording
--- idempotent under client/deadlock retries (QA finding F2 / AAP 0.6.4). Kept vendor-
--- neutral: PostgreSQL/Aurora support the same partial-unique-index form
--- (CREATE UNIQUE INDEX ... WHERE ...). The filtered index requires
--- SET ANSI_NULLS/QUOTED_IDENTIFIER ON (set at the top of this script).
-CREATE UNIQUE NONCLUSTERED INDEX UQ_Trades_external_trade_id ON dbo.Trades (external_trade_id) WHERE external_trade_id IS NOT NULL;
+-- idempotent under client/deadlock retries (QA finding F2 / AAP 0.6.4). The partial-
+-- unique-index form (CREATE UNIQUE INDEX ... WHERE ...) is also supported by
+-- PostgreSQL/Aurora, which keeps a future migration straightforward. The filtered index
+-- requires SET ANSI_NULLS/QUOTED_IDENTIFIER ON (set at the top of this script). Guarded so
+-- it is created on both a fresh instance and an in-place upgrade (after the ALTER above),
+-- and skipped when it already exists (CR-5 / MA-11 rerun-safe).
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'UQ_Trades_external_trade_id' AND object_id = OBJECT_ID(N'dbo.Trades'))
+	CREATE UNIQUE NONCLUSTERED INDEX UQ_Trades_external_trade_id ON dbo.Trades (external_trade_id) WHERE external_trade_id IS NOT NULL;
 GO
 
 -- ============================================================================
@@ -224,51 +269,82 @@ GO
 -- needs a live market price, which the service does not have. It's refreshed separately
 -- by the EOD mark-to-market batch (outside the scope of this brief). Treat this
 -- column as stale/EOD-only, not real-time.
+--
+-- last_applied_trade_id is the recompute checkpoint (review finding MI-2): the highest
+-- trade_id already folded into the row, letting the recompute process only newer trades
+-- rather than replaying the full history on every fill. See the column comment below.
 -- ============================================================================
-IF OBJECT_ID(N'dbo.Positions', N'U') IS NOT NULL DROP TABLE dbo.Positions;
+IF OBJECT_ID(N'dbo.Positions', N'U') IS NULL
+BEGIN
+	CREATE TABLE dbo.Positions
+	(
+		position_id		INT IDENTITY(1,1)		NOT NULL,
+		portfolio_id	INT						NOT NULL,
+		security_id		INT						NOT NULL,
+		qty				DECIMAL(18,4)			NOT NULL CONSTRAINT DF_Positions_qty DEFAULT (0),		-- signed: >0 long, <0 short
+		avg_price		DECIMAL(18,4)			NOT NULL CONSTRAINT DF_Positions_avg_price DEFAULT (0),
+		realized_pnl	DECIMAL(18,4)			NOT NULL CONSTRAINT DF_Positions_realized_pnl DEFAULT (0),
+		unrealized_pnl	DECIMAL(18,4)			NOT NULL CONSTRAINT DF_Positions_unrealized_pnl DEFAULT (0),
+		updated_date	DATETIME2(3)			NOT NULL CONSTRAINT DF_Positions_updated_date DEFAULT (SYSUTCDATETIME()),
+
+		-- MI-2 recompute checkpoint: the highest dbo.Trades.trade_id already folded into this
+		-- row. PositionRecalculationService.ApplyTradeAsync reads it under the position lock and
+		-- folds only trades with a greater trade_id (bounded, incremental, idempotent recompute)
+		-- instead of replaying the full history on every fill. 0 means "nothing applied yet",
+		-- which triggers a self-healing full replay from flat. Still pure storage - no decisioning.
+		last_applied_trade_id BIGINT			NOT NULL CONSTRAINT DF_Positions_last_applied_trade_id DEFAULT (0),
+
+		CONSTRAINT PK_Positions PRIMARY KEY CLUSTERED (position_id),
+		CONSTRAINT FK_Positions_Portfolios FOREIGN KEY (portfolio_id) REFERENCES dbo.Portfolios (portfolio_id),
+		CONSTRAINT FK_Positions_Securities FOREIGN KEY (security_id) REFERENCES dbo.Securities (security_id),
+		CONSTRAINT UQ_Positions_portfolio_security UNIQUE (portfolio_id, security_id)
+	);
+END
 GO
 
-CREATE TABLE dbo.Positions
-(
-	position_id		INT IDENTITY(1,1)		NOT NULL,
-	portfolio_id	INT						NOT NULL,
-	security_id		INT						NOT NULL,
-	qty				DECIMAL(18,4)			NOT NULL CONSTRAINT DF_Positions_qty DEFAULT (0),		-- signed: >0 long, <0 short
-	avg_price		DECIMAL(18,4)			NOT NULL CONSTRAINT DF_Positions_avg_price DEFAULT (0),
-	realized_pnl	DECIMAL(18,4)			NOT NULL CONSTRAINT DF_Positions_realized_pnl DEFAULT (0),
-	unrealized_pnl	DECIMAL(18,4)			NOT NULL CONSTRAINT DF_Positions_unrealized_pnl DEFAULT (0),
-	updated_date	DATETIME2(3)			NOT NULL CONSTRAINT DF_Positions_updated_date DEFAULT (SYSUTCDATETIME()),
-
-	CONSTRAINT PK_Positions PRIMARY KEY CLUSTERED (position_id),
-	CONSTRAINT FK_Positions_Portfolios FOREIGN KEY (portfolio_id) REFERENCES dbo.Portfolios (portfolio_id),
-	CONSTRAINT FK_Positions_Securities FOREIGN KEY (security_id) REFERENCES dbo.Securities (security_id),
-	CONSTRAINT UQ_Positions_portfolio_security UNIQUE (portfolio_id, security_id)
-);
+-- MI-2 / CR-5 guarded, repeatable, non-destructive upgrade. Adds the recompute checkpoint
+-- column to a database created before last_applied_trade_id existed (the create-if-missing
+-- block above is skipped for an existing table, so an in-place upgrade would otherwise never
+-- receive the column and ApplyTradeAsync's SELECT would fail at runtime). The DEFAULT (0)
+-- backfills every existing row with "nothing applied yet", so the first recompute after the
+-- upgrade folds the full history from flat once (self-healing) and then runs incrementally.
+-- No-op once the column is present, so this is safe to re-run.
+IF COL_LENGTH(N'dbo.Positions', N'last_applied_trade_id') IS NULL
+	ALTER TABLE dbo.Positions ADD last_applied_trade_id BIGINT NOT NULL CONSTRAINT DF_Positions_last_applied_trade_id DEFAULT (0);
 GO
 
 -- ============================================================================
 -- OrderStatusHistory
 --
--- Populated by trg_Orders_StatusAudit (see 003_Triggers.sql). This is the
--- audit/history cascade the compliance team asked for - append-only, nothing
--- in this schema ever updates or deletes from it.
+-- Populated by trg_Orders_StatusAudit (see 003_Triggers.sql), which records each
+-- status TRANSITION on UPDATE (it fires AFTER UPDATE only). This is a BEST-EFFORT,
+-- database-derived audit trail, NOT a tamper-proof append-only log: nothing in this
+-- schema updates or deletes from it, but that is not enforced with least-privilege
+-- credentials or immutable-audit controls, so a sufficiently privileged principal
+-- could still insert/update/delete rows here or alter the trigger. The order's
+-- authoritative CURRENT status always lives on dbo.Orders.status; this table is a
+-- derived, supplementary transition log and does not separately record the initial
+-- status set at INSERT time. Treat it as a convenience history derived from status
+-- changes, not a compliance-grade immutable record (review finding MA-12; see
+-- LEGACY_LAYER.md and Database/README.md).
 -- ============================================================================
-IF OBJECT_ID(N'dbo.OrderStatusHistory', N'U') IS NOT NULL DROP TABLE dbo.OrderStatusHistory;
+IF OBJECT_ID(N'dbo.OrderStatusHistory', N'U') IS NULL
+BEGIN
+	CREATE TABLE dbo.OrderStatusHistory
+	(
+		history_id		BIGINT IDENTITY(1,1)	NOT NULL,
+		order_id		BIGINT					NOT NULL,
+		old_status		VARCHAR(12)				NULL,
+		new_status		VARCHAR(12)				NOT NULL,
+		changed_date	DATETIME2(3)			NOT NULL CONSTRAINT DF_OrderStatusHistory_changed_date DEFAULT (SYSUTCDATETIME()),
+		changed_by		NVARCHAR(128)			NOT NULL CONSTRAINT DF_OrderStatusHistory_changed_by DEFAULT (SUSER_SNAME()),
+
+		CONSTRAINT PK_OrderStatusHistory PRIMARY KEY CLUSTERED (history_id),
+		CONSTRAINT FK_OrderStatusHistory_Orders FOREIGN KEY (order_id) REFERENCES dbo.Orders (order_id)
+	);
+END
 GO
 
-CREATE TABLE dbo.OrderStatusHistory
-(
-	history_id		BIGINT IDENTITY(1,1)	NOT NULL,
-	order_id		BIGINT					NOT NULL,
-	old_status		VARCHAR(12)				NULL,
-	new_status		VARCHAR(12)				NOT NULL,
-	changed_date	DATETIME2(3)			NOT NULL CONSTRAINT DF_OrderStatusHistory_changed_date DEFAULT (SYSUTCDATETIME()),
-	changed_by		NVARCHAR(128)			NOT NULL CONSTRAINT DF_OrderStatusHistory_changed_by DEFAULT (SUSER_SNAME()),
-
-	CONSTRAINT PK_OrderStatusHistory PRIMARY KEY CLUSTERED (history_id),
-	CONSTRAINT FK_OrderStatusHistory_Orders FOREIGN KEY (order_id) REFERENCES dbo.Orders (order_id)
-);
-GO
-
-CREATE NONCLUSTERED INDEX IX_OrderStatusHistory_order ON dbo.OrderStatusHistory (order_id);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_OrderStatusHistory_order' AND object_id = OBJECT_ID(N'dbo.OrderStatusHistory'))
+	CREATE NONCLUSTERED INDEX IX_OrderStatusHistory_order ON dbo.OrderStatusHistory (order_id);
 GO

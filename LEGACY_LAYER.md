@@ -31,10 +31,14 @@ set of rules, not two that quietly disagree.
   portfolio-wide circuit breaker, including the two rules
   (`RiskOrderValueRule`, `RiskDailyVolumeRule`) that used to exist only in SQL.
 - `Algo/Storages/Sql/` - `SqlLegacyOrderGateway`, the ADO.NET (not Dapper, not
-  EF - raw `SqlCommand`) client. It is now a pure CRUD adapter: it delegates
-  every decision to the C# services above and only does parameterized
-  `INSERT`/`SELECT`. Plus `SqlLegacyConnection` for connection-string
-  resolution and `SqlPosition`/`SqlOrderSubmitResult` DTOs.
+  EF - raw `SqlCommand`) client. It holds no risk decisioning: it delegates
+  every threshold / accept-reject / P&L decision to the C# services above, and
+  its data access is plain parameterized `INSERT`/`SELECT`. The only non-CRUD
+  SQL it issues is `sp_getapplock` / `sp_releaseapplock` - SQL Server
+  application locks used purely for concurrency control (serializing
+  same-portfolio submissions and same-instrument fills), not for any business
+  decision. Plus `SqlLegacyConnection` for connection-string resolution and
+  `SqlPosition`/`SqlOrderSubmitResult` DTOs.
 - `Samples/08_Misc/03_LegacySqlDemo` - a runnable walkthrough: submit a
   compliant order, submit one that gets rejected, record a fill, watch the
   position get recomputed. The three observable outcomes are unchanged; only
@@ -87,7 +91,7 @@ keep two implementations.
 | Order notional value (qty × price) | `MaxOrderValue` | `RiskOrderValueRule` *(new)* | check 3 | **Was SQL-only.** Now a first-class C# rule; both reject when `qty*price >= limit`. |
 | Order frequency | `MaxOrderFreqCount` / `MaxOrderFreqWindowSeconds` | `RiskOrderFreqRule` | check 4 | **Reconciled to the stricter algorithm** - rolling count, see below. |
 | Resulting position size | `MaxPositionSize` | `RiskPositionSizeRule` | check 5 | **Preserved-distinct.** The rule checks the *current* position from a `PositionChangeMessage`; the gate checks the *hypothetical post-fill* position, because it runs pre-trade. |
-| Cumulative commission | `MaxCommissionTotal` (+ `CommissionRate`) | `RiskCommissionRule` / `RiskOrderCommissionRule` / `RiskTransactionCommissionRule` | check 6 | **Preserved-distinct.** The rules track the *actual* commission reported on `ExecutionMessage` post-fill; the gate *estimates* it pre-fill from historical traded notional × rate. Same threshold, different basis - so they do not agree by construction. |
+| Cumulative commission | `MaxCommissionTotal` (+ `CommissionRate`) | `RiskCommissionRule` / `RiskOrderCommissionRule` / `RiskTransactionCommissionRule` | check 6 | **Preserved-distinct.** The rules track the *actual* commission post-fill, but not all from the same message: `RiskCommissionRule` reads a `PositionChangeMessage` (the `PositionChangeTypes.Commission` value), while `RiskOrderCommissionRule` and `RiskTransactionCommissionRule` read `ExecutionMessage.Commission`. The gate instead *estimates* commission pre-fill from historical traded notional × rate. Same threshold, different basis (and different message source) - so they do not agree by construction. |
 | Daily traded volume | `MaxDailyVolume` | `RiskDailyVolumeRule` *(new)* | check 7 | **Was SQL-only.** Now a first-class C# rule (an in-stream running total, partitioned by portfolio+security and rolled over on the UTC day); the gate reads the persisted accepted/filled/part-filled volume for the current UTC day. Preserved-distinct evaluation contexts sharing the one threshold. |
 | Position lifetime, P&L limit, slippage | (rule-owned) | `RiskPositionTimeRule`, `RiskPnLRule`, `RiskSlippageRule` | - | **Circuit-breaker-only.** These need live state the pre-trade gate doesn't have; unchanged. |
 
@@ -96,21 +100,39 @@ the clearest disagreement: `RiskOrderFreqRule` bucketed time into fixed,
 non-overlapping windows (a burst that straddles a bucket boundary could dodge
 the limit), while the SQL version ran a true rolling `COUNT(*)` over "now
 minus N seconds", which is strictly stricter near a boundary. Concretely, with
-`Count = 5` and a 60-second window, four orders at t=59s followed by four at
-t=61s never tripped the old fixed window (each non-overlapping window only ever
-saw four) but does trip the rolling count (at t=61s it counts the four from
-t=59 still inside the trailing 60 seconds, plus the current one = five). The
+`Count = 5` and a 60-second window, five orders at t = 0, 1, 2, 59, and 60
+seconds never tripped the old fixed window (the non-overlapping buckets are
+`[0,60)` and `[60,120)`: bucket `[0,60)` saw only the four at t=0/1/2/59, and
+the fifth order at t=60 started a fresh bucket that saw just one) but does trip
+the rolling count (at t=60 the trailing 60-second window still contains all
+five of `[0,1,2,59,60]`, so the count reaches five and the order is rejected).
+The
 consolidation resolved this by adopting the **rolling count in C#** - the
 never-less-strict choice. `RiskOrderFreqRule` now counts the prior orders
 still inside the trailing `Interval` window and rejects once that count plus
 the current order reaches `Count`, exactly like the gate. To stay
 "never less strict than a correct rolling count" under out-of-order events,
 the rule tracks a high watermark and treats a strictly-earlier (late) event as
-a breach rather than silently under-counting it. This is the single
-intentional behaviour change in the whole refactor, captured by characterization
-tests (the old fixed-window behaviour) and parity tests (the new behaviour is
-at-least-as-strict, never looser), and it makes the two patterns agree on
-frequency instead of disagreeing.
+a breach rather than silently under-counting it. This is the first of the two
+intentional behaviour changes in the refactor (the second is the non-positive
+ceiling convention described next), captured by characterization tests (the old
+fixed-window behaviour) and parity tests (the new behaviour is at-least-as-strict,
+never looser), and it makes the two patterns agree on frequency instead of
+disagreeing.
+
+The second intentional change is the **"not enforced" convention for
+non-positive ceilings** (review finding MA-16). Every ceiling on `RiskLimitSet`
+counts as enforced only when it is non-null *and* strictly positive -
+`RiskLimitSet.IsCeilingEnforced` returns true only for `ceiling > 0`, so a
+`null` or a `0`/negative value disables that single check. This is the NULL/0
+"not enforced" convention documented for the `dbo.RiskLimits` table (AAP §0.3.1)
+carried into the canonical model, and it diverges from the *literal* legacy
+proc: `usp_ValidatePreTradeRisk` guarded each check only with `IF @max_x IS NOT
+NULL`, so a stored `0` there made a comparison such as `price >= 0` reject
+*every* order (an effectively unusable block-all state). Under the canonical
+rule a `0` ceiling disables just that one check instead, while other populated
+ceilings still apply. Like the frequency change, it is proven intentional - not
+a regression - by an explicit characterization test.
 
 ## The position update is now single-apply (hazard removed)
 
@@ -191,16 +213,25 @@ script records the same thing at the point of change):
 - `trg_Orders_StatusAudit` → **kept, as a pure audit cascade** (Option A, AAP
   §0.6.5). It only inserts a row into `OrderStatusHistory` when an order's
   status changes; it contains no thresholds, no accept/reject decision, and no
-  P&L math, so it is defensible CRUD and preserves the append-only history
-  guarantee. It was left in the database rather than relocated to C# because a
+  P&L math, so it is defensible CRUD. It records a **best-effort,
+  trigger-derived log** of status transitions - *not* a tamper-proof,
+  append-only guarantee: the cascade is not backed by least-privilege
+  credentials or an immutable-audit mechanism, so a sufficiently privileged
+  principal (the application/test login, or SA) could still insert, update, or
+  delete history rows or alter the trigger (review finding MA-12). It was left
+  in the database rather than relocated to C# because a
   status-change-to-history insert is the lowest-risk option and does not
   reintroduce business logic into SQL.
 
 After `002_StoredProcedures.sql` and `003_Triggers.sql` run, no stored
 procedure exists and the only trigger is the audit cascade - verifiable with
-`sys.procedures` / `sys.triggers`. The DDL is left plain and vendor-neutral so
-a future PostgreSQL/Aurora migration is unobstructed (that migration is
-explicitly *not* part of this brief).
+`sys.procedures` / `sys.triggers`. The DDL is SQL Server-specific in syntax
+(`sp_getapplock`, filtered unique indexes, `SYSUTCDATETIME()`,
+`DROP ... IF EXISTS`, `IDENTITY`), but it is deliberately migration-friendly:
+it is plain relational storage - tables, keys, constraints, and indexes - with
+no business logic, so a future PostgreSQL/Aurora migration is a mechanical DDL
+translation rather than a logic rewrite (that migration is explicitly *not*
+part of this brief).
 
 ## Half-migrated persistence
 

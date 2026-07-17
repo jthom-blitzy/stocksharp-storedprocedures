@@ -22,7 +22,10 @@ namespace StockSharp.Algo.Risk;
 /// instrument's flow cannot mask or inflate another's.</item>
 /// <item><b>Keyed to the UTC calendar day</b> (matching the gate); crossing to a newer UTC day
 /// clears the prior day's totals, and a stale message from an already-closed earlier day is not
-/// accumulated (the gate remains authoritative for past days).</item>
+/// accumulated (the gate remains authoritative for past days). The active day is <b>bounded by the
+/// wall-clock UTC day</b>: a future-dated message (whether adversarial or from clock skew) is clamped
+/// to today and can never advance the active day into the future, so it cannot erase the current
+/// day's accumulated totals and silently disable enforcement (review finding CR-3).</item>
 /// <item><b>Deterministic and synchronized</b>: accumulation is guarded by a lock, non-positive
 /// (malformed) volumes contribute nothing, and the running total is accumulated with overflow-safe
 /// (saturating) arithmetic.</item>
@@ -115,15 +118,27 @@ public class RiskDailyVolumeRule : RiskRule
 		var utcDay = ToUtcDay(message.LocalTime);
 		var key = (order.PortfolioName ?? string.Empty, order.SecurityId.ToString());
 
+		// Bound the message's day by the wall-clock UTC day (review finding CR-3). A future-dated
+		// message - whether adversarial or the result of clock skew - must never be able to advance
+		// the active day into the future, because doing so would clear the current day's totals and
+		// then make every real current-day message look "stale" (day < _currentUtcDay), silently
+		// disabling enforcement until the wall clock caught up. Clamping the effective day to today
+		// keeps such a message accumulating against the current day (fail-safe/conservative) instead.
+		// Past-dated messages are left untouched, so historical replay/backtests are unaffected.
+		var nowUtcDay = DateTime.UtcNow.Date;
+		var effectiveDay = utcDay > nowUtcDay ? nowUtcDay : utcDay;
+
 		lock (_sync)
 		{
-			if (_currentUtcDay is null || utcDay > _currentUtcDay)
+			if (_currentUtcDay is null || effectiveDay > _currentUtcDay)
 			{
-				// Advance to a new UTC day: the prior day's partitioned totals are cleared.
-				_currentUtcDay = utcDay;
+				// Advance to a new UTC day: the prior day's partitioned totals are cleared. Because
+				// effectiveDay is bounded by today, this can only ever advance up to the real current
+				// UTC day, never to an arbitrary future day supplied by an incoming message.
+				_currentUtcDay = effectiveDay;
 				_dailyTotals.Clear();
 			}
-			else if (utcDay < _currentUtcDay)
+			else if (effectiveDay < _currentUtcDay)
 			{
 				// Stale/out-of-order message from an already-closed earlier UTC day. The gate's
 				// persisted query is authoritative for past days, so this is not accumulated here.

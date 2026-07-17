@@ -165,13 +165,21 @@ public class PositionRecalculationService
 	/// enrolling in the caller's (gateway-owned) <paramref name="transaction"/> so the trade insertion and the
 	/// position mutation commit or roll back together.
 	/// <para>
-	/// The position is recomputed <b>deterministically from the entire persisted trade set</b> of the
-	/// portfolio/security (folding <see cref="Recalculate"/> over the trades in executed order) rather than
-	/// incrementally mutating the stored row. This makes the operation <b>idempotent</b>: re-running it for the
-	/// same persisted trades yields the same position, so no residual or repeated path can double-apply a trade
-	/// (the historical trigger/standalone double-count hazard, LEGACY_LAYER.md:L74-L89, is structurally
-	/// eliminated). Because the recompute reads the just-inserted trade through the shared transaction, the
-	/// caller must INSERT the trade into <c>dbo.Trades</c> before calling this method within the same transaction.
+	/// The position is recomputed by <b>folding <see cref="Recalculate"/> over only the trades not yet reflected
+	/// in the stored row</b> - those whose <c>trade_id</c> is greater than the position's persisted checkpoint
+	/// (<c>dbo.Positions.last_applied_trade_id</c>) - starting from the stored (qty, avg_price, realized_pnl).
+	/// This bounds the work to the newly recorded trades (O(1) per fill in steady state) instead of replaying the
+	/// entire history on every fill (which was O(n) per fill and O(n^2) cumulative - review finding MI-2). When
+	/// the checkpoint is <c>0</c> (a fresh position, or a row that predates the checkpoint column) it folds the
+	/// <b>entire</b> persisted trade set from flat - the original full replay, which is self-healing and never
+	/// trusts a possibly-stale stored value. Because <see cref="Recalculate"/> rounds to the persisted
+	/// <c>DECIMAL(18,4)</c> after every step, the stored position is bit-identical to the matching intermediate of
+	/// a full replay, so incremental folding produces exactly the same result as replaying from flat. The
+	/// operation stays <b>idempotent</b>: re-running it for already-applied trades folds nothing
+	/// (<c>trade_id &lt;=</c> checkpoint), so no residual or repeated path can double-apply a trade (the
+	/// historical trigger/standalone double-count hazard, LEGACY_LAYER.md:L74-L89, stays structurally
+	/// eliminated). Because the recompute reads the just-inserted trade through the shared transaction, the caller
+	/// must INSERT the trade into <c>dbo.Trades</c> before calling this method within the same transaction.
 	/// </para>
 	/// <para>
 	/// Concurrency: this method locks the position key with <c>UPDLOCK, HOLDLOCK</c> for the duration of the
@@ -219,35 +227,60 @@ public class PositionRecalculationService
 
 		// Step 2 - take an update/range lock on the position key (held to the end of the caller's
 		// transaction). This serializes concurrent fills of the same instrument and blocks a racing first
-		// INSERT of the unique key. It also tells us whether to UPDATE or INSERT below.
+		// INSERT of the unique key. It also reads the stored position and its recompute checkpoint
+		// (last_applied_trade_id) so Step 3 can fold only the trades not yet reflected in that row, and tells
+		// us whether to UPDATE or INSERT below.
 		bool positionExists;
+		var storedQty = 0m;
+		var storedAvgPrice = 0m;
+		var storedRealizedPnl = 0m;
+		long checkpoint = 0;
 
 		await using (var lockCommand = new SqlCommand(
-			"SELECT qty FROM dbo.Positions WITH (UPDLOCK, HOLDLOCK) WHERE portfolio_id = @portfolio_id AND security_id = @security_id", connection, transaction))
+			"SELECT qty, avg_price, realized_pnl, last_applied_trade_id FROM dbo.Positions WITH (UPDLOCK, HOLDLOCK) WHERE portfolio_id = @portfolio_id AND security_id = @security_id", connection, transaction))
 		{
 			lockCommand.Parameters.Add(IntParam("@portfolio_id", portfolioId));
 			lockCommand.Parameters.Add(IntParam("@security_id", securityId));
 
 			await using var lockReader = await lockCommand.ExecuteReaderAsync(CommandBehavior.SingleRow, cancellationToken);
 			positionExists = await lockReader.ReadAsync(cancellationToken);
+
+			if (positionExists)
+			{
+				storedQty = lockReader.GetDecimal(0);
+				storedAvgPrice = lockReader.GetDecimal(1);
+				storedRealizedPnl = lockReader.GetDecimal(2);
+				checkpoint = lockReader.GetInt64(3);
+			}
 		}
 
-		// Step 3 - deterministic recompute from the ENTIRE persisted trade set of this portfolio/security,
-		// ordered exactly like the removed trigger's cursor (executed_date, then trade_id). Folding the pure
-		// math from flat is idempotent: the same trades always produce the same position.
-		var qty = 0m;
-		var avgPrice = 0m;
-		var realizedPnl = 0m;
+		// Step 3 - bounded, idempotent recompute (review finding MI-2). Fold the pure math over only the
+		// trades not yet reflected in the stored row - those with trade_id greater than the position's
+		// checkpoint - in the same order the removed trigger's cursor used (executed_date, then trade_id).
+		//  * checkpoint == 0 (fresh position, or a row upgraded in place before the checkpoint column
+		//    existed): start from flat and fold ALL trades. This is the original full replay - self-healing,
+		//    because it never trusts a possibly-stale stored value.
+		//  * checkpoint > 0: the stored (qty, avg_price, realized_pnl) already reflect every trade up to and
+		//    including the checkpoint (this method is the SOLE writer of dbo.Positions and always writes the
+		//    state and its checkpoint together), so start from the stored state and fold only the newer trades.
+		// Recalculate rounds to the persisted DECIMAL(18,4) after each step, so the stored row is bit-identical
+		// to the matching full-replay intermediate; incremental folding therefore yields the same result as
+		// replaying from flat, while re-running for already-applied trades folds nothing (idempotent).
+		var qty = checkpoint == 0 ? 0m : storedQty;
+		var avgPrice = checkpoint == 0 ? 0m : storedAvgPrice;
+		var realizedPnl = checkpoint == 0 ? 0m : storedRealizedPnl;
+		var newCheckpoint = checkpoint;
 
 		await using (var tradesCommand = new SqlCommand(
-			"SELECT o.side, t.qty, t.price " +
+			"SELECT o.side, t.qty, t.price, t.trade_id " +
 			"FROM dbo.Trades t " +
 			"INNER JOIN dbo.Orders o ON o.order_id = t.order_id " +
-			"WHERE o.portfolio_id = @portfolio_id AND o.security_id = @security_id " +
+			"WHERE o.portfolio_id = @portfolio_id AND o.security_id = @security_id AND t.trade_id > @checkpoint " +
 			"ORDER BY t.executed_date ASC, t.trade_id ASC", connection, transaction))
 		{
 			tradesCommand.Parameters.Add(IntParam("@portfolio_id", portfolioId));
 			tradesCommand.Parameters.Add(IntParam("@security_id", securityId));
+			tradesCommand.Parameters.Add(BigIntParam("@checkpoint", checkpoint));
 
 			await using var tradesReader = await tradesCommand.ExecuteReaderAsync(cancellationToken);
 
@@ -257,12 +290,18 @@ public class PositionRecalculationService
 				var side = tradesReader.GetString(0) == "B" ? Sides.Buy : Sides.Sell;
 				var tradeQty = tradesReader.GetDecimal(1);
 				var tradePrice = tradesReader.GetDecimal(2);
+				var tradeId = tradesReader.GetInt64(3);
 
 				var step = Recalculate(qty, avgPrice, realizedPnl, side, tradeQty, tradePrice);
 
 				qty = step.Quantity;
 				avgPrice = step.AveragePrice;
 				realizedPnl = step.RealizedPnl;
+
+				// Trades are read in ascending (executed_date, trade_id) order, so the last folded trade_id is
+				// the new high-water mark to persist as the checkpoint.
+				if (tradeId > newCheckpoint)
+					newCheckpoint = tradeId;
 			}
 		}
 
@@ -276,8 +315,8 @@ public class PositionRecalculationService
 		// Step 4 - persist. unrealized_pnl is set to 0 on insert and is never maintained here; it stays an
 		// end-of-day mark-to-market concern (see dbo.Positions in Database/001_Schema.sql).
 		var persistSql = positionExists
-			? "UPDATE dbo.Positions SET qty = @q, avg_price = @ap, realized_pnl = @rp, updated_date = SYSUTCDATETIME() WHERE portfolio_id = @portfolio_id AND security_id = @security_id"
-			: "INSERT INTO dbo.Positions (portfolio_id, security_id, qty, avg_price, realized_pnl, unrealized_pnl, updated_date) VALUES (@portfolio_id, @security_id, @q, @ap, @rp, 0, SYSUTCDATETIME())";
+			? "UPDATE dbo.Positions SET qty = @q, avg_price = @ap, realized_pnl = @rp, last_applied_trade_id = @cp, updated_date = SYSUTCDATETIME() WHERE portfolio_id = @portfolio_id AND security_id = @security_id"
+			: "INSERT INTO dbo.Positions (portfolio_id, security_id, qty, avg_price, realized_pnl, unrealized_pnl, last_applied_trade_id, updated_date) VALUES (@portfolio_id, @security_id, @q, @ap, @rp, 0, @cp, SYSUTCDATETIME())";
 
 		await using (var persistCommand = new SqlCommand(persistSql, connection, transaction))
 		{
@@ -286,6 +325,7 @@ public class PositionRecalculationService
 			persistCommand.Parameters.Add(DecimalParam("@q", result.Quantity));
 			persistCommand.Parameters.Add(DecimalParam("@ap", result.AveragePrice));
 			persistCommand.Parameters.Add(DecimalParam("@rp", result.RealizedPnl));
+			persistCommand.Parameters.Add(BigIntParam("@cp", newCheckpoint));
 
 			await persistCommand.ExecuteNonQueryAsync(cancellationToken);
 		}

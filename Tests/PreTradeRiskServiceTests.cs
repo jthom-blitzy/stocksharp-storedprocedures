@@ -103,6 +103,37 @@ public class PreTradeRiskServiceTests : BaseTestClass
 		result.RejectReason.AssertNull();
 	}
 
+	// ---- MA-16 : a non-null ZERO ceiling is "not enforced" (intentional divergence from legacy) --
+
+	[TestMethod]
+	public void ZeroCeilingNotEnforcedIntentionalDivergence()
+	{
+		// MA-16 characterization: this is the SECOND intentional, documented behaviour change of the
+		// refactor (after the order-frequency tightening, AAP §0.6.1). The legacy proc
+		// dbo.usp_ValidatePreTradeRisk guarded each check only with "IF @max_x IS NOT NULL", so a stored
+		// max_order_price = 0 made "price >= 0" reject EVERY order (an unusable block-all state). The
+		// canonical model adopts the NULL/0 = "not enforced" convention AAP §0.3.1 mandates, so a zero
+		// ceiling disables that single check instead. This test PINS the new behaviour so the divergence
+		// is proven intentional rather than a regression.
+		var zeroPrice = new RiskLimitSet { PortfolioId = 1, MaxOrderPrice = 0m };
+
+		RiskLimitSet.IsCeilingEnforced(zeroPrice.MaxOrderPrice).AssertFalse();
+		((object)zeroPrice.EffectiveMaxOrderPrice).AssertNull();
+		zeroPrice.IsUnlimited.AssertTrue(); // the only populated ceiling is a disabled zero
+
+		// An order that the literal legacy proc would have rejected (any price >= 0) is now accepted.
+		var accepted = PreTradeRiskService.Evaluate(zeroPrice, new PreTradeState(), Sides.Buy, volume: 10m, price: 999999m);
+		accepted.IsValid.AssertTrue();
+		accepted.RejectReason.AssertNull();
+
+		// Per-check: a zero PRICE ceiling disables ONLY the price check; a co-populated qty ceiling of 5
+		// still trips for a volume of 10, proving the "not enforced" semantics are scoped to that ceiling.
+		var zeroPriceWithQty = new RiskLimitSet { PortfolioId = 1, MaxOrderPrice = 0m, MaxOrderQty = 5m };
+		var rejected = PreTradeRiskService.Evaluate(zeroPriceWithQty, new PreTradeState(), Sides.Buy, volume: 10m, price: 999999m);
+		rejected.IsValid.AssertFalse();
+		rejected.RejectReason.AssertEqual("Order qty 10.0000 meets/exceeds limit 5.0000");
+	}
+
 	// ---- Task 4 : non-positive quantity is rejected in the preamble -----------------------------
 
 	[TestMethod]

@@ -74,10 +74,21 @@ public class RiskLimitSet
 
 	/// <summary>
 	/// Commission rate applied when estimating an order's commission
-	/// (<c>dbo.RiskLimits.commission_rate</c>). Non-nullable; the default of <c>0.0005</c> mirrors the
-	/// <c>DF_RiskLimits_commission_rate</c> database default.
+	/// (<c>dbo.RiskLimits.commission_rate</c>).
 	/// </summary>
-	public decimal CommissionRate { get; init; } = 0.0005m;
+	/// <remarks>
+	/// This property intentionally has <b>no C# default</b>. The single authoritative source for the
+	/// rate is the database column <c>dbo.RiskLimits.commission_rate</c> and its
+	/// <c>DF_RiskLimits_commission_rate</c> default (<c>0.0005</c>); duplicating that literal here would
+	/// create two independently-drifting sources of truth (MA-15). The pre-trade gate
+	/// <see cref="PreTradeRiskService"/> always hydrates this value from the loaded <c>dbo.RiskLimits</c>
+	/// row, so production never relies on the CLR default. When a <see cref="RiskLimitSet"/> is
+	/// constructed by hand (for example in tests) and the commission estimate matters, the rate must be
+	/// set explicitly; an unset rate is <c>0</c>, which yields a zero commission estimate rather than a
+	/// silent, hard-coded assumption. The rate is not a ceiling and never affects
+	/// <see cref="IsUnlimited"/>.
+	/// </remarks>
+	public decimal CommissionRate { get; init; }
 
 	/// <summary>
 	/// Scope key identifying the portfolio this limit set applies to (<c>dbo.RiskLimits.portfolio_id</c>).
@@ -115,10 +126,22 @@ public class RiskLimitSet
 	/// <see cref="RiskLimitSet"/> (the pre-trade gate <see cref="PreTradeRiskService"/> and the
 	/// circuit-breaker seed on <see cref="RiskManager"/>). A ceiling counts as enforced only when it
 	/// is non-null <b>and</b> strictly positive; a <see langword="null"/> value OR a non-positive
-	/// value (<c>0</c> or below) means "not enforced". This is the exact NULL/0 convention documented
-	/// for the <c>dbo.RiskLimits</c> table (see <c>Database/001_Schema.sql</c>) and used by the
-	/// existing <c>RiskRule</c> classes, expressed in one place so no consumer can drift from it.
+	/// value (<c>0</c> or below) means "not enforced". This is the NULL/0 convention documented for
+	/// the <c>dbo.RiskLimits</c> table (see <c>Database/001_Schema.sql</c>) and used by the existing
+	/// <c>RiskRule</c> classes, expressed in one place so no consumer can drift from it.
 	/// </summary>
+	/// <remarks>
+	/// <b>Intentional, AAP-sanctioned behaviour change (MA-16).</b> Treating a non-null <c>0</c> (or
+	/// negative) ceiling as "not enforced" is a deliberate reconciliation, and it is the <em>second</em>
+	/// documented behavioural change of this refactor (the first being the order-frequency tightening,
+	/// AAP §0.6.1). The literal legacy proc <c>dbo.usp_ValidatePreTradeRisk</c> guarded each check only
+	/// with <c>IF @max_x IS NOT NULL</c>, so a stored <c>0</c> ceiling made a comparison such as
+	/// <c>price &gt;= 0</c> reject <em>every</em> order (an effectively unusable "block-all" state). The
+	/// canonical model instead adopts the NULL/0 = "not enforced" convention that AAP §0.3.1 mandates
+	/// carry over into <see cref="RiskLimitSet"/>, so a <c>0</c> ceiling disables that single check
+	/// rather than blocking all orders. This is per-check: other populated ceilings still apply. The
+	/// divergence is proven intentional (not a regression) by an explicit characterization test.
+	/// </remarks>
 	/// <param name="ceiling">The raw ceiling value read from the limit set.</param>
 	/// <returns><see langword="true"/> when the ceiling is enforced (non-null and <c>&gt; 0</c>).</returns>
 	public static bool IsCeilingEnforced(decimal? ceiling) => ceiling is decimal c && c > 0m;
@@ -151,6 +174,27 @@ public class RiskLimitSet
 	public bool IsFrequencyEnforced =>
 		MaxOrderFreqCount is int c && c > 0 &&
 		MaxOrderFreqWindowSeconds is int w && w > 0;
+
+	/// <summary>
+	/// Gets a value indicating whether the order-frequency configuration is <b>malformed</b>: exactly
+	/// one of <see cref="MaxOrderFreqCount"/> and <see cref="MaxOrderFreqWindowSeconds"/> is a positive
+	/// value while the other is null or non-positive. Such a half-specified pair expresses an intent to
+	/// enforce a frequency limit that cannot be evaluated (a count with no window, or a window with no
+	/// count), so it must be surfaced as a configuration error rather than silently disabled. When both
+	/// are positive the limit is <see cref="IsFrequencyEnforced">enforced</see>; when both are
+	/// null/non-positive the limit is coherently "not enforced" (the NULL/0 convention). Consumers that
+	/// build rules from this set (for example <see cref="RiskManager.CreateRules(RiskLimitSet, RiskActions)"/>)
+	/// throw when this is <see langword="true"/>.
+	/// </summary>
+	public bool IsFrequencyMalformed
+	{
+		get
+		{
+			var countActive = MaxOrderFreqCount is int c && c > 0;
+			var windowActive = MaxOrderFreqWindowSeconds is int w && w > 0;
+			return countActive != windowActive;
+		}
+	}
 
 	/// <summary>
 	/// Gets a value indicating whether none of the order/position/commission/frequency limits is enforced.

@@ -236,9 +236,11 @@ public class PreTradeRiskService
 	/// </summary>
 	/// <remarks>
 	/// The connection and transaction are owned by the caller (the gateway), so the state reads here and
-	/// the subsequent dbo.Orders INSERT execute inside a <b>single</b> transaction. Combined with the
-	/// gateway's serializable isolation and per-portfolio application lock, this closes the check-then-act
-	/// race (C03/CWE-367): two concurrent orders can no longer both read stale state and both be accepted.
+	/// the subsequent dbo.Orders INSERT execute inside a <b>single</b> READ COMMITTED transaction.
+	/// Isolation alone would NOT close the check-then-act race; it is the gateway's per-portfolio
+	/// application lock (<c>sp_getapplock</c>, held for the life of the transaction) that serializes
+	/// concurrent submissions, so two concurrent orders can no longer both read stale state and both be
+	/// accepted (C03/CWE-367).
 	/// The cheap side/quantity preamble runs BEFORE any command so an invalid order is rejected without
 	/// touching the database and a transient database fault can never mask that authoritative reject (M03).
 	/// </remarks>

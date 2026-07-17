@@ -3,6 +3,8 @@ namespace StockSharp.Samples.Misc.LegacySqlDemo;
 using System;
 using System.Threading.Tasks;
 
+using Microsoft.Data.SqlClient;
+
 using StockSharp.Algo.Storages.Sql;
 using StockSharp.BusinessEntities;
 using StockSharp.Messages;
@@ -22,7 +24,8 @@ class Program
 {
 	static async Task Main()
 	{
-		var gateway = new SqlLegacyOrderGateway(SqlLegacyConnection.Resolve());
+		var connectionString = SqlLegacyConnection.Resolve();
+		var gateway = new SqlLegacyOrderGateway(connectionString);
 
 		var portfolio = new Portfolio { Name = "DEMO" };
 		var security = new Security { Id = "AAPL@NASDAQ", Code = "AAPL", Board = ExchangeBoard.Nasdaq, Type = SecurityTypes.Stock };
@@ -43,6 +46,19 @@ class Program
 
 		Console.WriteLine($"Portfolio '{portfolio.Name}' = portfolio_id {portfolioId}");
 		Console.WriteLine($"Security '{security.Id}' = security_id {securityId}");
+		Console.WriteLine();
+
+		// --- make the demo repeatable (review finding MA-14) ---
+		// The demo submits and fills orders against the seeded DEMO portfolio. Without a reset, each run
+		// would ACCUMULATE rows: a second run's position would read qty 200 instead of 100, and after
+		// enough runs the compliant order #1 would trip the seeded order-frequency limit (5 orders / 60s)
+		// and be rejected instead of accepted - contradicting the "same outcome on every run" intent. To
+		// keep the three observable outcomes identical on EVERY run we clear this portfolio's disposable
+		// transactional rows (orders, trades, positions and the derived status history) up front, while
+		// PRESERVING the seeded RiskLimits row, the portfolio and the securities. See Database/README.md
+		// for the documented reset requirement.
+		Console.WriteLine("Resetting DEMO portfolio transactional state (orders/trades/positions/history) for a repeatable run...");
+		await ResetDemoTransactionalStateAsync(connectionString, portfolioId);
 		Console.WriteLine();
 
 		// --- order #1: within every configured RiskLimits ceiling -> ACCEPTED ---
@@ -71,5 +87,43 @@ class Program
 
 		var position = await gateway.GetPositionAsync(portfolioId, securityId);
 		Console.WriteLine($"  -> position after C# recompute: qty={position.Quantity} avg_price={position.AveragePrice} realized_pnl={position.RealizedPnL}");
+	}
+
+	/// <summary>
+	/// Clears the disposable transactional rows for a single portfolio - orders, trades, positions and
+	/// the derived order-status history - so the demo produces the same three outcomes on every run
+	/// (review finding MA-14: without this, rows accumulate across runs and the position doubles while the
+	/// order-frequency limit eventually rejects the compliant order). The seeded RiskLimits row, the
+	/// portfolio and the securities are intentionally left in place, so the seeded thresholds and the
+	/// DEMO/AAPL/MSFT rows the AAP requires still exist. Deletes are ordered child-before-parent to respect
+	/// the foreign keys (OrderStatusHistory and Trades both reference Orders; Positions reference the
+	/// portfolio/security only) and run inside a single transaction so the reset is all-or-nothing.
+	/// QUOTED_IDENTIFIER/ANSI_NULLS are set ON because dbo.Trades carries a filtered unique index (on
+	/// external_trade_id) whose DML requires those session options.
+	/// </summary>
+	/// <param name="connectionString">Connection string for the StockSharpLegacy database.</param>
+	/// <param name="portfolioId">The portfolio whose transactional rows should be cleared.</param>
+	static async Task ResetDemoTransactionalStateAsync(string connectionString, int portfolioId)
+	{
+		const string sql = @"
+SET QUOTED_IDENTIFIER ON;
+SET ANSI_NULLS ON;
+DELETE FROM dbo.OrderStatusHistory WHERE order_id IN (SELECT order_id FROM dbo.Orders WHERE portfolio_id = @portfolioId);
+DELETE FROM dbo.Trades            WHERE order_id IN (SELECT order_id FROM dbo.Orders WHERE portfolio_id = @portfolioId);
+DELETE FROM dbo.Positions         WHERE portfolio_id = @portfolioId;
+DELETE FROM dbo.Orders            WHERE portfolio_id = @portfolioId;";
+
+		await using var connection = new SqlConnection(connectionString);
+		await connection.OpenAsync();
+
+		await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync();
+
+		await using (var command = new SqlCommand(sql, connection, transaction))
+		{
+			command.Parameters.AddWithValue("@portfolioId", portfolioId);
+			await command.ExecuteNonQueryAsync();
+		}
+
+		await transaction.CommitAsync();
 	}
 }
