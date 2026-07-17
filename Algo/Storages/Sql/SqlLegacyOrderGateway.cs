@@ -153,6 +153,24 @@ public class SqlLegacyOrderGateway
 
 		await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(IsolationLevel.Serializable, cancellationToken);
 
+		// Serialize the whole read-decide-insert critical section per PORTFOLIO before
+		// taking any data locks. Under SERIALIZABLE the pre-trade reads that scan this
+		// portfolio's Orders range (RiskOrderFreqRule COUNT(*), RiskDailyVolumeRule SUM,
+		// the commission notional SUM) take RangeS-S key-range locks, while the INSERT
+		// below needs a RangeI-N lock on that same range. Two concurrent submits to the
+		// SAME portfolio therefore each hold RangeS-S and then request RangeI-N, which
+		// deadlocks (SQL error 1205) - a robustness gap, though never a limit bypass, since
+		// the loser rolls back atomically. Taking an EXCLUSIVE, transaction-scoped
+		// application lock keyed on portfolio_id up front means only one submit per
+		// portfolio is ever inside the critical section, so that lock cycle cannot form;
+		// submits to DIFFERENT portfolios use different lock keys (and disjoint Orders key
+		// ranges) and still run fully in parallel. The lock is released automatically when
+		// this transaction commits or rolls back, so it also preserves the SERIALIZABLE
+		// check-to-insert (TOCTOU) guarantee the gate relies on. sp_getapplock is a
+		// built-in SQL Server concurrency primitive (like the isolation level itself), not
+		// business logic - no risk threshold or decision lives in SQL.
+		await AcquirePortfolioSubmitLockAsync(connection, transaction, portfolioId, cancellationToken);
+
 		// Canonical C# pre-trade gate; runs on the same connection/transaction as the
 		// insert below so the read-decide-insert sequence is one atomic unit.
 		var validation = await _preTradeRisk.ValidateAsync(
@@ -298,4 +316,55 @@ public class SqlLegacyOrderGateway
 		Sides.Sell => "S",
 		_ => throw new NotSupportedException($"Order side '{side}' has no dbo.Orders.side mapping (Buy/Sell only)."),
 	};
+
+	// Acquires an EXCLUSIVE, transaction-scoped application lock keyed on the portfolio so
+	// the read-decide-insert critical section in SubmitOrderAsync runs one-at-a-time per
+	// portfolio. This removes the SERIALIZABLE RangeS-S (pre-trade range reads) vs RangeI-N
+	// (Orders insert) deadlock cycle on a hot portfolio while leaving submits to other
+	// portfolios fully concurrent (distinct lock keys). @LockOwner = 'Transaction' ties the
+	// lock's lifetime to the surrounding transaction, so it is released on commit OR
+	// rollback with no explicit unlock and no leak on the exception paths. @LockTimeout = -1
+	// waits for the lock (bounded only by the caller's CancellationToken, which cancels the
+	// wait); the critical section is short, so that wait stays tiny in practice. This uses
+	// the built-in sp_getapplock concurrency primitive - it holds no risk threshold or
+	// accept/reject logic, so the "no business logic in SQL" contract is preserved.
+	private static async Task AcquirePortfolioSubmitLockAsync(
+		SqlConnection connection, SqlTransaction transaction, int portfolioId, CancellationToken cancellationToken)
+	{
+		await using var command = new SqlCommand("sys.sp_getapplock", connection)
+		{
+			Transaction = transaction,
+			CommandType = CommandType.StoredProcedure,
+			// No client-side command deadline: the wait is governed by @LockTimeout (below)
+			// and the CancellationToken, not by an arbitrary command timeout that could
+			// surface mid-serialization as a raw error under a large burst.
+			CommandTimeout = 0,
+		};
+		command.Parameters.AddWithValue("@Resource", FormattableString.Invariant($"SqlLegacyOrderGateway/SubmitOrder/portfolio/{portfolioId}"));
+		command.Parameters.AddWithValue("@LockMode", "Exclusive");
+		command.Parameters.AddWithValue("@LockOwner", "Transaction");
+		command.Parameters.AddWithValue("@LockTimeout", -1);
+
+		var resultCode = new SqlParameter
+		{
+			ParameterName = "@Result",
+			SqlDbType = SqlDbType.Int,
+			Direction = ParameterDirection.ReturnValue,
+		};
+		command.Parameters.Add(resultCode);
+
+		await command.ExecuteNonQueryAsync(cancellationToken);
+
+		// sp_getapplock return codes: 0 = granted, 1 = granted after waiting (both success);
+		// negative = failure (-1 timeout, -2 canceled, -3 deadlock victim, -999 bad
+		// parameter / other). With an infinite @LockTimeout a wait-timeout (-1) cannot occur
+		// and a cancellation surfaces as an OperationCanceledException from
+		// ExecuteNonQueryAsync before we reach here, so any negative code is an unexpected
+		// acquisition failure worth surfacing.
+		var code = resultCode.Value is int value ? value : -999;
+
+		if (code < 0)
+			throw new InvalidOperationException(FormattableString.Invariant(
+				$"Could not acquire the per-portfolio submit lock for portfolio {portfolioId} (sp_getapplock returned {code})."));
+	}
 }

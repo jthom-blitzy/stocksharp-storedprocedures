@@ -765,9 +765,63 @@ public class RiskTests : BaseTestClass
 
 		rule.ProcessMessage(orderMsg);
 		rule.Reset();
+		// Rolling window: Reset() clears the timestamp buffer; the two same-time orders
+		// then count 1 (false) and 2 (>=Count => true). Behaviour identical to before.
 
 		rule.ProcessMessage(orderMsg).AssertFalse();
 		rule.ProcessMessage(orderMsg).AssertTrue();
+	}
+
+	[TestMethod]
+	public void OrderFreqRollingWindowBurst()
+	{
+		// AAP §0.6.3 stricter-wins — flagship reconciliation. The OLD fixed
+		// non-overlapping window ADMITS a burst straddling a bucket boundary; the
+		// canonical ROLLING window REJECTS it, so it is strictly stricter near a boundary.
+		var rule = new RiskOrderFreqRule
+		{
+			Count = 3,
+			Interval = TimeSpan.FromSeconds(10),
+			Action = RiskActions.CancelOrders
+		};
+
+		var t0 = DateTime.UtcNow;
+
+		// X=0 => buffer {0}, rolling count 1 (< 3) => admit.
+		var order0 = new OrderRegisterMessage
+		{
+			SecurityId = Helper.CreateSecurityId(),
+			LocalTime = t0.AddSeconds(0)
+		};
+		rule.ProcessMessage(order0).AssertFalse();
+
+		// X=9 => buffer {0,9}, count 2 (< 3) => admit.
+		var order9 = new OrderRegisterMessage
+		{
+			SecurityId = Helper.CreateSecurityId(),
+			LocalTime = t0.AddSeconds(9)
+		};
+		rule.ProcessMessage(order9).AssertFalse();
+
+		// X=11 => removes 0 (0 <= 11-10=1), buffer {9,11}, count 2 (< 3) => admit.
+		var order11 = new OrderRegisterMessage
+		{
+			SecurityId = Helper.CreateSecurityId(),
+			LocalTime = t0.AddSeconds(11)
+		};
+		rule.ProcessMessage(order11).AssertFalse();
+
+		// Characterization (OLD fixed window): bucket1 [0,10) sees {0,9} => 2 < 3; the
+		// order at +11 opens bucket2 [11,21) with current=1; +12 => current=2 < 3, so the
+		// fixed window NEVER trips and ADMITS the whole burst.
+		// Parity (canonical rolling, AAP §0.6.3 stricter-wins): the same burst is REJECTED
+		// at +12 because {+9,+11,+12} all fall within the trailing 10s window (count 3 >= 3).
+		var order12 = new OrderRegisterMessage
+		{
+			SecurityId = Helper.CreateSecurityId(),
+			LocalTime = t0.AddSeconds(12)
+		};
+		rule.ProcessMessage(order12).AssertTrue();
 	}
 
 	[TestMethod]
@@ -1416,6 +1470,388 @@ public class RiskTests : BaseTestClass
 		rule.ProcessMessage(execMsg).AssertFalse();
 	}
 
+	[TestMethod]
+	public void OrderPriceAtLimit()
+	{
+		// AAP §0.6.6: ">=" boundary — value equal to the limit must reject.
+		// Parity check that consolidation preserves the canonical price ceiling
+		// (switching to ">" would loosen the control).
+		var rule = new RiskOrderPriceRule
+		{
+			Price = 100,
+			Action = RiskActions.CancelOrders
+		};
+
+		var orderRegMsg = new OrderRegisterMessage
+		{
+			SecurityId = Helper.CreateSecurityId(),
+			Price = 100
+		};
+
+		rule.ProcessMessage(orderRegMsg).AssertTrue();
+	}
+
+	[TestMethod]
+	public void OrderVolumeAtLimit()
+	{
+		// AAP §0.6.6: ">=" boundary — value equal to the limit must reject.
+		// Parity check that consolidation preserves the canonical quantity ceiling.
+		var rule = new RiskOrderVolumeRule
+		{
+			Volume = 1000,
+			Action = RiskActions.StopTrading
+		};
+
+		var orderRegMsg = new OrderRegisterMessage
+		{
+			SecurityId = Helper.CreateSecurityId(),
+			Volume = 1000
+		};
+
+		rule.ProcessMessage(orderRegMsg).AssertTrue();
+	}
+
+	[TestMethod]
+	public void OrderValue()
+	{
+		// AAP §0.6.1 RELOCATE: canonical order-notional rule (qty*price), promoted from SQL-only max_order_value.
+		var rule = new RiskOrderValueRule
+		{
+			OrderValue = 1000,
+			Action = RiskActions.CancelOrders
+		};
+
+		var orderRegMsg = new OrderRegisterMessage
+		{
+			SecurityId = Helper.CreateSecurityId(),
+			Volume = 10,
+			Price = 90
+		};
+
+		// notional 10*90 = 900 < 1000 => admit.
+		rule.ProcessMessage(orderRegMsg).AssertFalse();
+
+		// AAP §0.6.6 ">=" boundary: notional 10*100 = 1000 == limit => reject.
+		orderRegMsg.Price = 100;
+		rule.ProcessMessage(orderRegMsg).AssertTrue();
+
+		// notional 10*110 = 1100 > 1000 => reject.
+		orderRegMsg.Price = 110;
+		rule.ProcessMessage(orderRegMsg).AssertTrue();
+
+		var orderReplaceMsg = new OrderReplaceMessage
+		{
+			SecurityId = Helper.CreateSecurityId(),
+			Volume = 10,
+			Price = 50
+		};
+
+		// replace notional 10*50 = 500 < 1000 => admit.
+		rule.ProcessMessage(orderReplaceMsg).AssertFalse();
+
+		// replace notional 10*200 = 2000 > 1000 => reject.
+		orderReplaceMsg.Price = 200;
+		rule.ProcessMessage(orderReplaceMsg).AssertTrue();
+
+		// Price > 0 guard on replace: a zero/absent price never rejects, even at a huge volume.
+		var orderReplaceNoPrice = new OrderReplaceMessage
+		{
+			SecurityId = Helper.CreateSecurityId(),
+			Volume = 10,
+			Price = 0
+		};
+		rule.ProcessMessage(orderReplaceNoPrice).AssertFalse();
+	}
+
+	[TestMethod]
+	public void OrderValueInvalidValue()
+	{
+		var rule = new RiskOrderValueRule();
+
+		ThrowsExactly<ArgumentOutOfRangeException>(() => rule.OrderValue = -100);
+	}
+
+	[TestMethod]
+	public void OrderValueZeroDisabled()
+	{
+		// AAP §0.6.6: NULL/0 threshold means "not enforced".
+		var rule = new RiskOrderValueRule
+		{
+			OrderValue = 0
+		};
+
+		var orderRegMsg = new OrderRegisterMessage
+		{
+			SecurityId = Helper.CreateSecurityId(),
+			Volume = 1000,
+			Price = 1000
+		};
+
+		rule.ProcessMessage(orderRegMsg).AssertFalse();
+	}
+
+	[TestMethod]
+	public void DailyVolume()
+	{
+		// AAP §0.6.1 RELOCATE: canonical daily-traded-volume rule, promoted from SQL-only max_daily_volume.
+		// The canonical rule keeps a running daily total keyed by the message's UTC
+		// day, so each boundary case uses a fresh rule instance and a valid same-day
+		// timestamp to exercise the ">=" trip on a single order's volume.
+		var day = new DateTime(2024, 1, 2, 10, 0, 0, DateTimeKind.Utc);
+
+		// 500 < 1000 => admit.
+		new RiskDailyVolumeRule { DailyVolume = 1000, Action = RiskActions.StopTrading }
+			.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Volume = 500m, LocalTime = day }).AssertFalse();
+
+		// AAP §0.6.6 ">=" boundary: 1000 == limit => reject.
+		new RiskDailyVolumeRule { DailyVolume = 1000, Action = RiskActions.StopTrading }
+			.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Volume = 1000m, LocalTime = day }).AssertTrue();
+
+		// 1500 > 1000 => reject.
+		new RiskDailyVolumeRule { DailyVolume = 1000, Action = RiskActions.StopTrading }
+			.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Volume = 1500m, LocalTime = day }).AssertTrue();
+
+		// Volume > 0 guard on replace: a zero volume never rejects.
+		new RiskDailyVolumeRule { DailyVolume = 1000, Action = RiskActions.StopTrading }
+			.ProcessMessage(new OrderReplaceMessage { SecurityId = Helper.CreateSecurityId(), Volume = 0m, LocalTime = day }).AssertFalse();
+	}
+
+	[TestMethod]
+	public void DailyVolumeInvalidValue()
+	{
+		ThrowsExactly<ArgumentOutOfRangeException>(() => new RiskDailyVolumeRule().DailyVolume = -1);
+	}
+
+	[TestMethod]
+	public void DailyVolumeZeroDisabled()
+	{
+		// NULL/0 => not enforced (AAP §0.6.6).
+		var rule = new RiskDailyVolumeRule
+		{
+			DailyVolume = 0
+		};
+
+		var orderRegMsg = new OrderRegisterMessage
+		{
+			SecurityId = Helper.CreateSecurityId(),
+			Volume = 100000
+		};
+
+		rule.ProcessMessage(orderRegMsg).AssertFalse();
+	}
+
+	[TestMethod]
+	public void DailyVolumeGateSemantics()
+	{
+		// AAP §0.6.1: the rule holds only threshold+comparison; the pre-trade gate supplies
+		// (today's accepted/filled qty + new qty) as the effective Volume, matching SQL
+		// max_daily_volume "today + qty >= limit". Each gate check is independent (the gate
+		// reads today's SQL total fresh per call), so each case uses its own rule instance
+		// and a valid same-day timestamp.
+		var day = new DateTime(2024, 1, 2, 10, 0, 0, DateTimeKind.Utc);
+
+		// Would come from SELECT SUM(qty) today in the gate — computed in C# now, per §0.6.1.
+		decimal todayVolume = 800m;
+
+		// Breach: today (800) + new (300) = 1100 >= 1000 => reject.
+		decimal newQty = 300m;
+		new RiskDailyVolumeRule { DailyVolume = 1000 }
+			.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Volume = todayVolume + newQty, LocalTime = day }).AssertTrue();
+
+		// Pass: today (800) + new (100) = 900 < 1000 => admit.
+		new RiskDailyVolumeRule { DailyVolume = 1000 }
+			.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Volume = todayVolume + 100m, LocalTime = day }).AssertFalse();
+	}
+
+	[TestMethod]
+	public void RecalcOpenLong()
+	{
+		// AAP §0.6.5: opening a fresh long — weighted-average accumulate from flat.
+		var (qty, avg, pnl) = PositionRecalculationService.Recalculate(0m, 0m, 0m, Sides.Buy, 100m, 150m);
+		qty.AssertEqual(100m);
+		avg.AssertEqual(150m);
+		pnl.AssertEqual(0m);
+	}
+
+	[TestMethod]
+	public void RecalcAddToLong()
+	{
+		// AAP §0.6.5: same-sign accumulate, weighted average = (100*150 + 100*160)/200 = 155.
+		// unrealized_pnl is intentionally NOT part of the recompute (it needs a live market
+		// price) — the pure result exposes only Quantity/AveragePrice/RealizedPnl, leaving
+		// unrealized_pnl untouched by design.
+		var (qty, avg, pnl) = PositionRecalculationService.Recalculate(100m, 150m, 0m, Sides.Buy, 100m, 160m);
+		qty.AssertEqual(200m);
+		avg.AssertEqual(155m);
+		pnl.AssertEqual(0m);
+	}
+
+	[TestMethod]
+	public void RecalcPartialCloseLong()
+	{
+		// AAP §0.6.5: partial close realizes 40*(170-150) = 800; the remaining 60 keeps its avg (150).
+		var (qty, avg, pnl) = PositionRecalculationService.Recalculate(100m, 150m, 0m, Sides.Sell, 40m, 170m);
+		qty.AssertEqual(60m);
+		avg.AssertEqual(150m);
+		pnl.AssertEqual(800m);
+	}
+
+	[TestMethod]
+	public void RecalcExactCloseLong()
+	{
+		// AAP §0.6.5: exact close realizes 100*(170-150) = 2000; a flat position resets avg to 0.
+		var (qty, avg, pnl) = PositionRecalculationService.Recalculate(100m, 150m, 0m, Sides.Sell, 100m, 170m);
+		qty.AssertEqual(0m);
+		avg.AssertEqual(0m);
+		pnl.AssertEqual(2000m);
+	}
+
+	[TestMethod]
+	public void RecalcCloseAndFlipLong()
+	{
+		// AAP §0.6.5: close 100 => realize 2000; the remaining 60 opens a short at the trade price 170.
+		var (qty, avg, pnl) = PositionRecalculationService.Recalculate(100m, 150m, 0m, Sides.Sell, 160m, 170m);
+		qty.AssertEqual(-60m);
+		avg.AssertEqual(170m);
+		pnl.AssertEqual(2000m);
+	}
+
+	[TestMethod]
+	public void RecalcOpenShort()
+	{
+		// AAP §0.6.5: opening a fresh short — weighted-average accumulate from flat.
+		var (qty, avg, pnl) = PositionRecalculationService.Recalculate(0m, 0m, 0m, Sides.Sell, 100m, 150m);
+		qty.AssertEqual(-100m);
+		avg.AssertEqual(150m);
+		pnl.AssertEqual(0m);
+	}
+
+	[TestMethod]
+	public void RecalcAddToShort()
+	{
+		// AAP §0.6.5: same-sign short accumulate, weighted average = (100*150 + 100*160)/200 = 155.
+		var (qty, avg, pnl) = PositionRecalculationService.Recalculate(-100m, 150m, 0m, Sides.Sell, 100m, 160m);
+		qty.AssertEqual(-200m);
+		avg.AssertEqual(155m);
+		pnl.AssertEqual(0m);
+	}
+
+	[TestMethod]
+	public void RecalcPartialCloseShort()
+	{
+		// AAP §0.6.5: short partial close realizes 40*(150-130) = 800; the remaining -60 keeps its avg (150).
+		var (qty, avg, pnl) = PositionRecalculationService.Recalculate(-100m, 150m, 0m, Sides.Buy, 40m, 130m);
+		qty.AssertEqual(-60m);
+		avg.AssertEqual(150m);
+		pnl.AssertEqual(800m);
+	}
+
+	[TestMethod]
+	public void RecalcCloseAndFlipShort()
+	{
+		// AAP §0.6.5: close 100 short => realize 2000; the remaining 60 opens a long at the trade price 130.
+		var (qty, avg, pnl) = PositionRecalculationService.Recalculate(-100m, 150m, 0m, Sides.Buy, 160m, 130m);
+		qty.AssertEqual(60m);
+		avg.AssertEqual(130m);
+		pnl.AssertEqual(2000m);
+	}
+
+	[TestMethod]
+	public void RecalcNoDoubleCount()
+	{
+		// AAP §0.6.5: the OLD design let the trigger AND the standalone proc both recompute,
+		// doubling the position (100 -> 200). The refactor calls the service EXACTLY ONCE per
+		// trade (in RecordTradeAsync), so applying it twice here proves why exactly-once matters.
+		var once = PositionRecalculationService.Recalculate(0m, 0m, 0m, Sides.Buy, 100m, 150m);
+		once.Quantity.AssertEqual(100m);
+
+		var twice = PositionRecalculationService.Recalculate(once.Quantity, once.AveragePrice, once.RealizedPnl, Sides.Buy, 100m, 150m);
+		twice.Quantity.AssertEqual(200m);
+
+		(once.Quantity == twice.Quantity).AssertFalse();
+	}
+
+	[TestMethod]
+	public void PositionSizeTwoApplicationPoints()
+	{
+		// AAP §0.6.4 SHARED DEFINITION, TWO APPLICATION POINTS: identical threshold (Position=100)
+		// and ">=" comparison. The circuit breaker reacts only once the LIVE value reaches the limit
+		// (post-update); the pre-trade gate feeds a POST-FILL PROJECTION (current + signed order qty)
+		// so it rejects BEFORE the fill. Dropping the projection would loosen the gate and violate
+		// §0.6.2 stricter-wins.
+		var rule = new RiskPositionSizeRule
+		{
+			Position = 100,
+			Action = RiskActions.CancelOrders
+		};
+
+		// Circuit-breaker / live application point: the live current value (80) is below the
+		// limit, so the stream-based breaker has NOT yet tripped.
+		var liveMsg = new PositionChangeMessage
+		{
+			SecurityId = Helper.CreateSecurityId(),
+			ServerTime = DateTime.UtcNow,
+			PortfolioName = _pfName
+		};
+		liveMsg.Add(PositionChangeTypes.CurrentValue, 80m);
+
+		rule.ProcessMessage(liveMsg).AssertFalse();
+
+		// Gate / pre-trade post-fill projection (PreTradeRiskService RULE5: projected = currentQty + signedDelta).
+		decimal current = 80m;
+		decimal signedDelta = 40m; // a BUY of 40
+		decimal projected = current + signedDelta; // = 120
+
+		var projectedMsg = new PositionChangeMessage
+		{
+			SecurityId = Helper.CreateSecurityId(),
+			ServerTime = DateTime.UtcNow,
+			PortfolioName = _pfName
+		};
+		projectedMsg.Add(PositionChangeTypes.CurrentValue, projected);
+
+		// |120| >= 100 => the gate rejects PRE-fill using the SAME rule definition.
+		rule.ProcessMessage(projectedMsg).AssertTrue();
+	}
+
+	[TestMethod]
+	public void CommissionEstimateVsActualSeparate()
+	{
+		// AAP §0.6.4 KEEP SEPARATE BY DESIGN: pre-fill ESTIMATE (qty*price*rate, RULE6) and
+		// post-fill ACTUAL (RiskOrderCommissionRule off ExecutionMessage) consume the SAME
+		// max_commission_total limit but operate on fundamentally different figures available at
+		// different times. They are two implementations, never merged — see the rewritten LEGACY_LAYER.md.
+
+		// ACTUAL post-fill path (canonical RiskOrderCommissionRule).
+		var actualRule = new RiskOrderCommissionRule
+		{
+			Commission = 1,
+			Action = RiskActions.CancelOrders
+		};
+
+		var execMsg = new ExecutionMessage
+		{
+			DataTypeEx = DataType.Transactions,
+			SecurityId = Helper.CreateSecurityId(),
+			ServerTime = DateTime.UtcNow,
+			Commission = 60,
+			HasOrderInfo = true
+		};
+
+		// actual 60 >= limit 1 => breaches.
+		actualRule.ProcessMessage(execMsg).AssertTrue();
+
+		// ESTIMATE pre-fill path (PreTradeRiskService RULE6 formula, replicated inline since RULE6 is DB-bound).
+		const decimal rate = 0.0005m; // PreTradeRiskService default commission rate
+		decimal qty = 10m, price = 100m, existingNotional = 0m;
+		decimal estimate = existingNotional * rate + qty * price * rate; // RULE6: = 0.5m
+		estimate.AssertEqual(0.5m);
+
+		// Separation: same order, same limit=1, OPPOSITE decisions; and the two figures differ.
+		(estimate >= 1m).AssertFalse(); // the pre-fill estimate (0.5) does NOT breach the same limit the actual (60) breaches
+		(estimate == 60m).AssertFalse();
+	}
+
 	private class TestRiskRule : RiskRule
 	{
 		public bool ShouldActivate { get; set; }
@@ -1860,14 +2296,6 @@ public class RiskTests : BaseTestClass
 		RiskDailyVolumeRule.IsDailyVolumeExceeded(100m, 100m).AssertTrue();  // boundary
 		RiskDailyVolumeRule.IsDailyVolumeExceeded(120m, 100m).AssertTrue();
 		RiskDailyVolumeRule.IsDailyVolumeExceeded(1_000m, 0m).AssertFalse(); // 0 = not enforced
-	}
-
-	[TestMethod]
-	public void DailyVolumeInvalidValue()
-	{
-		var rule = new RiskDailyVolumeRule();
-
-		ThrowsExactly<ArgumentOutOfRangeException>(() => rule.DailyVolume = -1);
 	}
 
 	[TestMethod]

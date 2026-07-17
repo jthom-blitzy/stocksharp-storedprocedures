@@ -28,11 +28,31 @@ SET QUOTED_IDENTIFIER ON;
 GO
 
 -- ============================================================================
--- Portfolios
+-- Teardown
+--
+-- Re-running this script is the documented in-place reset (see Database/README.md),
+-- so it has to be able to drop every table even when the database already holds
+-- data. Tables are dropped CHILD-FIRST here - the exact reverse of the
+-- parent-first creation order below - because a table that is still referenced by
+-- a FOREIGN KEY cannot be dropped while the referencing children exist. Dropping
+-- in creation order instead fails with "Msg 3726 ... could not drop object
+-- because it is referenced by a FOREIGN KEY constraint" (FK_OrderStatusHistory_Orders,
+-- FK_Trades_Orders, FK_Positions_Portfolios/_Securities, FK_Orders_Portfolios/_Securities,
+-- FK_RiskLimits_Portfolios/_Securities), which aborts the reset and leaves stale
+-- data behind. On a fresh database every drop below is a harmless no-op.
 -- ============================================================================
+IF OBJECT_ID(N'dbo.OrderStatusHistory', N'U') IS NOT NULL DROP TABLE dbo.OrderStatusHistory;
+IF OBJECT_ID(N'dbo.Trades', N'U') IS NOT NULL DROP TABLE dbo.Trades;
+IF OBJECT_ID(N'dbo.Positions', N'U') IS NOT NULL DROP TABLE dbo.Positions;
+IF OBJECT_ID(N'dbo.Orders', N'U') IS NOT NULL DROP TABLE dbo.Orders;
+IF OBJECT_ID(N'dbo.RiskLimits', N'U') IS NOT NULL DROP TABLE dbo.RiskLimits;
+IF OBJECT_ID(N'dbo.Securities', N'U') IS NOT NULL DROP TABLE dbo.Securities;
 IF OBJECT_ID(N'dbo.Portfolios', N'U') IS NOT NULL DROP TABLE dbo.Portfolios;
 GO
 
+-- ============================================================================
+-- Portfolios
+-- ============================================================================
 CREATE TABLE dbo.Portfolios
 (
 	portfolio_id	INT IDENTITY(1,1)		NOT NULL,
@@ -56,9 +76,6 @@ GO
 -- still the C#-side Security/ISecurityStorage catalog). security_code is the
 -- StockSharp Code@Board id so the two sides can be joined/reconciled.
 -- ============================================================================
-IF OBJECT_ID(N'dbo.Securities', N'U') IS NOT NULL DROP TABLE dbo.Securities;
-GO
-
 CREATE TABLE dbo.Securities
 (
 	security_id		INT IDENTITY(1,1)		NOT NULL,
@@ -84,9 +101,6 @@ GO
 -- "no limit"). Whoever configures this table needs to know that convention;
 -- it isn't enforced anywhere else.
 -- ============================================================================
-IF OBJECT_ID(N'dbo.RiskLimits', N'U') IS NOT NULL DROP TABLE dbo.RiskLimits;
-GO
-
 CREATE TABLE dbo.RiskLimits
 (
 	risk_limit_id			INT IDENTITY(1,1)	NOT NULL,
@@ -125,9 +139,6 @@ GO
 -- three years of stored procs and nobody wanted to touch it. Same story
 -- elsewhere in this schema.
 -- ============================================================================
-IF OBJECT_ID(N'dbo.Orders', N'U') IS NOT NULL DROP TABLE dbo.Orders;
-GO
-
 CREATE TABLE dbo.Orders
 (
 	order_id				BIGINT IDENTITY(1,1)	NOT NULL,
@@ -167,9 +178,6 @@ GO
 -- ============================================================================
 -- Trades
 -- ============================================================================
-IF OBJECT_ID(N'dbo.Trades', N'U') IS NOT NULL DROP TABLE dbo.Trades;
-GO
-
 CREATE TABLE dbo.Trades
 (
 	trade_id		BIGINT IDENTITY(1,1)	NOT NULL,
@@ -198,9 +206,6 @@ GO
 -- separately by the EOD mark-to-market batch (outside the scope of this brief).
 -- Treat this column as stale/EOD-only, not real-time.
 -- ============================================================================
-IF OBJECT_ID(N'dbo.Positions', N'U') IS NOT NULL DROP TABLE dbo.Positions;
-GO
-
 CREATE TABLE dbo.Positions
 (
 	position_id		INT IDENTITY(1,1)		NOT NULL,
@@ -226,9 +231,6 @@ GO
 -- audit/history cascade the compliance team asked for - append-only, nothing
 -- in this schema ever updates or deletes from it.
 -- ============================================================================
-IF OBJECT_ID(N'dbo.OrderStatusHistory', N'U') IS NOT NULL DROP TABLE dbo.OrderStatusHistory;
-GO
-
 CREATE TABLE dbo.OrderStatusHistory
 (
 	history_id		BIGINT IDENTITY(1,1)	NOT NULL,

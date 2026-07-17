@@ -16,7 +16,7 @@ consolidation rationale and the rule-by-rule reconciliation.
 
 Run order: `001_Schema.sql` -> `002_StoredProcedures.sql` -> `003_Triggers.sql` -> `004_SeedData.sql` (optional but the C# sample/demo assumes it has run).
 
-Each script is safe to re-run (`001` drops and recreates every table, `002` drops the three retired procedures with `DROP ... IF EXISTS`, `003` drops the retired position-recalc trigger and `CREATE OR ALTER`s the audit trigger, `004` checks before inserting) - convenient when iterating, but be aware `001` is destructive: rerunning it against a database with real data wipes it.
+Each script is safe to re-run (`001` drops every table child-first - reverse of the parent-first creation order - so foreign keys don't block the reset, then recreates them all, `002` drops the three retired procedures with `DROP ... IF EXISTS`, `003` drops the retired position-recalc trigger and `CREATE OR ALTER`s the audit trigger, `004` checks before inserting) - convenient when iterating, but be aware `001` is destructive: rerunning it against a database with real data wipes it.
 
 ## Stand up a local instance (Docker)
 
