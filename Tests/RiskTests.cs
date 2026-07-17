@@ -825,6 +825,111 @@ public class RiskTests : BaseTestClass
 	}
 
 	[TestMethod]
+	public void OrderFreqRollingCountAtLeastAsStrict()
+	{
+		// Characterization + parity for the rolling-count consolidation (AAP §0.6.1). The refactor
+		// replaced RiskOrderFreqRule's fixed-window bucketing with a rolling COUNT(*) over the trailing
+		// Interval, mirroring the SQL pre-trade gate (dbo.usp_ValidatePreTradeRisk, ported to
+		// PreTradeRiskService). This test pins the pre-refactor behaviour via OldFixedWindowFires (a
+		// verbatim reproduction of the old algorithm) and proves the delivered rolling rule is
+		// (a) never looser than the old fixed-window rule at any order in the sequence, and
+		// (b) strictly stricter for at least one order — the single deliberate, authorized tightening.
+		const int count = 3;
+		var interval = TimeSpan.FromSeconds(10);
+
+		// A strictly-increasing sequence with a post-fire continuation: the old rule fires at +5s, then
+		// resets its bucket and misses the +6s/+7s burst; the rolling rule keeps rejecting while the
+		// trailing window stays saturated. (Timestamps are in-order, so the rule's late-event watermark
+		// path is not exercised here.)
+		var start = DateTime.UtcNow;
+		var times = new[]
+		{
+			start.AddSeconds(0),
+			start.AddSeconds(1),
+			start.AddSeconds(5),
+			start.AddSeconds(6),
+			start.AddSeconds(7),
+		};
+
+		// Old fixed-window fire vector (characterization of the pre-refactor algorithm).
+		var oldFires = OldFixedWindowFires(count, interval, times);
+
+		// New rolling-count fire vector: feed the identical timestamps into a single fresh delivered rule.
+		var rule = new RiskOrderFreqRule
+		{
+			Count = count,
+			Interval = interval,
+		};
+
+		var newFires = new bool[times.Length];
+
+		for (var i = 0; i < times.Length; i++)
+		{
+			var msg = new OrderRegisterMessage
+			{
+				SecurityId = Helper.CreateSecurityId(),
+				LocalTime = times[i],
+			};
+
+			newFires[i] = rule.ProcessMessage(msg);
+		}
+
+		// Never-looser: whenever the old fixed-window rule fired, the new rolling rule must also fire.
+		for (var i = 0; i < times.Length; i++)
+			(!oldFires[i] || newFires[i]).AssertTrue();
+
+		// Strictly-stricter somewhere: the rolling rule fires on at least one order the old rule missed
+		// (here the +6s continuation), proving the intentional at-least-as-strict tightening.
+		Enumerable.Range(0, times.Length).Any(i => newFires[i] && !oldFires[i]).AssertTrue();
+	}
+
+	// Characterization of the pre-refactor RiskOrderFreqRule fixed-window algorithm
+	// (Algo/Risk/RiskOrderFreqRule.cs before the rolling-count consolidation, AAP §0.6.1). Verbatim
+	// behavioural reproduction of the old ProcessMessage: time is bucketed into non-overlapping
+	// [anchor, anchor + interval) windows, the counter resets to 1 when an order falls outside the
+	// current window, and the rule fires (and clears the window) once the counter reaches Count.
+	private static bool[] OldFixedWindowFires(int count, TimeSpan interval, DateTime[] times)
+	{
+		var fires = new bool[times.Length];
+		DateTime? endTime = null;
+		var current = 0;
+
+		for (var i = 0; i < times.Length; i++)
+		{
+			var time = times[i];
+
+			if (endTime == null)
+			{
+				endTime = time + interval;
+				current = 1;
+				fires[i] = false;
+				continue;
+			}
+
+			if (time < endTime)
+			{
+				current++;
+
+				if (current >= count)
+				{
+					endTime = null;
+					fires[i] = true;
+					continue;
+				}
+			}
+			else
+			{
+				endTime = time + interval;
+				current = 1;
+			}
+
+			fires[i] = false;
+		}
+
+		return fires;
+	}
+
+	[TestMethod]
 	public void OrderFreqBoundary()
 	{
 		// M15: correct rolling-window boundary for Count=5 / window=60s using offsets [0,1,2,59,60].
