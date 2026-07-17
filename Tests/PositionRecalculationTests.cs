@@ -239,18 +239,49 @@ public class PositionRecalculationTests : BaseTestClass
 		close.AvgPrice.AssertEqual(150.00m); // partial close: average price unchanged
 	}
 
+	[TestMethod]
+	public void Recalculate_ZeroQtyFromFlat_NoThrow_IsNoOp()
+	{
+		// INFO guard (defensive totality): a zero-quantity trade against a FLAT position would compute 0/0 in
+		// the weighted-average branch and throw DivideByZeroException. ApplyAsync can never feed this (the DB
+		// CHECK qty > 0 rejects a zero-qty trade before it reaches the service), but the PURE method must be
+		// TOTAL - so a zero-qty trade is a no-op that returns the position unchanged instead of throwing.
+		var fromFlat = PositionRecalculationService.Recalculate(
+			existingQty: 0m, existingAvgPrice: 0m, existingRealizedPnl: 0m,
+			side: "B", tradeQty: 0m, tradePrice: 0m);
+
+		fromFlat.Qty.AssertEqual(0m);          // still flat
+		fromFlat.AvgPrice.AssertEqual(0m);     // no average to form
+		fromFlat.RealizedPnl.AssertEqual(0m);  // nothing realized
+
+		// A zero-qty trade against a NON-flat position is likewise a no-op that preserves existing state.
+		var nonFlat = PositionRecalculationService.Recalculate(
+			existingQty: 100m, existingAvgPrice: 150.00m, existingRealizedPnl: 55m,
+			side: "S", tradeQty: 0m, tradePrice: 170.00m);
+
+		nonFlat.Qty.AssertEqual(100m);          // unchanged
+		nonFlat.AvgPrice.AssertEqual(150.00m);  // unchanged
+		nonFlat.RealizedPnl.AssertEqual(55m);   // unchanged
+	}
+
 	// ========================================================================================================
 	// Phase C - guarded PostgreSQL integration (step-3 engine-migration run).
 	//
 	// These exercise the REAL PositionRecalculationService.ApplyAsync against a live PostgreSQL database and
 	// MUST report Inconclusive (never fail) when no database is available. They seed only what each scenario
-	// needs with unique natural keys for re-run safety and tear everything down in a finally.
+	// needs with unique natural keys - including UNIQUE trade ids, because the single-apply guard is now a
+	// DURABLE processedtrades ledger row (not process-local), so a fixed id would survive across runs - for
+	// re-run safety, and tear everything down (positions, orders, securities, portfolios AND the
+	// processedtrades ledger rows) in a finally.
 	// ========================================================================================================
 
 	/// <summary>
-	/// Single-apply invariant: the position-recalc DB trigger was removed, so the service records applied
-	/// <c>trade_id</c>s in an in-memory <c>HashSet</c> AFTER success; re-applying the SAME <c>trade_id</c> is a
-	/// no-op, so the position is not double-counted.
+	/// Single-apply invariant (same instance): the position-recalc DB trigger was removed, so the service
+	/// claims each applied <c>trade_id</c> in the durable <c>processedtrades</c> ledger inside its own
+	/// transaction; re-applying the SAME <c>trade_id</c> is an idempotent no-op, so the position is not
+	/// double-counted. The durable CROSS-instance/restart proof is
+	/// <see cref="ApplyAsync_CrossInstanceSameTrade_NoDoubleCount"/> and the concurrency proof is
+	/// <see cref="ApplyAsync_ConcurrentDifferentTrades_Accumulate"/>.
 	/// </summary>
 	[TestMethod]
 	public async Task ApplyAsync_SingleApply_NoDoubleCount()
@@ -266,16 +297,16 @@ public class PositionRecalculationTests : BaseTestClass
 		var portfolioId = 0;
 		var securityId = 0;
 
+		// The single-apply guard is keyed on trade_id, so BOTH calls MUST use the SAME value for the second to
+		// be recognised as a repeat. The guard is now DURABLE (a processedtrades ledger row), so the id must
+		// be UNIQUE PER RUN and purged in cleanup - otherwise a re-run would find it already applied.
+		var tradeId = NextTradeId();
+
 		try
 		{
 			portfolioId = await InsertPortfolioAsync(cn, "pf_recalc_single_" + suffix);
 			securityId = await InsertSecurityAsync(cn, "sec_" + suffix);
 			var orderId = await InsertOrderAsync(cn, portfolioId, securityId, "B", 100m, 150.00m, "ACCEPTED");
-
-			// The single-apply guard is keyed on trade_id, so BOTH calls MUST use the same value for the
-			// second to be recognised as a repeat. The guard is per service instance and in-memory, so a
-			// fixed constant is sufficient here (a fresh instance starts with an empty set).
-			const long tradeId = 987654321L;
 
 			var svc = new PositionRecalculationService();
 
@@ -292,7 +323,7 @@ public class PositionRecalculationTests : BaseTestClass
 		}
 		finally
 		{
-			await CleanupAsync(cn, portfolioId, securityId);
+			await CleanupAsync(cn, portfolioId, securityId, tradeId);
 		}
 	}
 
@@ -313,6 +344,10 @@ public class PositionRecalculationTests : BaseTestClass
 		var portfolioId = 0;
 		var securityId = 0;
 
+		// Unique per run: the single-apply guard is a durable processedtrades ledger row, so a fixed id would
+		// survive across runs and skip the apply. Purged in cleanup.
+		var tradeId = NextTradeId();
+
 		try
 		{
 			portfolioId = await InsertPortfolioAsync(cn, "pf_recalc_unreal_" + suffix);
@@ -327,7 +362,7 @@ public class PositionRecalculationTests : BaseTestClass
 				qty: 0m, avgPrice: 0m, realizedPnl: 0m, unrealizedPnl: sentinelUnrealized);
 
 			var svc = new PositionRecalculationService();
-			await svc.ApplyAsync(cn, orderId, 987654322L, 100m, 150.00m, CancellationToken);
+			await svc.ApplyAsync(cn, orderId, tradeId, 100m, 150.00m, CancellationToken);
 
 			var position = await ReadPositionAsync(cn, portfolioId, securityId);
 
@@ -340,7 +375,115 @@ public class PositionRecalculationTests : BaseTestClass
 		}
 		finally
 		{
-			await CleanupAsync(cn, portfolioId, securityId);
+			await CleanupAsync(cn, portfolioId, securityId, tradeId);
+		}
+	}
+
+	/// <summary>
+	/// Single-apply invariant ACROSS service instances / process restarts - the first original CRITICAL. The
+	/// guard used to be a process-local <c>HashSet</c>, so a SECOND instance (modelling a restarted process
+	/// with fresh in-memory state) re-applied the SAME trade and DOUBLE-COUNTED the position (observed qty
+	/// 200). With the durable <c>processedtrades</c> ledger the repeat is recognised regardless of which
+	/// instance applies it, so the position stays at qty 100.
+	/// </summary>
+	[TestMethod]
+	public async Task ApplyAsync_CrossInstanceSameTrade_NoDoubleCount()
+	{
+		await using var cn = await TryOpenAsync();
+
+		if (cn is null)
+			return;
+
+		var suffix = Guid.NewGuid().ToString("N");
+		var portfolioId = 0;
+		var securityId = 0;
+		var tradeId = NextTradeId();
+
+		try
+		{
+			portfolioId = await InsertPortfolioAsync(cn, "pf_recalc_xinst_" + suffix);
+			securityId = await InsertSecurityAsync(cn, "sec_" + suffix);
+			var orderId = await InsertOrderAsync(cn, portfolioId, securityId, "B", 100m, 150.00m, "ACCEPTED");
+
+			// Instance A opens the position from flat -> qty 100 @ 150.
+			var svcA = new PositionRecalculationService();
+			await svcA.ApplyAsync(cn, orderId, tradeId, 100m, 150.00m, CancellationToken);
+
+			var afterA = await ReadPositionAsync(cn, portfolioId, securityId);
+			afterA.Qty.AssertEqual(100m); // first apply took effect
+
+			// A DISTINCT instance (fresh, empty in-memory state - as after a process restart) applies the SAME
+			// trade_id. The old process-local guard MISSED this and double-counted to 200; the durable
+			// processedtrades ledger recognises the repeat and makes it an idempotent no-op.
+			var svcB = new PositionRecalculationService();
+			await svcB.ApplyAsync(cn, orderId, tradeId, 100m, 150.00m, CancellationToken);
+
+			var afterB = await ReadPositionAsync(cn, portfolioId, securityId);
+			afterB.Qty.AssertEqual(100m);           // NOT 200 - durable single-apply held across instances
+			afterB.AvgPrice.AssertEqual(150.0000m); // unchanged by the ignored repeat
+			afterB.RealizedPnl.AssertEqual(0m);     // opening a position realizes nothing
+		}
+		finally
+		{
+			await CleanupAsync(cn, portfolioId, securityId, tradeId);
+		}
+	}
+
+	/// <summary>
+	/// Concurrency / lost-update invariant - the second original CRITICAL. Two DIFFERENT trades on the SAME
+	/// (portfolio, security) applied CONCURRENTLY used to race on an unsynchronised read-modify-write, and the
+	/// absolute UPSERT overwrote one update so the observed qty was 100 instead of 200 (a lost update). Each
+	/// apply now runs in its own transaction and serialises on a per-(portfolio, security)
+	/// <c>pg_advisory_xact_lock</c>, so both updates land and the position accumulates to qty 200.
+	/// </summary>
+	[TestMethod]
+	public async Task ApplyAsync_ConcurrentDifferentTrades_Accumulate()
+	{
+		await using var cn = await TryOpenAsync();
+
+		if (cn is null)
+			return;
+
+		var suffix = Guid.NewGuid().ToString("N");
+		var portfolioId = 0;
+		var securityId = 0;
+		var tradeIdA = NextTradeId();
+		var tradeIdB = NextTradeId();
+
+		try
+		{
+			portfolioId = await InsertPortfolioAsync(cn, "pf_recalc_conc_" + suffix);
+			securityId = await InsertSecurityAsync(cn, "sec_" + suffix);
+			// Both trades reference one accepted BUY order; ApplyAsync reads only (portfolio, security, side)
+			// from it, so a single order is enough and both applies target the SAME position row.
+			var orderId = await InsertOrderAsync(cn, portfolioId, securityId, "B", 100m, 150.00m, "ACCEPTED");
+
+			// Two DISTINCT connections: ApplyAsync opens its own transaction, and a single NpgsqlConnection
+			// cannot run two overlapping transactions, so genuine concurrency needs one connection each.
+			await using var cnA = new NpgsqlConnection(SqlLegacyConnection.Resolve());
+			await using var cnB = new NpgsqlConnection(SqlLegacyConnection.Resolve());
+			await cnA.OpenAsync(CancellationToken);
+			await cnB.OpenAsync(CancellationToken);
+
+			var svcA = new PositionRecalculationService();
+			var svcB = new PositionRecalculationService();
+
+			// Fire both applies concurrently against the SAME (portfolio, security). Without per-key
+			// serialisation these race and one update is lost (observed qty 100); with the advisory lock they
+			// serialise and both land.
+			var applyA = svcA.ApplyAsync(cnA, orderId, tradeIdA, 100m, 150.00m, CancellationToken);
+			var applyB = svcB.ApplyAsync(cnB, orderId, tradeIdB, 100m, 150.00m, CancellationToken);
+			await Task.WhenAll(applyA, applyB);
+
+			var position = await ReadPositionAsync(cn, portfolioId, securityId);
+
+			position.Qty.AssertEqual(200m);           // 100 + 100 - NEITHER update lost
+			position.AvgPrice.AssertEqual(150.0000m); // both at 150 -> weighted average still 150
+			position.RealizedPnl.AssertEqual(0m);     // two same-side opens realize nothing
+		}
+		finally
+		{
+			await CleanupAsync(cn, portfolioId, securityId, tradeIdA, tradeIdB);
 		}
 	}
 
@@ -446,10 +589,20 @@ public class PositionRecalculationTests : BaseTestClass
 	}
 
 	/// <summary>
-	/// Removes every row seeded for a portfolio/security in FK-safe order (children first) so the shared
-	/// dev/CI database stays clean across re-runs. Safe to call with zero ids (deletes nothing).
+	/// Generates a process-unique, positive <c>trade_id</c> for the durable single-apply ledger. Because the
+	/// guard is now a persisted <c>processedtrades</c> row (not process-local state), a hard-coded id would
+	/// survive across runs and make a re-run's first apply look like an already-applied repeat; a fresh random
+	/// id per test keeps every run independent. Bounded well inside <c>BIGINT</c> and far from any seeded ids.
 	/// </summary>
-	private async Task CleanupAsync(NpgsqlConnection cn, int portfolioId, int securityId)
+	private static long NextTradeId() => Random.Shared.NextInt64(1_000_000_000L, long.MaxValue);
+
+	/// <summary>
+	/// Removes every row seeded for a portfolio/security in FK-safe order (children first) so the shared
+	/// dev/CI database stays clean across re-runs, and purges the durable <c>processedtrades</c> ledger rows
+	/// for the supplied trade ids so a re-run does not see them already applied. Safe to call with zero ids
+	/// (deletes nothing).
+	/// </summary>
+	private async Task CleanupAsync(NpgsqlConnection cn, int portfolioId, int securityId, params long[] tradeIds)
 	{
 		using var cmd = new NpgsqlCommand(
 			"DELETE FROM trades WHERE order_id IN (SELECT order_id FROM orders WHERE portfolio_id = @pid); " +
@@ -457,9 +610,13 @@ public class PositionRecalculationTests : BaseTestClass
 			"DELETE FROM positions WHERE portfolio_id = @pid; " +
 			"DELETE FROM orders WHERE portfolio_id = @pid; " +
 			"DELETE FROM securities WHERE security_id = @sid; " +
-			"DELETE FROM portfolios WHERE portfolio_id = @pid;", cn);
+			"DELETE FROM portfolios WHERE portfolio_id = @pid; " +
+			"DELETE FROM processedtrades WHERE trade_id = ANY(@ids);", cn);
 		cmd.Parameters.Add(new NpgsqlParameter("pid", NpgsqlDbType.Integer) { Value = portfolioId });
 		cmd.Parameters.Add(new NpgsqlParameter("sid", NpgsqlDbType.Integer) { Value = securityId });
+		// The durable single-apply ledger (processedtrades) has NO FK to trades, so it must be purged
+		// explicitly; ANY over a (possibly empty) bigint[] deletes exactly the ids this test claimed.
+		cmd.Parameters.Add(new NpgsqlParameter("ids", NpgsqlDbType.Array | NpgsqlDbType.Bigint) { Value = tradeIds ?? [] });
 		await cmd.ExecuteNonQueryAsync(CancellationToken);
 	}
 }

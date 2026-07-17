@@ -35,9 +35,11 @@ public class SqlLegacyOrderGateway
 	private readonly string _connectionString;
 
 	// The gateway owns a single PositionRecalculationService and calls ApplyAsync exactly
-	// once per inserted trade (single-apply invariant, AAP 0.6.5). The service keeps a
-	// per-instance applied-trade-id guard, so reusing one instance across calls makes an
-	// accidental re-apply of the same trade an idempotent no-op.
+	// once per inserted trade (single-apply invariant, AAP 0.6.5). The service enforces that
+	// invariant DURABLY at the database level (it claims each trade_id in the processedtrades
+	// ledger inside its own transaction), so an accidental re-apply of the same trade is an
+	// idempotent no-op even across service instances, process restarts, or concurrent callers -
+	// not merely within one in-memory instance.
 	private readonly PositionRecalculationService _positionRecalc = new();
 
 	/// <summary>

@@ -201,6 +201,31 @@ CREATE TABLE Positions
 );
 
 -- ============================================================================
+-- ProcessedTrades
+--
+-- Durable, cross-process single-apply ledger for the C# PositionRecalculationService
+-- (AAP 0.6.5). The position-recalc trigger was removed, so that service is the sole
+-- applier of a trade's effect on a Position; it claims a trade_id here (INSERT ...
+-- ON CONFLICT (trade_id) DO NOTHING) inside the SAME transaction as the position
+-- write, so re-applying the same trade - from a second service instance, a process
+-- restart, or a concurrent call - is an idempotent no-op at the DATABASE level rather
+-- than relying on process-local memory. The PRIMARY KEY on trade_id is what enforces
+-- that uniqueness. This is still PURE STORAGE (a uniqueness/audit ledger): it holds no
+-- business logic. There is deliberately NO FK to Trades - the guard is keyed purely on
+-- the trade_id value, so the applier stays decoupled from the Trades row lifecycle (and
+-- so parity tests can drive it with synthetic trade ids that have no Trades row).
+-- ============================================================================
+CREATE TABLE ProcessedTrades
+(
+    trade_id       BIGINT        NOT NULL,   -- the applied trade's id (single-apply key)
+    -- UTC instant the trade's position effect was applied; same now() at time zone 'utc'
+    -- UTC time source and naive-TIMESTAMP convention as every other timestamp here.
+    applied_date   TIMESTAMP     NOT NULL DEFAULT (now() at time zone 'utc'),
+
+    CONSTRAINT PK_ProcessedTrades PRIMARY KEY (trade_id)
+);
+
+-- ============================================================================
 -- OrderStatusHistory
 --
 -- Populated by trg_Orders_StatusAudit (see 003_Triggers.sql). This is the
