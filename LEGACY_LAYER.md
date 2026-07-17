@@ -7,8 +7,9 @@ deploy, and it was added to piecemeal for years.
 
 This document exists because the last three "why did this order get
 rejected" tickets all turned out to be a disagreement between the C# risk
-engine and a *second*, parallel risk engine that lived in T-SQL, and nobody
-could point at a single place that explained both. That split is now gone.
+engine and a *second*, parallel risk engine that lived in T-SQL - two separate
+definitions of the same limits that were free to drift apart, and did. That
+split is now gone.
 The risk decisioning that used to live in stored procedures has been
 consolidated into unit-tested C# services, every limit is defined exactly
 once, and SQL Server is back to being pure data storage. This is still the
@@ -64,9 +65,11 @@ limit is written down once and consumed in two places:
 Anyone asking "does this order get risk-checked" still needs to know which
 path it's going through. Going through `SqlLegacyOrderGateway.SubmitOrderAsync`
 gets you the pre-trade gate. Going through a `Connector`/`RiskMessageAdapter`
-pipeline gets you the circuit breaker. **Nothing runs both** - but whichever
-one runs, it is reading the *same* canonical limits, so they can no longer
-disagree about a threshold.
+pipeline gets you the circuit breaker. A given order flows through one of those
+paths, not both - but whichever one runs, it is reading the *same* canonical
+`RiskLimitSet`, so the two patterns can no longer disagree about a threshold.
+The single place that used to be missing now exists: the limits live once on
+`RiskLimitSet`, and this document is the map of how each is enforced.
 
 ### Rule-by-rule coverage
 
@@ -92,7 +95,11 @@ The frequency check is the one worth calling out specifically. It used to be
 the clearest disagreement: `RiskOrderFreqRule` bucketed time into fixed,
 non-overlapping windows (a burst that straddles a bucket boundary could dodge
 the limit), while the SQL version ran a true rolling `COUNT(*)` over "now
-minus N seconds", which is strictly stricter near a boundary. The
+minus N seconds", which is strictly stricter near a boundary. Concretely, with
+`Count = 5` and a 60-second window, four orders at t=59s followed by four at
+t=61s never tripped the old fixed window (each non-overlapping window only ever
+saw four) but does trip the rolling count (at t=61s it counts the four from
+t=59 still inside the trailing 60 seconds, plus the current one = five). The
 consolidation resolved this by adopting the **rolling count in C#** - the
 never-less-strict choice. `RiskOrderFreqRule` now counts the prior orders
 still inside the trailing `Interval` window and rejects once that count plus
@@ -100,8 +107,10 @@ the current order reaches `Count`, exactly like the gate. To stay
 "never less strict than a correct rolling count" under out-of-order events,
 the rule tracks a high watermark and treats a strictly-earlier (late) event as
 a breach rather than silently under-counting it. This is the single
-intentional behaviour change in the whole refactor, and it makes the two
-patterns agree on frequency instead of disagreeing.
+intentional behaviour change in the whole refactor, captured by characterization
+tests (the old fixed-window behaviour) and parity tests (the new behaviour is
+at-least-as-strict, never looser), and it makes the two patterns agree on
+frequency instead of disagreeing.
 
 ## The position update is now single-apply (hazard removed)
 
