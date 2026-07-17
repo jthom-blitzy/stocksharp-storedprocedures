@@ -1,0 +1,25 @@
+================================================================
+ QA EVIDENCE 04 - SQL layer holds NO business logic
+================================================================
+Branch : blitzy-e686e219-30ce-45cc-8608-8ea778391629
+Commit : 78ec6ebefb583a72c36476b12255ddc68b511d64
+Captured: 2026-07-17 13:38:43 UTC
+DB     : StockSharpLegacy @ 127.0.0.1:14330
+
+--- 1. Stored procedures remaining (expect 0: all risk/P&L procs removed) ---
+0
+
+--- 2. User triggers remaining (expect 1: only the audit cascade) ---
+trg_Orders_StatusAudit (AFTER UPDATE) on Orders
+
+--- 3. Business-logic keyword scan of the retained trigger body (expect all 0) ---
+max_order_price refs   = 0
+reject/RAISERROR refs  = 0
+realized_pnl refs      = 0
+avg_price math refs    = 0
+
+--- 4. Confirmation ---
+  * 0 stored procedures  -> usp_ValidatePreTradeRisk / usp_RecalculatePositionOnTrade /
+    usp_SubmitOrder all removed; their logic now lives in C# services.
+  * 1 trigger (trg_Orders_StatusAudit, AFTER UPDATE) -> pure best-effort audit cascade;
+    0 risk thresholds, 0 accept/reject decisions, 0 P&L math (keyword scan above).

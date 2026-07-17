@@ -1,0 +1,32 @@
+================================================================
+ QA EVIDENCE 06 - Docker SQL Server healthy (loopback-bound)
+================================================================
+Branch : blitzy-e686e219-30ce-45cc-8608-8ea778391629
+Commit : 78ec6ebefb583a72c36476b12255ddc68b511d64
+Captured: 2026-07-17 13:36:53 UTC
+
+----- docker ps (stocksharp-legacy-sql) -----
+NAMES                   IMAGE                                        STATUS              PORTS
+stocksharp-legacy-sql   mcr.microsoft.com/mssql/server:2022-latest   Up About a minute   127.0.0.1:14330->1433/tcp
+
+----- docker port (MA-13: bound to loopback 127.0.0.1, NOT 0.0.0.0) -----
+1433/tcp -> 127.0.0.1:14330
+
+----- SQL Server recovery-complete marker (docker logs) -----
+
+2026-07-17 13:35:40.34 spid68s     SQL Server is now ready for client connections. This is an informational message; no user action is required.
+
+2026-07-17 13:35:41.25 spid51s     Recovery is complete. This is an informational message only. No user action is required.
+
+----- Database provisioned (clean seed markers) -----
+orders=0
+trades=0
+positions=0
+riskLimits=1
+portfolios=1
+securities=2
+
+----------------------------------------------------------------
+RESULT: container Up, 'Recovery is complete', and the port is published on the
+LOOPBACK interface (127.0.0.1:14330->1433/tcp), NOT 0.0.0.0 (review finding
+MA-13 / CWE-668). Database StockSharpLegacy provisioned with the clean seed.

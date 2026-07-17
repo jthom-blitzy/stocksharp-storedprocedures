@@ -4,6 +4,8 @@ TRANSCRIPT — Recording 01: End-to-end Docker + scripts + demo
 
 Substitution for: 01_end_to_end_docker_scripts_demo.mp4 (screen-only, target < 5:00)
 Reason: no video-capture environment available — see AAP §0.6.7.
+Branch: blitzy-e686e219-30ce-45cc-8608-8ea778391629
+Commit: 78ec6ebefb583a72c36476b12255ddc68b511d64
 Companion frames: 01_end_to_end_docker_scripts_demo_01.png … 01_end_to_end_docker_scripts_demo_03.png
 
 This is a screen-only "recording". A headless CI Linux container has no desktop, window
@@ -16,10 +18,13 @@ to [~04:40]. The frame cross-references (→ frame _01 / _02 / _03) tie each cap
 that depicts it.
 
 WHAT THIS RECORDING PROVES
-The SQL→C# risk-consolidation refactor is complete and behavior-preserving, demonstrated
-end-to-end against a LIVE SQL Server: (1) the SQL Server 2022 container comes up healthy;
+The SQL→C# risk-consolidation refactor is demonstrated end-to-end against a LIVE SQL Server. It
+preserves the three observable outcomes; behavior is preserved except for two intentional,
+documented changes (the order-frequency rule adopts the stricter rolling count, AAP §0.6.1, and a
+non-positive ceiling now means "not enforced" under the NULL/0 convention, AAP §0.3.1 / MA-16):
+(1) the SQL Server 2022 container comes up healthy;
 (2) the four scripts apply in run order 001 → 002 → 003 → 004, after which SQL Server is pure
-data storage — zero stored procedures and a single append-only audit trigger, with no risk
+data storage — zero stored procedures and a single best-effort audit trigger, with no risk
 thresholds, no accept/reject decisions, and no P&L math left in SQL; (3) the console demo
 reproduces the THREE observable outcomes — an order ACCEPTED within limits, an order REJECTED
 by the seeded max_order_price ceiling, and a recorded trade that RECOMPUTES the position. After
@@ -31,38 +36,48 @@ which are gone.
 --------------------------------------------------------------------------------
 ENVIRONMENT  (commands verbatim from Database/README.md)
 --------------------------------------------------------------------------------
-Stand up the SQL Server 2022 container (host port 14330 → container 1433):
+Stand up the SQL Server 2022 container on the LOOPBACK interface only (host port 127.0.0.1:14330 →
+container 1433), with a per-run secret (review finding MA-13, CWE-668):
+
+    # Per-run secret - not committed, not shown in evidence.
+    export MSSQL_SA_PASSWORD="$(openssl rand -base64 24)Aa1!"
 
     docker run -d --name stocksharp-legacy-sql \
-      -e "ACCEPT_EULA=Y" -e "MSSQL_SA_PASSWORD=DevTest_Passw0rd!" \
-      -p 14330:1433 \
+      -e "ACCEPT_EULA=Y" -e "MSSQL_SA_PASSWORD=$MSSQL_SA_PASSWORD" \
+      -p 127.0.0.1:14330:1433 \
       mcr.microsoft.com/mssql/server:2022-latest
+
+The 127.0.0.1: prefix publishes the port on loopback only; verify with
+`docker port stocksharp-legacy-sql` (must print 127.0.0.1:14330, not 0.0.0.0:14330).
 
 Wait for initialization to finish (health check):
 
     docker logs stocksharp-legacy-sql | grep "Recovery is complete"
 
-Apply the DDL/CRUD scripts in run order 001 → 002 → 003 → 004:
+Apply the DDL/CRUD scripts in run order 001 → 002 → 003 → 004 (secret passed via SQLCMDPASSWORD so
+it never lands on the command line / process list):
 
     docker cp Database stocksharp-legacy-sql:/tmp/Database
     for f in 001_Schema.sql 002_StoredProcedures.sql 003_Triggers.sql 004_SeedData.sql; do
-      docker exec stocksharp-legacy-sql /opt/mssql-tools18/bin/sqlcmd \
-        -S localhost -U sa -P 'DevTest_Passw0rd!' -C -i "/tmp/Database/$f"
+      docker exec -e "SQLCMDPASSWORD=$MSSQL_SA_PASSWORD" stocksharp-legacy-sql \
+        /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -C -i "/tmp/Database/$f"
     done
 
 Connection string the C# side resolves (fallback; override via the
 STOCKSHARP_LEGACY_SQL_CONNECTION environment variable):
 
-    Server=localhost,14330;Database=StockSharpLegacy;User Id=sa;Password=DevTest_Passw0rd!;TrustServerCertificate=True;
+    Server=localhost,14330;Database=StockSharpLegacy;User Id=sa;Password=<sa-password>;TrustServerCertificate=True;
 
 Run the console demo:
 
     dotnet run --project Samples/08_Misc/03_LegacySqlDemo
 
-Credential note: DevTest_Passw0rd! is a throwaway, non-production, local-demo credential for an
-ephemeral container (exactly as documented in Database/README.md and QA/README.md). It is not a
-real secret and must never be reused outside a disposable local instance; for any non-disposable
-target supply the connection string through STOCKSHARP_LEGACY_SQL_CONNECTION instead.
+Credential/exposure note (MA-13): the SA password is a per-run secret generated above, never a
+committed literal, and is not pasted into logs, screenshots, or this transcript. The container is
+bound to 127.0.0.1 so the SA endpoint is not reachable from other hosts. For the application/demo,
+prefer a least-privilege login scoped to the StockSharpLegacy tables (see Database/README.md)
+rather than SA, and for any non-disposable target supply the connection string through
+STOCKSHARP_LEGACY_SQL_CONNECTION (backed by a secret manager) instead.
 
 Seeded DEMO limits (Database/004_SeedData.sql) — the portfolio-wide RiskLimits row used throughout:
 
@@ -107,11 +122,13 @@ TIMELINE / CAPTION TRACK  (screen-only, < 5:00)
          decisions, NO P&L math: 002 merely DROPs the relocated procedures (the
          usp_ValidatePreTradeRisk / usp_RecalculatePositionOnTrade logic now lives in the C#
          services, and usp_SubmitOrder was removed entirely), and 003 DROPs the old
-         trg_Trades_PositionRecalc and (re)creates only the append-only audit trigger
+         trg_Trades_PositionRecalc and (re)creates only the best-effort audit trigger
          trg_Orders_StatusAudit. Catalog introspection confirms the consolidated state:
 
              stored_procedures = 0
-             user_triggers     = 1   (trg_Orders_StatusAudit — pure append-only audit cascade)
+             user_triggers     = 1   (trg_Orders_StatusAudit — best-effort audit cascade, a
+                                       trigger-derived transition log, not a tamper-proof
+                                       append-only guarantee)
 
          with the seed intact (1 DEMO portfolio, 2 securities, 1 RiskLimits row).
 
@@ -170,7 +187,9 @@ TIMELINE / CAPTION TRACK  (screen-only, < 5:00)
          reject-by-price, and trade-triggers-position-recompute. The pre-trade decision ran in C#
          (PreTradeRiskService) and the position recompute ran exactly once in C#
          (PositionRecalculationService); SQL Server held only pure DDL + CRUD (0 stored procedures,
-         1 append-only audit trigger). The refactor is complete and behavior-preserving.
+         1 best-effort audit trigger). The three observable outcomes are preserved; the only
+         behavioral changes are the two documented, intentional ones (rolling-count frequency,
+         AAP §0.6.1; non-positive ceiling = not enforced, AAP §0.3.1 / MA-16).
 
 --------------------------------------------------------------------------------
 FOOTER
@@ -181,9 +200,9 @@ AAP §0.6.7 documented substitution for the screen-only recording
 01_end_to_end_docker_scripts_demo.mp4 (no video-capture environment exists in this headless
 container). The substitution is indexed in QA/README.md alongside the other QA evidence artifacts.
 
-The database-assigned identifiers — <N> = portfolio_id, <M> = security_id, and the order <id>s —
-vary from run to run; the canonical fresh run captured here shows portfolio_id <N> = 1,
-security_id <M> = 1, and order_id <id> = 1 (accepted) then 2 (rejected). What never varies is the
-behavior: the three outcomes are reproduced on every run, with the risk decision made by
-PreTradeRiskService and the position recompute performed exactly once by
-PositionRecalculationService, and with SQL Server reduced to pure DDL + CRUD.
+The database-assigned identifiers (portfolio_id, security_id, and the order_id values) are
+IDENTITY-assigned and increment from run to run; the fresh run captured here shows
+portfolio_id = 1, security_id = 1 (AAPL), and order_id = 1 (accepted) then order_id = 2
+(rejected). What never varies is the behavior: the three outcomes are reproduced on every run,
+with the risk decision made by PreTradeRiskService and the position recompute performed exactly
+once by PositionRecalculationService, and with SQL Server reduced to pure DDL + CRUD.

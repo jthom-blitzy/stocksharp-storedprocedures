@@ -4,6 +4,8 @@ TRANSCRIPT — Recording 03: Coverage-table-to-code walkthrough
 
 Substitution for: 03_coverage_table_to_code_walkthrough.mp4 (screen-only, target < 5:00)
 Reason: no video-capture environment — AAP §0.6.7.
+Branch: blitzy-e686e219-30ce-45cc-8608-8ea778391629
+Commit: 78ec6ebefb583a72c36476b12255ddc68b511d64
 Companion frames: 03_coverage_table_to_code_walkthrough_01.png … 03_coverage_table_to_code_walkthrough_03.png
 
 This is a screen-only "recording". A headless CI Linux container has no desktop, window
@@ -88,7 +90,10 @@ TIMELINE / CAPTION TRACK  (screen-only, < 5:00)
              public int?     MaxOrderFreqCount { get; init; }
              public int?     MaxOrderFreqWindowSeconds { get; init; }
              public decimal? MaxCommissionTotal { get; init; }
-             public decimal  CommissionRate { get; init; } = 0.0005m;
+             public decimal  CommissionRate { get; init; }   // no C# literal default; the DB
+                                                             // (dbo.RiskLimits.commission_rate,
+                                                             // DEFAULT 0.0005) is the single
+                                                             // source, hydrated by the gate (MA-15)
 
          Two behaviours mirror the RiskLimits table exactly. First, "not enforced" is NULL or a
          non-positive ceiling: IsCeilingEnforced(ceiling) returns true only when ceiling > 0, and
@@ -128,8 +133,10 @@ TIMELINE / CAPTION TRACK  (screen-only, < 5:00)
            current order reaches MaxOrderFreqCount. The rule keeps its Count / Interval config and,
            to stay "never less strict than a correct rolling count" under out-of-order events,
            tracks a high watermark and treats a strictly-earlier (late) event as a breach. This is
-           the SINGLE intentional behavioural change of the whole refactor (AAP §0.6.1): it is
-           AT-LEAST-AS-STRICT as, and never looser than, the old fixed-window bucketing.
+           the first of the two intentional behavioural changes of the refactor, and the only
+           at-least-as-strict TIGHTENING (AAP §0.6.1; the second change is the non-positive-ceiling
+           = "not enforced" convention, AAP §0.3.1 / MA-16): it is AT-LEAST-AS-STRICT as, and never
+           looser than, the old fixed-window bucketing.
 
 [~02:40]  Coverage rows 5–7 + the circuit-breaker-only rules.                → frame _02
          • Row 5 — Resulting position size. One shared threshold, RiskLimitSet.MaxPositionSize,
@@ -140,11 +147,13 @@ TIMELINE / CAPTION TRACK  (screen-only, < 5:00)
            "Resulting position … meets/exceeds limit …", because it runs pre-trade. Not force-merged.
          • Row 6 — Cumulative commission. One shared threshold, RiskLimitSet.MaxCommissionTotal
            (+ CommissionRate), two contexts — PRESERVED DIFFERENT-BY-DESIGN (AAP §0.6.2). The
-           circuit-breaker rules Algo/Risk/RiskCommissionRule, RiskOrderCommissionRule and
-           RiskTransactionCommissionRule track the ACTUAL commission reported on ExecutionMessage
-           post-fill; the gate's check 6 ESTIMATES commission pre-fill from historical traded
-           notional × rate and rejects with "Estimated cumulative commission … meets/exceeds
-           limit …". Same threshold, different basis — they do not agree by construction, and that
+           circuit-breaker rules track the ACTUAL commission post-fill, but from different message
+           sources: Algo/Risk/RiskCommissionRule reads a PositionChangeMessage (the
+           PositionChangeTypes.Commission value), while RiskOrderCommissionRule and
+           RiskTransactionCommissionRule read ExecutionMessage.Commission; the gate's check 6
+           ESTIMATES commission pre-fill from historical traded notional × rate and rejects with
+           "Estimated cumulative commission … meets/exceeds limit …". Same threshold, different
+           basis (and different message source) — they do not agree by construction, and that
            is intentional, not a regression.
          • Row 7 — Daily traded volume. Circuit breaker is the NEW Algo/Risk/RiskDailyVolumeRule
            (an in-stream running total partitioned by portfolio+security, rolled over on the UTC
@@ -181,8 +190,10 @@ TIMELINE / CAPTION TRACK  (screen-only, < 5:00)
          RiskPositionTimeRule / RiskPnLRule / RiskSlippageRule, the canonical RiskLimitSet, and the
          two services PreTradeRiskService and PositionRecalculationService. Each threshold is
          defined once and enforced in both patterns (or preserved as a documented distinct pair);
-         SQL Server holds no risk or P&L business logic. The consolidation is complete and
-         behaviour-preserving.
+         SQL Server holds no risk or P&L business logic. The three observable outcomes are
+         preserved; the only behavioural changes are the two intentional, documented ones — the
+         rolling-count frequency tightening (AAP §0.6.1) and the non-positive-ceiling = "not
+         enforced" convention (AAP §0.3.1 / MA-16).
 
 --------------------------------------------------------------------------------
 FOOTER

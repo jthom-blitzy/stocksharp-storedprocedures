@@ -1,0 +1,55 @@
+================================================================
+ QA EVIDENCE 02 - Legacy SQL demo: three observable outcomes
+================================================================
+Branch : blitzy-e686e219-30ce-45cc-8608-8ea778391629
+Commit : 78ec6ebefb583a72c36476b12255ddc68b511d64
+Captured: 2026-07-17 13:37:33 UTC
+Project: Samples/08_Misc/03_LegacySqlDemo (net10.0, Release)
+SQL    : 127.0.0.1:14330 (loopback), db StockSharpLegacy
+
+The demo is run TWICE from the same clean seed to prove MA-14 repeatability:
+the position after the recorded fill is qty=100 on BOTH runs (not 200),
+confirming the idempotent self-reset at demo start.
+
+================================================================
+ RUN 1
+================================================================
+Portfolio 'DEMO' = portfolio_id 1
+Security 'AAPL@NASDAQ' = security_id 1
+Resetting DEMO portfolio transactional state (orders/trades/positions/history) for a repeatable run...
+Submitting BUY 100 @ 150.00 (within limits)...
+  -> order_id=3 is_valid=True reject_reason=(none)
+Submitting BUY 10 @ 999.00 (price exceeds the seeded max_order_price limit)...
+  -> order_id=4 is_valid=False reject_reason=Order price 999.0000 meets/exceeds limit 500.0000
+     Note: this rejection comes from the C# PreTradeRiskService (the per-order pre-trade
+     gate), which reads the applicable RiskLimits row and enforces it in C#. The C#
+     RiskManager (Algo/Risk) is the portfolio-wide circuit breaker - a distinct
+     enforcement pattern that now shares the same canonical RiskLimitSet thresholds.
+Recording a trade: 100 @ 150.00 against order #1...
+  -> position after C# recompute: qty=100.0000 avg_price=150.0000 realized_pnl=0.0000
+
+================================================================
+ RUN 2 (repeatability proof - identical outcomes)
+================================================================
+Portfolio 'DEMO' = portfolio_id 1
+Security 'AAPL@NASDAQ' = security_id 1
+Resetting DEMO portfolio transactional state (orders/trades/positions/history) for a repeatable run...
+Submitting BUY 100 @ 150.00 (within limits)...
+  -> order_id=5 is_valid=True reject_reason=(none)
+Submitting BUY 10 @ 999.00 (price exceeds the seeded max_order_price limit)...
+  -> order_id=6 is_valid=False reject_reason=Order price 999.0000 meets/exceeds limit 500.0000
+     Note: this rejection comes from the C# PreTradeRiskService (the per-order pre-trade
+     gate), which reads the applicable RiskLimits row and enforces it in C#. The C#
+     RiskManager (Algo/Risk) is the portfolio-wide circuit breaker - a distinct
+     enforcement pattern that now shares the same canonical RiskLimitSet thresholds.
+Recording a trade: 100 @ 150.00 against order #1...
+  -> position after C# recompute: qty=100.0000 avg_price=150.0000 realized_pnl=0.0000
+
+----------------------------------------------------------------
+RESULT (both runs identical -> MA-14 repeatability):
+  1. BUY 100 @ 150.00  -> ACCEPTED  (is_valid=True)
+  2. BUY  10 @ 999.00  -> REJECTED  (price 999 >= seeded max_order_price 500),
+     reject reason produced by the C# PreTradeRiskService (per-order gate).
+  3. Trade 100 @ 150.00 -> position RECOMPUTED in C# to qty=100 avg_price=150
+     realized_pnl=0 on BOTH runs (not 200), because the demo self-resets the
+     DEMO portfolio's transactional rows at start (review finding MA-14).

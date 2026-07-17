@@ -1,0 +1,29 @@
+================================================================
+ 03 - Risk-consolidation suite 198/198 GREEN (+ honest full-suite disclosure)
+================================================================
+Branch  : blitzy-e686e219-30ce-45cc-8608-8ea778391629
+Commit  : 78ec6ebefb583a72c36476b12255ddc68b511d64
+Captured: 2026-07-17
+Command : dotnet test Tests/Tests.csproj -c Release --framework net10.0 --filter "...~PreTradeRiskServiceTests|~PositionRecalculationTests|~CommissionTests|~RiskTests|~LegacyOracleParityTests"
+----------------------------------------------------------------
+######## FOCUSED SUITE (per-class counts) ########
+Passed!  - Failed:     0, Passed:   198, Skipped:     0, Total:   198, Duration: 5 s - StockSharp.Tests.dll (net10.0)
+######## per-class breakdown (count [TestMethod] per focused class) ########
+  PreTradeRiskServiceTests: 35 [TestMethod] (19 Live_)
+  PositionRecalculationTests: 42 [TestMethod] (29 Live_)
+  CommissionTests: 34 [TestMethod] (2 Live_)
+  RiskTests: 72 [TestMethod] (0 Live_)
+  LegacyOracleParityTests: 15 [TestMethod] (15 Live_)
+
+----------------------------------------------------------------
+RESULT: 198 passed, 0 failed, 0 skipped (Total 198) across the FIVE test
+classes this refactor owns, including 65 Live_* tests executed against the
+real SQL Server 2022 container (15 of them differential tests against the
+verbatim legacy stored procedures - the LegacyOracleParityTests oracle).
+
+HONEST FULL-SUITE DISCLOSURE: the entire Tests/Tests.csproj (the whole
+StockSharp platform - thousands of tests across many unrelated subsystems,
+many needing external market-data/network/infra) is NOT green-by-design in a
+headless container and is long-running; it is classified separately (see the
+"Note on the full test suite" section of QA/README.md). This frame is scoped
+to the risk-consolidation work delivered.
