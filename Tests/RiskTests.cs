@@ -2007,6 +2007,51 @@ public class RiskTests : BaseTestClass
 	}
 
 	[TestMethod]
+	public void RecalculateShortExactCloseFlat()
+	{
+		// Short -100 @ 150, buy 100 @ 130: fully cover the short; realize
+		// 100*(130-150)*sign(-100) = 100*(-20)*(-1) = 2000; quantity and average
+		// price return to zero. Sign-mirror of RecalculateExactCloseFlat on the
+		// short side - the exact-close branch is asserted for both position signs
+		// (AAP 0.6.5 exact-close).
+		var result = PositionRecalculationService.Recalculate(-100m, 150m, 0m, Sides.Buy, 100m, 130m);
+		result.Quantity.AssertEqual(0m);
+		result.AveragePrice.AssertEqual(0m);
+		result.RealizedPnl.AssertEqual(2000m);
+	}
+
+	[TestMethod]
+	public void RecalculateShortCloseAndFlip()
+	{
+		// Short -100 @ 150, buy 150 @ 130: cover the 100 (realize 2000) and open a
+		// new long of 50 at the trade price. Sign-mirror of RecalculateCloseAndFlip
+		// on the short side - the close-and-flip branch is asserted for both
+		// position signs (AAP 0.6.5 full-close-and-flip).
+		var result = PositionRecalculationService.Recalculate(-100m, 150m, 0m, Sides.Buy, 150m, 130m);
+		result.Quantity.AssertEqual(50m);
+		result.AveragePrice.AssertEqual(130m);
+		result.RealizedPnl.AssertEqual(2000m);
+	}
+
+	[TestMethod]
+	public void RecalculateShortOpenAndAdd()
+	{
+		// Open a fresh short, then add to it and weighted-average the price in.
+		// Sign-mirror of RecalculateOpenAndAdd on the short side - the same-sign/
+		// flat accumulation branch is asserted for both position signs (AAP 0.6.5).
+		var opened = PositionRecalculationService.Recalculate(0m, 0m, 0m, Sides.Sell, 100m, 150m);
+		opened.Quantity.AssertEqual(-100m);
+		opened.AveragePrice.AssertEqual(150m);
+		opened.RealizedPnl.AssertEqual(0m);
+
+		// (100*150 + 50*180) / 150 = 24000 / 150 = 160
+		var added = PositionRecalculationService.Recalculate(-100m, 150m, 0m, Sides.Sell, 50m, 180m);
+		added.Quantity.AssertEqual(-150m);
+		added.AveragePrice.AssertEqual(160m);
+		added.RealizedPnl.AssertEqual(0m);
+	}
+
+	[TestMethod]
 	public void RecalculateInvalidInputThrows()
 	{
 		// Non-positive trade quantity / price violate the Trades CHECK constraints
