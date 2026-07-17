@@ -4,19 +4,20 @@ namespace StockSharp.Algo.Risk;
 /// The risks control manager.
 /// </summary>
 /// <remarks>
-/// Since the StockSharpLegacy SQL layer was added (see /Database,
-/// Algo/Storages/Sql, and LEGACY_LAYER.md at the repo root), this is no
-/// longer the only place pre-trade risk is enforced, and the two don't cover
-/// the same rules. This engine is a portfolio-wide circuit breaker: a
-/// triggered rule takes a global action (ClosePositions/StopTrading/
-/// CancelOrders via RiskMessageAdapter) rather than rejecting the one order
-/// that tripped it. dbo.usp_ValidatePreTradeRisk is the opposite model - a
-/// classic per-order gate that rejects a single order before it's accepted,
-/// and it also enforces two limits (order notional value, daily traded
-/// volume) that have no rule class here at all. Nothing in this codebase
-/// reconciles the two, which is the point - a caller going through
-/// SqlLegacyOrderGateway gets SQL-side coverage only; a caller going through
-/// this RiskManager gets C#-side coverage only.
+/// Business risk logic now has a single canonical C# home. The shared thresholds and
+/// the rolling-window order-frequency evaluator live in <see cref="CanonicalRiskRules"/>,
+/// and the per-order accept/reject gate lives in <see cref="PreTradeRiskService"/> (which
+/// re-expresses the retired usp_ValidatePreTradeRisk in C#). This class remains the
+/// portfolio-wide circuit breaker: a triggered rule takes a global action
+/// (ClosePositions/StopTrading/CancelOrders via <see cref="RiskMessageAdapter"/>) rather
+/// than rejecting the one order that tripped it, whereas <see cref="PreTradeRiskService"/>
+/// is the classic per-order gate that rejects a single order before it is accepted (and it
+/// also enforces the order-notional-value and daily-traded-volume limits that used to exist
+/// only on the SQL side). Where a rule exists on both sides - order frequency being the
+/// prime example - the circuit-breaker rule (<see cref="RiskOrderFreqRule"/>) and the gate
+/// now consume the SAME canonical definitions in <see cref="CanonicalRiskRules"/>, so the
+/// two can no longer silently diverge. See /LEGACY_LAYER.md at the repo root for the full
+/// merged-versus-preserved rule table.
 /// </remarks>
 public class RiskManager : BaseLogReceiver, IRiskManager
 {

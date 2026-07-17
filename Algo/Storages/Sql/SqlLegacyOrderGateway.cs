@@ -15,6 +15,8 @@ using StockSharp.Algo.Risk;
 /// business logic moved to canonical C# services under Algo/Risk/, so this gateway
 /// is now a PURE data-access layer that makes no accept/reject or P&amp;L decisions:
 /// <list type="bullet">
+///   <item>pre-trade accept/reject is delegated to <see cref="PreTradeRiskService"/>,
+///   and the gateway merely relays its { IsValid, RejectReason } decision;</item>
 ///   <item>rows are written with plain parameterised <c>INSERT ... RETURNING</c>
 ///   (no stored procedures, no T-SQL <c>OUTPUT</c> parameters);</item>
 ///   <item>position recomputation is delegated to
@@ -33,6 +35,12 @@ using StockSharp.Algo.Risk;
 public class SqlLegacyOrderGateway
 {
 	private readonly string _connectionString;
+
+	// Canonical per-order accept/reject gate (Algo/Risk). The gateway delegates the entire
+	// pre-trade accept/reject decision to this service and makes none of its own; it is
+	// constructed once and reused across calls (stateless apart from its injected UTC clock).
+	// The logic that used to live in dbo.usp_ValidatePreTradeRisk now lives here (AAP 0.1/0.6).
+	private readonly PreTradeRiskService _preTradeRisk = new();
 
 	// The gateway owns a single PositionRecalculationService and calls ApplyAsync exactly
 	// once per inserted trade (single-apply invariant, AAP 0.6.5). The service enforces that
@@ -69,6 +77,7 @@ public class SqlLegacyOrderGateway
 		await using var connection = CreateConnection();
 		await connection.OpenAsync(cancellationToken);
 
+		// dbo. qualifier dropped: objects live in the public schema (unqualified).
 		await using (var select = new NpgsqlCommand("SELECT portfolio_id FROM portfolios WHERE name = @name", connection))
 		{
 			select.Parameters.Add(new NpgsqlParameter("name", NpgsqlDbType.Varchar) { Value = portfolio.Name });
@@ -126,18 +135,21 @@ public class SqlLegacyOrderGateway
 	}
 
 	/// <summary>
-	/// Submits an order into the orders table and returns the persisted order id.
+	/// Submits an order into the orders table and returns the persisted order id together with the
+	/// canonical pre-trade accept/reject decision.
 	/// </summary>
 	/// <remarks>
 	/// Consolidation note (AAP 0.1/0.6): the retired <c>dbo.usp_SubmitOrder</c> ran
-	/// <c>usp_ValidatePreTradeRisk</c> before inserting the row. That pre-trade accept/reject
-	/// decision is being consolidated into the canonical C# <c>PreTradeRiskService</c> under
-	/// Algo/Risk/. Until that service is wired in here, this gateway performs pure data access
-	/// only: it inserts the order as <c>ACCEPTED</c> and makes no accept/reject decision, so the
-	/// returned <see cref="SqlOrderSubmitResult"/> always carries <see cref="SqlOrderSubmitResult.IsValid"/>
-	/// = <see langword="true"/> with a null reason. The public signature is preserved for the demo
-	/// and other callers; <paramref name="requestedBy"/> is retained on the signature but is not
-	/// persisted (the orders table has no such column - it was only consumed by the retired proc).
+	/// <c>usp_ValidatePreTradeRisk</c> before inserting the row. That pre-trade accept/reject decision
+	/// now lives in the canonical C# <see cref="PreTradeRiskService"/> under Algo/Risk/, so this gateway
+	/// makes NO decision of its own: it delegates to the service and is a pure relay of the returned
+	/// { <see cref="SqlOrderSubmitResult.IsValid"/>, <see cref="SqlOrderSubmitResult.RejectReason"/> }.
+	/// Both accepted and rejected orders are still persisted (parity with the retired proc), so a
+	/// rejected order continues to count toward the rolling order-frequency window. The public
+	/// signature is preserved for the demo and other callers; <paramref name="requestedBy"/> is
+	/// retained on the signature but is not persisted (the orders table has no such column - it was
+	/// only ever a presently-unused argument of the retired proc) and is not passed to the risk gate
+	/// (the service does not consume it).
 	/// </remarks>
 	public async Task<SqlOrderSubmitResult> SubmitOrderAsync(
 		int portfolioId, int securityId, Sides side, decimal volume, decimal? price, OrderTypes orderType,
@@ -146,33 +158,56 @@ public class SqlLegacyOrderGateway
 		await using var connection = CreateConnection();
 		await connection.OpenAsync(cancellationToken);
 
-		// Pure data-access insert (no stored proc). 'B'/'S' side sign and the LIMIT/MARKET
-		// order_type carry over unchanged; status is written as the accepted terminal-for-now
-		// value. T-SQL "OUTPUT INSERTED.order_id" -> Postgres "RETURNING order_id".
+		// 'B'/'S' side sign carries over unchanged from the SQL side.
+		var sideCode = side == Sides.Buy ? "B" : "S";
+
+		// Business decision delegated to the canonical PreTradeRiskService (Algo/Risk). The old
+		// dbo.usp_SubmitOrder StoredProcedure call (which ran usp_ValidatePreTradeRisk internally) is
+		// retired; the gateway is now a pure relay of the service's decision. The already-open
+		// connection + token are passed through so the DB-state-aware gate can read
+		// risklimits/positions/orders/trades for the position, frequency and daily-volume checks.
+		var validation = await _preTradeRisk.ValidateAsync(connection, portfolioId, securityId, sideCode, volume, price, cancellationToken);
+		var status = validation.IsValid ? "ACCEPTED" : "REJECTED";
+
+		// StoredProcedure call replaced by service delegation + parameterized INSERT (business logic
+		// moved to Algo/Risk; usp_SubmitOrder/usp_ValidatePreTradeRisk retired). The LIMIT/MARKET
+		// order_type carries over unchanged. T-SQL "OUTPUT INSERTED.order_id" -> Postgres
+		// "RETURNING order_id".
 		await using var command = new NpgsqlCommand(
 			"""
-			INSERT INTO orders (portfolio_id, security_id, side, qty, price, order_type, status, external_transaction_id)
-			VALUES (@portfolio_id, @security_id, @side, @qty, @price, @order_type, 'ACCEPTED', @external_transaction_id)
+			INSERT INTO orders
+				(portfolio_id, security_id, side, qty, price, order_type, status, reject_reason, external_transaction_id, submitted_date)
+			VALUES
+				(@portfolio_id, @security_id, @side, @qty, @price, @order_type, @status, @reject_reason, @external_transaction_id, now() at time zone 'utc')
 			RETURNING order_id
 			""", connection);
 
 		command.Parameters.Add(new NpgsqlParameter("portfolio_id", NpgsqlDbType.Integer) { Value = portfolioId });
 		command.Parameters.Add(new NpgsqlParameter("security_id", NpgsqlDbType.Integer) { Value = securityId });
-		command.Parameters.Add(new NpgsqlParameter("side", NpgsqlDbType.Varchar) { Value = side == Sides.Buy ? "B" : "S" });
+		command.Parameters.Add(new NpgsqlParameter("side", NpgsqlDbType.Varchar) { Value = sideCode });
 		// qty / price are NUMERIC(18,4): bind as decimal (never double/float) so the schema's
 		// scale is preserved and no downstream >= comparison can silently loosen (AAP 0.6.4).
 		command.Parameters.Add(new NpgsqlParameter("qty", NpgsqlDbType.Numeric) { Value = volume });
 		command.Parameters.Add(new NpgsqlParameter("price", NpgsqlDbType.Numeric) { Value = (object)price ?? DBNull.Value });
 		command.Parameters.Add(new NpgsqlParameter("order_type", NpgsqlDbType.Varchar) { Value = MapOrderType(orderType) });
+		// both ACCEPTED and REJECTED orders are persisted (parity with usp_SubmitOrder; rejected
+		// orders still count toward the frequency window).
+		command.Parameters.Add(new NpgsqlParameter("status", NpgsqlDbType.Varchar) { Value = status });
+		command.Parameters.Add(new NpgsqlParameter("reject_reason", NpgsqlDbType.Varchar) { Value = (object)validation.RejectReason ?? DBNull.Value });
 		command.Parameters.Add(new NpgsqlParameter("external_transaction_id", NpgsqlDbType.Bigint) { Value = (object)externalTransactionId ?? DBNull.Value });
+		// submitted_date is written by the SQL expression now() at time zone 'utc' (== SYSUTCDATETIME(),
+		// the UTC time source, AAP 0.6.4); last_updated is left to its column DEFAULT. requestedBy is
+		// intentionally neither persisted nor forwarded to the risk gate (see the remarks above).
 
 		var orderId = (long)await command.ExecuteScalarAsync(cancellationToken);
 
+		// Pure relay of the service decision: IsValid/RejectReason come straight from the gate;
+		// OrderId from RETURNING.
 		return new()
 		{
 			OrderId = orderId,
-			IsValid = true,
-			RejectReason = null,
+			IsValid = validation.IsValid,
+			RejectReason = validation.RejectReason,
 		};
 	}
 
@@ -188,22 +223,25 @@ public class SqlLegacyOrderGateway
 		await using var connection = CreateConnection();
 		await connection.OpenAsync(cancellationToken);
 
-		// Insert the fill, capturing the generated trade id.
-		// T-SQL "OUTPUT INSERTED.trade_id" -> Postgres "RETURNING trade_id".
+		// Insert the fill, capturing the generated trade id. executed_date via now() at time zone
+		// 'utc' (UTC time source, AAP 0.6.4). T-SQL "OUTPUT INSERTED.trade_id" -> Postgres
+		// "RETURNING trade_id" (was OUTPUT INSERTED / trigger-driven flow).
 		long tradeId;
 		await using (var insert = new NpgsqlCommand(
-			"INSERT INTO trades (order_id, qty, price) VALUES (@order_id, @qty, @price) RETURNING trade_id", connection))
+			"INSERT INTO trades (order_id, qty, price, executed_date) VALUES (@order_id, @qty, @price, now() at time zone 'utc') RETURNING trade_id", connection))
 		{
 			insert.Parameters.Add(new NpgsqlParameter("order_id", NpgsqlDbType.Bigint) { Value = orderId });
+			// qty / price are NUMERIC(18,4): bind as decimal (never double/float) - AAP 0.6.4.
 			insert.Parameters.Add(new NpgsqlParameter("qty", NpgsqlDbType.Numeric) { Value = qty });
 			insert.Parameters.Add(new NpgsqlParameter("price", NpgsqlDbType.Numeric) { Value = price });
 
 			tradeId = (long)await insert.ExecuteScalarAsync(cancellationToken);
 		}
 
-		// Single-apply the position recompute on the gateway's already-open connection. The
-		// service owns neither the connection nor a transaction (the gateway does), matching
-		// the transactional context the retired procedure ran in.
+		// Single-apply invariant (AAP 0.6.5): the trg_Trades_PositionRecalc trigger was removed, so the
+		// gateway is the sole applier and calls the recalculation service exactly once per inserted trade.
+		// The service owns neither the connection nor a transaction (the gateway does), matching the
+		// transactional context the retired procedure ran in.
 		await _positionRecalc.ApplyAsync(connection, orderId, tradeId, qty, price, cancellationToken);
 	}
 

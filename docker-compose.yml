@@ -1,0 +1,126 @@
+# =============================================================================
+# docker-compose.yml — one-command local stack for the StockSharp "Legacy SQL"
+# console demo (Samples/08_Misc/03_LegacySqlDemo) running against PostgreSQL 16.
+#
+# `docker-compose up` (equivalently `docker compose up --build`) brings up two
+# services:
+#   1. db  — PostgreSQL 16, initialized from the Database/*.sql scripts.
+#   2. app — the .NET 10 console demo (built from the repo-root Dockerfile),
+#            started only once the database is fully initialized and healthy.
+#
+# This is the LOCAL-CONTAINER stand-in for the target containerized-on-AWS model
+# (Agent Action Plan 0.7.2): there is NO real Aurora / ECS / EKS / Fargate / IAM
+# / networking here — just two local containers and a named volume.
+#
+# Minimal-change / scope discipline (AAP 0.7.2): exactly two services and one
+# named volume. There is intentionally NO obsolete top-level `version:` key (the
+# modern Compose Spec omits it; declaring it only emits a deprecation warning),
+# and NO explicit `networks:` block — Compose's implicit default network already
+# lets `app` reach `db` by its service name over DNS. No pgadmin, no secrets
+# manager, nothing AWS-specific.
+#
+# Canonical dev-only credentials — shared verbatim with
+# Algo/Storages/Sql/SqlLegacyConnection.cs and the demo narrative:
+#   user=postgres  password=postgres  database=stocksharp  host(service)=db
+# These are LOCAL DEVELOPMENT credentials only; they are deliberately not secret.
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # db — PostgreSQL 16 (Amazon Aurora-PostgreSQL-parity major version). The tag
+  # is pinned to `16`, never `latest`, for reproducible local runs.
+  # ---------------------------------------------------------------------------
+  db:
+    image: postgres:16
+
+    # POSTGRES_DB makes the entrypoint CREATE the `stocksharp` database on first
+    # init — this replaces the old T-SQL `CREATE DATABASE` guard, so the SQL
+    # init scripts neither create nor switch databases. POSTGRES_USER / _PASSWORD
+    # set the superuser the app (and the healthcheck) authenticate with. The
+    # list form (- KEY=value) is used throughout so YAML never coerces a value.
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=stocksharp
+
+    volumes:
+      # Mount the SQL init scripts read-only into the well-known init directory.
+      # The official postgres image auto-executes *.sql / *.sh files placed here
+      # in ALPHABETICAL order, on FIRST initialization only (empty data dir).
+      # With 002_StoredProcedures.sql retired, the effective order is:
+      #     001_Schema.sql -> 003_Triggers.sql -> 004_SeedData.sql
+      # The 002 numbering gap is harmless, and the non-*.sql Database/README.md
+      # is ignored by the init runner. `:ro` keeps the host scripts read-only.
+      - ./Database:/docker-entrypoint-initdb.d:ro
+      # Persist the cluster data in a named volume so restarts keep state (and so
+      # the one-time init scripts do NOT re-run on every `up`). Remove it with
+      # `docker compose down -v` to force a clean re-initialization.
+      - pgdata:/var/lib/postgresql/data
+
+    # Expose the standard PostgreSQL port on the host for convenience (psql / GUI
+    # clients), mirroring the port the previous README documented.
+    ports:
+      - "5432:5432"
+
+    # Healthcheck — CRITICAL: it gates the `app` service (below) through
+    # depends_on: condition: service_healthy, and MUST only report healthy once
+    # the database is FULLY initialized and accepting TCP connections.
+    #
+    # Why `-h localhost` (a TCP probe) and not a bare socket check: the postgres
+    # entrypoint first starts a TEMPORARY server that listens on the UNIX SOCKET
+    # ONLY (listen_addresses='') while it runs the init scripts, then restarts
+    # the REAL server with TCP enabled. A socket-based `pg_isready` (no -h) can
+    # report "ready" DURING init, so the app could start before the tables exist.
+    # The demo's Program.cs performs its DB setup inside a try/catch and EXITS on
+    # failure (it does not retry), so an early start makes the demo fail. A TCP
+    # probe fails during the temp-server phase and only succeeds once the real
+    # TCP listener is up — i.e. after every init script has completed — correctly
+    # gating startup. Do NOT drop the `-h localhost`.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h localhost -U postgres -d stocksharp"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # app — the .NET 10 "Legacy SQL" console demo, built from the repo-root
+  # Dockerfile and run once against the `db` service.
+  # ---------------------------------------------------------------------------
+  app:
+    # Build from THIS repository. The build context MUST be the repository root
+    # (context: .) so the Dockerfile's `dotnet publish` can resolve the demo's
+    # transitive project/props references (Algo, BusinessEntities, Messages, the
+    # shared common_*.props chain, etc.). The companion .dockerignore trims
+    # non-build artifacts from that context.
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    # Start only after the database is fully initialized and healthy. Paired with
+    # the TCP healthcheck above, this guarantees the schema, triggers, and seed
+    # data all exist before the (non-retrying) demo connects.
+    depends_on:
+      db:
+        condition: service_healthy
+
+    # Point the demo at the `db` service over the default Compose network. The
+    # variable name STOCKSHARP_LEGACY_SQL_CONNECTION is RETAINED across the SQL
+    # Server -> PostgreSQL migration (AAP 0.7.2 minimal-change decision) and is
+    # exactly the variable SqlLegacyConnection.Resolve() reads. `Host=db` resolves
+    # to this service via Compose DNS; the credentials match the db service above.
+    # Quoted because the value contains '=' and ';'.
+    environment:
+      - "STOCKSHARP_LEGACY_SQL_CONNECTION=Host=db;Port=5432;Database=stocksharp;Username=postgres;Password=postgres"
+
+    # No `restart:` policy (defaults to `no`): the demo is a one-shot walkthrough
+    # that prints its three scenarios and exits. Auto-restarting would loop it
+    # pointlessly once it completes.
+
+# -----------------------------------------------------------------------------
+# Named volume backing the PostgreSQL data directory (see the db service). A
+# named volume (rather than an anonymous one) keeps the data across `up`/`down`
+# cycles until it is explicitly removed with `docker compose down -v`.
+# -----------------------------------------------------------------------------
+volumes:
+  pgdata:
