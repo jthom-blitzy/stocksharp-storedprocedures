@@ -56,7 +56,7 @@ Set the environment variable to point at a different instance rather than editin
 dotnet run --project Samples/08_Misc/03_LegacySqlDemo
 ```
 
-Walks through: ensure portfolio/security rows exist, submit a compliant order (accepted), submit one that breaches the seeded `max_order_price` limit (rejected, with reason), record a fill against the accepted order, and print the position. The three observable outcomes are unchanged; the pre-trade decision now comes from `PreTradeRiskService` and the position is recomputed by `PositionRecalculationService` (invoked exactly once per recorded trade inside the gateway's transaction), not from a stored procedure or trigger.
+Walks through: ensure portfolio/security rows exist, submit a compliant order (accepted), submit one that breaches the seeded `max_order_price` limit (rejected, with reason), record a fill against the accepted order, and print the position. The three observable outcomes are unchanged; the pre-trade decision now comes from `PreTradeRiskService` and the position is recomputed by `PositionRecalculationService`, invoked exactly once per recorded trade from `SqlLegacyOrderGateway.RecordTradeAsync` inside the trade's transaction, not from a stored procedure or trigger.
 
 ## What's in each file
 
