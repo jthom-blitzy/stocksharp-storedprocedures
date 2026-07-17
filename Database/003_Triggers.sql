@@ -2,7 +2,7 @@
 	StockSharpLegacy - triggers (consolidated state)
 	----------------------------------------
 	trg_Trades_PositionRecalc has been REMOVED. The per-trade position/P&L
-	recalculation it used to drive (via usp_RecalculatePositionOnTrade) now lives in
+	recalculation it used to drive now lives in
 	Algo/Risk/PositionRecalculationService.cs, invoked exactly once per recorded trade
 	by Algo/Storages/Sql/SqlLegacyOrderGateway.RecordTradeAsync inside the same
 	transaction as the dbo.Trades INSERT. Removing the trigger also eliminates the
@@ -29,8 +29,14 @@ SET ANSI_NULLS ON;
 SET QUOTED_IDENTIFIER ON;
 GO
 
--- Position/P&L recalculation relocated to PositionRecalculationService (C#), invoked once per
--- recorded trade by the gateway; drop the trigger driver and its double-count hazard.
+-- ============================================================================
+-- Position/P&L recalculation relocated to Algo/Risk/PositionRecalculationService.cs (C#),
+-- invoked exactly once per recorded trade from SqlLegacyOrderGateway.RecordTradeAsync.
+-- Dropping the old trigger driver leaves the C# service as the single entry point and
+-- eliminates the trigger-vs-standalone double-count hazard (AAP 0.6.4). DROP TRIGGER IF
+-- EXISTS is portable, vendor-neutral cleanup and is a no-op when the trigger is absent,
+-- so this script stays safe to re-run.
+-- ============================================================================
 DROP TRIGGER IF EXISTS dbo.trg_Trades_PositionRecalc;
 GO
 
@@ -42,6 +48,14 @@ GO
 -- that touches other columns (a price amendment, etc.) without changing status does
 -- not create a history row. This is a pure append-only audit cascade: no thresholds,
 -- no accept/reject decision, no P&L math.
+--
+-- DECISION (Option A - KEEP; mandatory inline record, AAP 0.6.5 / 0.7.2): this trigger is
+-- RETAINED at the database layer rather than relocated to C#. Rationale: the only
+-- conditional here is the narrow "IF NOT UPDATE(status) RETURN" guard, which merely gates
+-- the history write - it is defensible CRUD, not risk decisioning or P&L math - and keeping
+-- the cascade in SQL preserves the append-only OrderStatusHistory guarantee at the storage
+-- layer with the least risk. Option B (relocating this to C#) would only be required under a
+-- strict "zero conditional logic in SQL" reading, which the AAP does not enforce.
 -- ============================================================================
 CREATE OR ALTER TRIGGER dbo.trg_Orders_StatusAudit
 ON dbo.Orders

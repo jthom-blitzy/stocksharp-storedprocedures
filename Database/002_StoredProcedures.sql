@@ -42,8 +42,13 @@ SET ANSI_NULLS ON;
 SET QUOTED_IDENTIFIER ON;
 GO
 
--- Order "front door" relocated to SqlLegacyOrderGateway.SubmitOrderAsync (direct C# CRUD).
--- Dropped first because it depended on usp_ValidatePreTradeRisk.
+-- usp_SubmitOrder disposition = REMOVED (Option 2); NOT retained as a thin CRUD wrapper.
+-- Rationale (recorded at the point of change per AAP 0.7.2; see header block for the full note):
+-- the order "front door" is now SqlLegacyOrderGateway.SubmitOrderAsync, which runs the C#
+-- PreTradeRiskService and then writes dbo.Orders with a direct parameterized INSERT (final status
+-- and reject_reason supplied by C#) inside one gateway-owned transaction. A pass-through proc would
+-- be unused dead code plus a second place to keep in sync, so Option 1 (thin INSERT-only wrapper)
+-- was considered and rejected. Dropped first because it depended on usp_ValidatePreTradeRisk.
 DROP PROCEDURE IF EXISTS dbo.usp_SubmitOrder;
 GO
 
