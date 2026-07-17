@@ -9,10 +9,11 @@
 	explicit NOT EXISTS check (see each INSERT below).
 */
 
--- Portfolios has a unique key on name (UQ_Portfolios_name), so ON CONFLICT
--- keeps this insert idempotent (matches the original IF NOT EXISTS check).
+-- Portfolios has a case-insensitive unique key on LOWER(name) (the functional index UQ_Portfolios_name,
+-- F2), so the ON CONFLICT target is LOWER(name); this keeps the insert idempotent (matches the original
+-- IF NOT EXISTS check) AND case-insensitive, so re-seeding 'DEMO' never duplicates a 'demo' row.
 INSERT INTO Portfolios (name, currency) VALUES ('DEMO', 'USD')
-	ON CONFLICT (name) DO NOTHING;
+	ON CONFLICT (LOWER(name)) DO NOTHING;
 
 -- Securities has a unique key on (security_code, board_code)
 -- (UQ_Securities_code_board); both seed rows carry a non-null board_code, so

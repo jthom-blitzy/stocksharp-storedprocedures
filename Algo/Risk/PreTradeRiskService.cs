@@ -147,10 +147,24 @@ public sealed class PreTradeRiskService
 		if (side != "B" && side != "S")
 			return PreTradeRiskResult.Reject($"Invalid side: {side}");
 
-		if (qty is null || qty.Value <= 0m)
+		if (qty is null)
 			return PreTradeRiskResult.Reject("Invalid qty");
 
-		var q = qty.Value;
+		// F5: quantise to the schema's NUMERIC(18,4) scale FIRST, before the qty <= 0 guard. The retired proc
+		// declared @qty as DECIMAL(18,4), so a value such as 0.00005 was coerced to 0.0001 (and 0.00004 to 0.0000)
+		// on binding - BEFORE its own qty <= 0 guard - and every subsequent comparison ran on that coerced value.
+		// Matching that here makes the gate's accept/reject decision on exactly the value Postgres will persist into
+		// the NUMERIC(18,4) column, so a >4-dp input can no longer be accepted on its full-precision value yet stored
+		// at (or above) a ceiling it should have met. Away-from-zero rounding is never LESS strict (hard NFR, AAP 0.6.4).
+		var q = QuantizeToScale(qty.Value);
+
+		if (q <= 0m)
+			return PreTradeRiskResult.Reject("Invalid qty");
+
+		// Quantise the limit price to the same NUMERIC(18,4) scale (a market order has no price => null). Every
+		// downstream check and reject message uses this quantised price, not the raw parameter, for the same
+		// decision-matches-persistence reason (F5).
+		var priceQ = price.HasValue ? (decimal?)QuantizeToScale(price.Value) : null;
 
 		// --- Most-specific RiskLimits row selection ---
 		// Prefer portfolio+security, then portfolio-only, then security-only; newest effective_date wins.
@@ -224,9 +238,9 @@ public sealed class PreTradeRiskService
 		// Uses the shared CanonicalRiskRules.MeetsOrExceeds so the gate and the circuit-breaker price rule
 		// apply the identical ">=" comparison. MeetsOrExceeds embeds the canonical enabled-limit guard
 		// (present AND > 0, so NULL or 0 = unlimited), so a breach guarantees maxOrderPrice.HasValue.
-		if (price is not null && CanonicalRiskRules.MeetsOrExceeds(price.Value, maxOrderPrice))
+		if (priceQ is not null && CanonicalRiskRules.MeetsOrExceeds(priceQ.Value, maxOrderPrice))
 			return PreTradeRiskResult.Reject(
-				$"Order price {price.Value.To<string>()} meets/exceeds limit {maxOrderPrice.Value.To<string>()}");
+				$"Order price {priceQ.Value.To<string>()} meets/exceeds limit {maxOrderPrice.Value.To<string>()}");
 
 		// --- 2. Order qty ceiling (mirrors RiskOrderVolumeRule; rejects when qty >= limit) ---
 		// Canonical MeetsOrExceeds: NULL or 0 max_order_qty = unlimited; positive => ">=" rejects (F3).
@@ -240,9 +254,9 @@ public sealed class PreTradeRiskService
 		// meaningful when a price is supplied (a market order has no ex-ante notional), matching the SQL
 		// "@price IS NOT NULL". Product stays decimal and the canonical MeetsOrExceeds (NULL or 0 = unlimited)
 		// keeps the ">=" comparison from silently loosening (F3).
-		if (price is not null && CanonicalRiskRules.MeetsOrExceeds(q * price.Value, maxOrderValue))
+		if (priceQ is not null && CanonicalRiskRules.MeetsOrExceeds(q * priceQ.Value, maxOrderValue))
 			return PreTradeRiskResult.Reject(
-				$"Order value {(q * price.Value).To<string>()} meets/exceeds limit {maxOrderValue.Value.To<string>()}");
+				$"Order value {(q * priceQ.Value).To<string>()} meets/exceeds limit {maxOrderValue.Value.To<string>()}");
 
 		// --- 4. Order frequency (mirrors RiskOrderFreqRule) ---
 		// Canonical IsFrequencyEnabled: enforced only when BOTH count and window are present and > 0 (F3).
@@ -316,7 +330,7 @@ public sealed class PreTradeRiskService
 			// which accumulate ACTUAL ExecutionMessage.Commission AFTER the fill. A forecast and a realized figure
 			// will not agree, so BOTH are preserved (different by design, AAP 0.6.2).
 			var rate = commissionRate ?? 0m; // commission_rate is NOT NULL in the schema, so present when a limit row exists.
-			decimal? estPrice = price;
+			decimal? estPrice = priceQ; // use the quantised limit price (F5); the market fallback below is already 4-dp.
 
 			if (estPrice is null)
 			{
@@ -345,9 +359,12 @@ public sealed class PreTradeRiskService
 				existingNotional = await ExecuteDecimalScalarAsync(notionalCommand, 0m, cancellationToken);
 			}
 
-			// Estimated cumulative commission = existing notional * rate + prospective notional * rate. All decimal;
-			// ISNULL(@estPrice, 0) parity via (estPrice ?? 0m) so a market order with no last trade contributes 0.
-			var est = existingNotional * rate + q * (estPrice ?? 0m) * rate;
+			// F5 parity: the retired proc held @existingNotional and @estCommission as DECIMAL(18,4), so quantise the
+			// summed notional to 4 dp and the final estimate to 4 dp before the ">=" compare. rate stays at its full
+			// NUMERIC(9,6) scale (it is a rate, not a ceiling). ISNULL(@estPrice, 0) parity via (estPrice ?? 0m) so a
+			// market order with no last trade contributes 0. All decimal so the compare can never silently loosen.
+			existingNotional = QuantizeToScale(existingNotional);
+			var est = QuantizeToScale(existingNotional * rate + q * (estPrice ?? 0m) * rate);
 			if (CanonicalRiskRules.MeetsOrExceeds(est, maxCommissionTotal))
 				return PreTradeRiskResult.Reject(
 					$"Estimated cumulative commission {est.To<string>()} meets/exceeds limit {maxCommissionTotal.Value.To<string>()}");
@@ -396,4 +413,15 @@ public sealed class PreTradeRiskService
 		var result = await command.ExecuteScalarAsync(cancellationToken);
 		return result is decimal value ? value : defaultValue;
 	}
+
+	// F5 helper: rounds a decimal to the schema's NUMERIC(18,4) scale using away-from-zero (half-up) rounding - the
+	// exact coercion the retired proc applied by declaring @qty/@price/@max_*/@estCommission as DECIMAL(18,4), and the
+	// same rounding Postgres uses when persisting into a NUMERIC(18,4) column. Quantising the gate's inputs and money
+	// intermediates to this scale keeps the accept/reject decision consistent with the value that is actually stored,
+	// so a >4-dp input can no longer be accepted on its full-precision value yet persisted at (or above) a ceiling it
+	// should have met. Rounding to a fixed scale away from zero is never LESS strict (hard NFR, AAP 0.6.4).
+	private const int NumericScale = 4;
+
+	private static decimal QuantizeToScale(decimal value)
+		=> Math.Round(value, NumericScale, MidpointRounding.AwayFromZero);
 }

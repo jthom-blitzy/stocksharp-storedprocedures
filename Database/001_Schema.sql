@@ -41,9 +41,18 @@ CREATE TABLE Portfolios
     created_date   TIMESTAMP     NOT NULL DEFAULT (now() at time zone 'utc'),
     is_active      BOOLEAN       NOT NULL DEFAULT TRUE,   -- active flag, defaults on
 
-    CONSTRAINT PK_Portfolios PRIMARY KEY (portfolio_id),
-    CONSTRAINT UQ_Portfolios_name UNIQUE (name)
+    CONSTRAINT PK_Portfolios PRIMARY KEY (portfolio_id)
 );
+
+-- F2: restore the SQL Server default (case-insensitive) collation behaviour for the portfolio name.
+-- Under SQL Server the name column used the database's default CI collation, so 'DEMO' and 'demo' were
+-- the SAME key; PostgreSQL's VARCHAR comparison is case-SENSITIVE, which let case-variant duplicates
+-- persist (the drift this fixes). A functional UNIQUE INDEX on LOWER(name) makes the uniqueness key
+-- case-insensitive WITHOUT the citext extension (extension-free and deterministic). The name is still
+-- STORED as provided, so display casing is preserved; only the uniqueness key is case-folded. It cannot
+-- be an inline table CONSTRAINT (a functional index must be a separate statement). EnsurePortfolioAsync's
+-- atomic upsert targets ON CONFLICT (LOWER(name)), which infers THIS index.
+CREATE UNIQUE INDEX UQ_Portfolios_name ON Portfolios (LOWER(name));
 
 -- ============================================================================
 -- Securities

@@ -78,16 +78,19 @@ public class SqlLegacyOrderGateway
 		await using var connection = CreateConnection();
 		await connection.OpenAsync(cancellationToken);
 
-		// Atomic upsert-or-select (F7): a single INSERT ... ON CONFLICT (name) DO UPDATE ... RETURNING
+		// Atomic upsert-or-select (F7): a single INSERT ... ON CONFLICT (LOWER(name)) DO UPDATE ... RETURNING
 		// removes the former SELECT-then-INSERT race in which two concurrent callers could both miss the row
-		// and both attempt the INSERT (the second hitting UQ_Portfolios_name). DO UPDATE (a no-op touch of
-		// name) rather than DO NOTHING is used deliberately: DO NOTHING returns NO row on conflict, whereas
-		// DO UPDATE always yields the existing row via RETURNING. The conflict target (name) matches
-		// UQ_Portfolios_name. currency is not modeled on BusinessEntities.Portfolio, so an auto-created row
-		// lands on the column default ('USD'); dbo. qualifier dropped (objects live in the public schema).
+		// and both attempt the INSERT (the second hitting UQ_Portfolios_name). DO UPDATE (a no-op touch that
+		// re-sets name to its EXISTING value) rather than DO NOTHING is used deliberately: DO NOTHING returns
+		// NO row on conflict, whereas DO UPDATE always yields the existing row via RETURNING. The conflict
+		// target LOWER(name) matches the case-insensitive functional unique index UQ_Portfolios_name (F2), so
+		// ensuring 'demo' after 'DEMO' resolves to the SAME row; SET name = portfolios.name keeps the update a
+		// true no-op that PRESERVES the originally stored casing. currency is not modeled on
+		// BusinessEntities.Portfolio, so an auto-created row lands on the column default ('USD'); dbo. qualifier
+		// dropped (objects live in the public schema).
 		await using var command = new NpgsqlCommand(
 			"INSERT INTO portfolios (name) VALUES (@name) " +
-			"ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name " +
+			"ON CONFLICT (LOWER(name)) DO UPDATE SET name = portfolios.name " +
 			"RETURNING portfolio_id", connection);
 		command.Parameters.Add(new NpgsqlParameter("name", NpgsqlDbType.Varchar) { Value = portfolio.Name });
 

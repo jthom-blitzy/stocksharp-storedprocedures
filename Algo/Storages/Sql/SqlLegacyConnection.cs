@@ -28,7 +28,12 @@ public static class SqlLegacyConnection
 
 	/// <summary>
 	/// Resolves the connection string to use, preferring the environment variable.
+	/// A value that is null, empty, OR whitespace-only falls back to the local-dev default:
+	/// a whitespace-only override (e.g. a variable set to spaces by a misconfigured launcher or
+	/// compose file) is treated as "unset" rather than being handed to Npgsql verbatim, which would
+	/// otherwise surface only as an obscure connect-time failure. A genuine connection string that
+	/// merely has surrounding whitespace is preserved as-is.
 	/// </summary>
 	public static string Resolve()
-		=> Environment.GetEnvironmentVariable(_envVarName).IsEmpty(_localDevDefault);
+		=> Environment.GetEnvironmentVariable(_envVarName).IsEmptyOrWhiteSpace(_localDevDefault);
 }
