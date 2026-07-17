@@ -333,6 +333,20 @@ public class PositionRecalculationTests : BaseTestClass
 		return (reader.GetDecimal(0), reader.GetDecimal(1), reader.GetDecimal(2));
 	}
 
+	// Counts how many dbo.Trades rows exist for an order. Used by the F2 idempotency tests to prove that a
+	// duplicate RecordTradeAsync (same external_trade_id) inserts the fill exactly once, while an un-keyed
+	// duplicate inserts each call.
+	private static async Task<int> CountTradesAsync(string connectionString, long orderId)
+	{
+		await using var connection = new SqlConnection(connectionString);
+		await connection.OpenAsync();
+
+		await using var cmd = new SqlCommand("SELECT COUNT(*) FROM dbo.Trades WHERE order_id = @o", connection);
+		cmd.Parameters.Add(new SqlParameter("@o", SqlDbType.BigInt) { Value = orderId });
+
+		return (int)await cmd.ExecuteScalarAsync();
+	}
+
 	// Runs the body against a fresh scope inside a transaction that is always rolled back.
 	private async Task RunWithFreshScopeAsync(Func<PositionRecalculationService, SqlConnection, SqlTransaction, int, int, Task> body)
 	{
@@ -693,10 +707,11 @@ public class PositionRecalculationTests : BaseTestClass
 		{
 			var gateway = new SqlLegacyOrderGateway(connectionString);
 
-			// Two concurrent fills of the same instrument. The service's UPDLOCK/HOLDLOCK on the position
-			// key serializes the recompute+persist, and because each recompute folds over ALL committed
-			// trades, the last writer sees both fills - so neither fill is lost (no double-count, no
-			// lost update). Final: qty 200, avg (100*150 + 100*160)/200 = 155.
+			// Two concurrent fills of the same instrument. The gateway acquires a per-position application
+			// lock BEFORE inserting each trade, so the two fills serialize cleanly (no insert-then-lock
+			// deadlock, QA finding F1); because each recompute then folds over ALL committed trades, the
+			// last writer sees both fills - so neither fill is lost (no double-count, no lost update).
+			// Final: qty 200, avg (100*150 + 100*160)/200 = 155.
 			var fillA = gateway.RecordTradeAsync(orderId, 100m, 150m);
 			var fillB = gateway.RecordTradeAsync(orderId, 100m, 160m);
 			await Task.WhenAll(fillA, fillB);
@@ -705,6 +720,220 @@ public class PositionRecalculationTests : BaseTestClass
 			position.AssertNotNull();
 			position.Quantity.AssertEqual(200m);
 			position.AveragePrice.AssertEqual(155m);
+		}
+		finally
+		{
+			await CleanupScopeAsync(connectionString, portfolioId, securityId);
+		}
+	}
+
+	[TestMethod]
+	public async Task Live_HighContentionConcurrentFillsNeverDeadlockOrLoseFills()
+	{
+		var connectionString = SqlLegacyConnection.Resolve();
+
+		await using (var probe = await TryOpenLegacyAsync())
+		{
+			if (probe is null)
+			{
+				Inconclusive("StockSharpLegacy SQL Server is not reachable; skipping live high-contention concurrent-fill test.");
+				return;
+			}
+		}
+
+		int portfolioId;
+		int securityId;
+		long orderId;
+
+		await using (var setup = new SqlConnection(connectionString))
+		{
+			await setup.OpenAsync();
+			await using var tx = (SqlTransaction)await setup.BeginTransactionAsync(IsolationLevel.ReadCommitted);
+			(portfolioId, securityId) = await InsertScopeAsync(setup, tx, default);
+			orderId = await InsertOrderAsync(setup, tx, portfolioId, securityId, 'B', 1000m, 100m, default);
+			await tx.CommitAsync();
+		}
+
+		try
+		{
+			var gateway = new SqlLegacyOrderGateway(connectionString);
+
+			// F1 regression guard. Fire MANY simultaneous un-keyed fills of the SAME position - the exact
+			// scenario that deadlocked (SQL 1205) and silently lost fills under the old insert-then-lock
+			// ordering (a Barrier-forced standalone harness reproduced it 100% of the time). With the fix
+			// (per-position application lock acquired BEFORE the INSERT, plus a bounded deadlock retry) every
+			// fill serializes cleanly: Task.WhenAll must complete WITHOUT throwing and no fill may be lost.
+			const int fills = 12;
+			const decimal each = 10m;
+
+			var tasks = new Task[fills];
+			for (var i = 0; i < fills; i++)
+				tasks[i] = gateway.RecordTradeAsync(orderId, each, 100m);
+
+			await Task.WhenAll(tasks);   // no unhandled deadlock (1205) may surface
+
+			// Every fill applied exactly once: qty == fills*each, and dbo.Trades holds exactly one row per call.
+			var position = await gateway.GetPositionAsync(portfolioId, securityId);
+			position.AssertNotNull();
+			position.Quantity.AssertEqual(fills * each);           // 120 - no lost fills
+			(await CountTradesAsync(connectionString, orderId)).AssertEqual(fills);
+		}
+		finally
+		{
+			await CleanupScopeAsync(connectionString, portfolioId, securityId);
+		}
+	}
+
+	[TestMethod]
+	public async Task Live_RecordTradeIsIdempotentWithExternalTradeId()
+	{
+		var connectionString = SqlLegacyConnection.Resolve();
+
+		await using (var probe = await TryOpenLegacyAsync())
+		{
+			if (probe is null)
+			{
+				Inconclusive("StockSharpLegacy SQL Server is not reachable; skipping live idempotency-key test.");
+				return;
+			}
+		}
+
+		int portfolioId;
+		int securityId;
+
+		await using (var setup = new SqlConnection(connectionString))
+		{
+			await setup.OpenAsync();
+			await using var tx = (SqlTransaction)await setup.BeginTransactionAsync(IsolationLevel.ReadCommitted);
+			(portfolioId, securityId) = await InsertScopeAsync(setup, tx, default);
+			await tx.CommitAsync();
+		}
+
+		try
+		{
+			var gateway = new SqlLegacyOrderGateway(connectionString);
+			var submit = await gateway.SubmitOrderAsync(portfolioId, securityId, Sides.Buy, 100m, 150m, OrderTypes.Limit);
+			submit.IsValid.AssertTrue();
+
+			// F2: recording the SAME logical fill twice (same external_trade_id) - e.g. a client retry - must
+			// record it exactly once and apply it to the position exactly once (qty 100, NOT double-counted 200).
+			const long externalTradeId = 918_273_645L;
+			await gateway.RecordTradeAsync(submit.OrderId, 100m, 150m, externalTradeId);
+			await gateway.RecordTradeAsync(submit.OrderId, 100m, 150m, externalTradeId);
+
+			(await CountTradesAsync(connectionString, submit.OrderId)).AssertEqual(1);   // one trade row, not two
+
+			var position = await gateway.GetPositionAsync(portfolioId, securityId);
+			position.AssertNotNull();
+			position.Quantity.AssertEqual(100m);        // single apply -> 100, NOT 200
+			position.AveragePrice.AssertEqual(150m);
+			position.RealizedPnL.AssertEqual(0m);
+		}
+		finally
+		{
+			await CleanupScopeAsync(connectionString, portfolioId, securityId);
+		}
+	}
+
+	[TestMethod]
+	public async Task Live_RecordTradeWithoutKeyRecordsEachFill()
+	{
+		var connectionString = SqlLegacyConnection.Resolve();
+
+		await using (var probe = await TryOpenLegacyAsync())
+		{
+			if (probe is null)
+			{
+				Inconclusive("StockSharpLegacy SQL Server is not reachable; skipping live no-key duplicate test.");
+				return;
+			}
+		}
+
+		int portfolioId;
+		int securityId;
+
+		await using (var setup = new SqlConnection(connectionString))
+		{
+			await setup.OpenAsync();
+			await using var tx = (SqlTransaction)await setup.BeginTransactionAsync(IsolationLevel.ReadCommitted);
+			(portfolioId, securityId) = await InsertScopeAsync(setup, tx, default);
+			await tx.CommitAsync();
+		}
+
+		try
+		{
+			var gateway = new SqlLegacyOrderGateway(connectionString);
+			var submit = await gateway.SubmitOrderAsync(portfolioId, securityId, Sides.Buy, 200m, 150m, OrderTypes.Limit);
+			submit.IsValid.AssertTrue();
+
+			// Backward-compatibility: without an idempotency key each call is a DISTINCT fill (original
+			// behavior preserved for callers that do not supply a key), so two calls record two trades and
+			// the position reflects both (qty 200).
+			await gateway.RecordTradeAsync(submit.OrderId, 100m, 150m);
+			await gateway.RecordTradeAsync(submit.OrderId, 100m, 150m);
+
+			(await CountTradesAsync(connectionString, submit.OrderId)).AssertEqual(2);   // both fills recorded
+
+			var position = await gateway.GetPositionAsync(portfolioId, securityId);
+			position.AssertNotNull();
+			position.Quantity.AssertEqual(200m);        // both applied - legacy behavior preserved
+			position.AveragePrice.AssertEqual(150m);
+		}
+		finally
+		{
+			await CleanupScopeAsync(connectionString, portfolioId, securityId);
+		}
+	}
+
+	[TestMethod]
+	public async Task Live_ConcurrentDuplicateKeyAppliesOnce()
+	{
+		var connectionString = SqlLegacyConnection.Resolve();
+
+		await using (var probe = await TryOpenLegacyAsync())
+		{
+			if (probe is null)
+			{
+				Inconclusive("StockSharpLegacy SQL Server is not reachable; skipping live concurrent-duplicate-key test.");
+				return;
+			}
+		}
+
+		int portfolioId;
+		int securityId;
+
+		await using (var setup = new SqlConnection(connectionString))
+		{
+			await setup.OpenAsync();
+			await using var tx = (SqlTransaction)await setup.BeginTransactionAsync(IsolationLevel.ReadCommitted);
+			(portfolioId, securityId) = await InsertScopeAsync(setup, tx, default);
+			await tx.CommitAsync();
+		}
+
+		try
+		{
+			var gateway = new SqlLegacyOrderGateway(connectionString);
+			var submit = await gateway.SubmitOrderAsync(portfolioId, securityId, Sides.Buy, 100m, 150m, OrderTypes.Limit);
+			submit.IsValid.AssertTrue();
+
+			// F1 + F2 together: fire MANY concurrent recordings of the SAME logical fill (same
+			// external_trade_id) - the retry-storm the deadlock retry (F1) could otherwise turn into a
+			// double-count. The per-position application lock serializes them and the idempotency key (F2)
+			// makes recording exactly-once regardless of overlap or retry: exactly one trade row, applied once.
+			const long externalTradeId = 112_233_445L;
+			const int attempts = 8;
+
+			var tasks = new Task[attempts];
+			for (var i = 0; i < attempts; i++)
+				tasks[i] = gateway.RecordTradeAsync(submit.OrderId, 100m, 150m, externalTradeId);
+
+			await Task.WhenAll(tasks);
+
+			(await CountTradesAsync(connectionString, submit.OrderId)).AssertEqual(1);   // exactly one, despite 8 concurrent calls
+
+			var position = await gateway.GetPositionAsync(portfolioId, securityId);
+			position.AssertNotNull();
+			position.Quantity.AssertEqual(100m);        // applied once
 		}
 		finally
 		{

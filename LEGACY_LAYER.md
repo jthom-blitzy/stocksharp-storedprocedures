@@ -113,16 +113,47 @@ double-counted the trade against `Positions.qty` / `avg_price` /
 `realized_pnl`. Nothing in the schema prevented it.
 
 That duality is gone. `PositionRecalculationService` is now the single entry
-point, and `SqlLegacyOrderGateway.RecordTradeAsync` invokes it exactly once
-per recorded trade, inside the same gateway-owned transaction that inserts the
-trade, taking `UPDLOCK`/`HOLDLOCK` on the `Positions` row so concurrent fills
-serialize. The apply is idempotent: it recomputes the position deterministically
-from the full persisted trade set for that portfolio+security rather than
-folding a delta, so re-running it cannot double-apply. `trg_Trades_PositionRecalc`
-and its calculation logic have been removed. There is a live test
-(`Live_ApplyTradeIsIdempotent`, plus the gateway end-to-end and concurrent-fill
-tests) that proves applying the same trade twice leaves the position at its
-single-apply value, not double.
+point, and `SqlLegacyOrderGateway.RecordTradeAsync` invokes it exactly once per
+recorded trade, inside the same gateway-owned transaction that inserts the
+trade. `trg_Trades_PositionRecalc` and its calculation logic have been removed.
+
+Two distinct guarantees hold this together - and each is narrower than the
+earlier draft of this section implied, so be precise about which is which:
+
+- **The recompute is idempotent for a fixed trade set.** It recomputes the
+  position deterministically from the full persisted trade set for that
+  portfolio+security rather than folding a delta, so re-running it over the
+  *same* trades cannot double-apply. `PositionRecalculationService` also takes
+  `UPDLOCK`/`HOLDLOCK` on the `Positions` row, which serializes standalone/direct
+  callers and blocks a racing first insert of the position key.
+
+- **Concurrent fills serialize without deadlocking - lock before insert.** The
+  `UPDLOCK`/`HOLDLOCK` above is acquired *after* a trade row is inserted, so on
+  its own it does not order the inserts: two fills of the same instrument that
+  each inserted first and only then locked could deadlock (SQL 1205), rolling one
+  back and losing that fill. `RecordTradeAsync` therefore acquires a per-position
+  application lock (`sp_getapplock`, keyed on portfolio+security) *before*
+  inserting the trade, so concurrent same-instrument fills serialize cleanly; a
+  bounded deadlock-retry wraps the unit of work as defense-in-depth for any
+  residual contention.
+
+- **Recording is exactly-once only with a business key.** Idempotency of the
+  *recompute* does not by itself make *recording* idempotent: a retried
+  `RecordTradeAsync` that inserts a second trade row would legitimately fold that
+  extra row and double the position. To make a retry safe, pass
+  `RecordTradeAsync(..., externalTradeId)` - the external execution/trade id of
+  the logical fill. A filtered unique index (`UQ_Trades_external_trade_id`)
+  enforces uniqueness and the guarded insert no-ops on a duplicate key, so the
+  fill is recorded and applied at most once. When no key is supplied the original
+  behavior is preserved: every call records a distinct fill.
+
+Live tests prove all three: `Live_ApplyTradeIsIdempotent` (same trade set →
+single-apply), `Live_HighContentionConcurrentFillsNeverDeadlockOrLoseFills`
+(many concurrent un-keyed fills → no 1205, no lost fill),
+`Live_RecordTradeIsIdempotentWithExternalTradeId` and
+`Live_ConcurrentDuplicateKeyAppliesOnce` (same key → one trade row, applied
+once), and `Live_RecordTradeWithoutKeyRecordsEachFill` (no key → each fill
+recorded), alongside the existing gateway end-to-end and concurrent-fill tests.
 
 `unrealized_pnl` on `Positions` is still not maintained here - it needs a live
 market price, which this path doesn't have. It's refreshed by the EOD

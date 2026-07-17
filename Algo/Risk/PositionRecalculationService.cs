@@ -174,9 +174,16 @@ public class PositionRecalculationService
 	/// caller must INSERT the trade into <c>dbo.Trades</c> before calling this method within the same transaction.
 	/// </para>
 	/// <para>
-	/// Concurrency: the position key is locked with <c>UPDLOCK, HOLDLOCK</c> for the duration of the caller's
-	/// transaction, serializing concurrent recalculations of the same portfolio/security and blocking a racing
-	/// first INSERT of the unique (portfolio_id, security_id) key (CWE-362).
+	/// Concurrency: this method locks the position key with <c>UPDLOCK, HOLDLOCK</c> for the duration of the
+	/// caller's transaction, which serializes concurrent recalculations of the same portfolio/security and
+	/// blocks a racing first INSERT of the unique (portfolio_id, security_id) key (CWE-362). Note this lock is
+	/// acquired <b>after</b> the caller has inserted its trade row; on its own it does not order the trade
+	/// INSERTs, so two callers that each insert then reach this lock could deadlock. The gateway avoids that by
+	/// acquiring a per-position application lock <b>before</b> inserting the trade (see
+	/// <c>SqlLegacyOrderGateway.RecordTradeAsync</c>); the <c>UPDLOCK, HOLDLOCK</c> here then runs uncontended
+	/// on the gateway path and remains the serialization mechanism for standalone/direct callers that do not
+	/// hold that application lock. It is therefore a layered defense, not a stand-alone guarantee that
+	/// concurrent trade INSERTs are ordered.
 	/// </para>
 	/// </summary>
 	/// <param name="connection">The gateway-owned open connection enrolled in <paramref name="transaction"/>.</param>

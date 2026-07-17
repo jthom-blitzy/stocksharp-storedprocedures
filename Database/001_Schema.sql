@@ -170,6 +170,15 @@ GO
 
 -- ============================================================================
 -- Trades
+--
+-- external_trade_id is an optional business idempotency key (the external
+-- execution/trade id of a logical fill). It was added so trade recording can be
+-- made exactly-once under client and deadlock retries: when a caller supplies it,
+-- SqlLegacyOrderGateway.RecordTradeAsync records the fill at most once and a retry
+-- cannot double-count the position (QA finding F2; AAP 0.6.4 "exactly once per
+-- successful logical trade"). This is still pure storage - the column plus the
+-- filtered unique index UQ_Trades_external_trade_id enforce uniqueness only; no
+-- business decisioning or P&L math lives in this schema.
 -- ============================================================================
 IF OBJECT_ID(N'dbo.Trades', N'U') IS NOT NULL DROP TABLE dbo.Trades;
 GO
@@ -182,6 +191,10 @@ CREATE TABLE dbo.Trades
 	price			DECIMAL(18,4)			NOT NULL,
 	executed_date	DATETIME2(3)			NOT NULL CONSTRAINT DF_Trades_executed_date DEFAULT (SYSUTCDATETIME()),
 
+	-- optional business idempotency key; NULL (the default) means "no key" and is
+	-- exempt from UQ_Trades_external_trade_id, so unlimited un-keyed fills are allowed
+	external_trade_id BIGINT				NULL,
+
 	CONSTRAINT PK_Trades PRIMARY KEY CLUSTERED (trade_id),
 	CONSTRAINT FK_Trades_Orders FOREIGN KEY (order_id) REFERENCES dbo.Orders (order_id),
 	CONSTRAINT CK_Trades_qty CHECK (qty > 0),
@@ -191,6 +204,16 @@ GO
 
 CREATE NONCLUSTERED INDEX IX_Trades_order ON dbo.Trades (order_id);
 CREATE NONCLUSTERED INDEX IX_Trades_executed_date ON dbo.Trades (executed_date);
+GO
+
+-- Enforces at-most-one trade per business idempotency key. Filtered on IS NOT NULL so
+-- NULL (un-keyed) fills are unlimited while any non-null external_trade_id is unique -
+-- this is what lets RecordTradeAsync no-op on a duplicate and makes trade recording
+-- idempotent under client/deadlock retries (QA finding F2 / AAP 0.6.4). Kept vendor-
+-- neutral: PostgreSQL/Aurora support the same partial-unique-index form
+-- (CREATE UNIQUE INDEX ... WHERE ...). The filtered index requires
+-- SET ANSI_NULLS/QUOTED_IDENTIFIER ON (set at the top of this script).
+CREATE UNIQUE NONCLUSTERED INDEX UQ_Trades_external_trade_id ON dbo.Trades (external_trade_id) WHERE external_trade_id IS NOT NULL;
 GO
 
 -- ============================================================================

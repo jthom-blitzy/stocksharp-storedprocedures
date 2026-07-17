@@ -148,7 +148,7 @@ public class SqlLegacyOrderGateway
 		// single atomic check-then-act. Portfolio scope (not portfolio+security) is deliberate: the
 		// frequency and commission checks are portfolio-wide, so a narrower lock would leave those races
 		// open. The lock is held for the life of the transaction and released on commit/rollback.
-		await AcquireOrderAppLockAsync(connection, transaction, portfolioId, cancellationToken);
+		await AcquireAppLockAsync(connection, transaction, $"StockSharpLegacy:Order:Portfolio:{portfolioId}", cancellationToken);
 
 		var evaluation = await _preTradeRiskService.ValidateAsync(
 			connection, transaction, portfolioId, securityId, side, volume, price, orderType, cancellationToken);
@@ -190,18 +190,22 @@ public class SqlLegacyOrderGateway
 		};
 	}
 
-	// Serializes concurrent order submissions for a portfolio using sp_getapplock in Transaction-owner
-	// mode. Combined with the enclosing transaction this makes validation + INSERT a single atomic
-	// check-then-act (C03/CWE-367): a second submission for the same portfolio waits here until the first
-	// commits, so it can no longer read pre-insert state and be accepted past a shared limit. The lock is
-	// released automatically when the transaction ends.
-	private static async Task AcquireOrderAppLockAsync(SqlConnection connection, SqlTransaction transaction, int portfolioId, CancellationToken cancellationToken)
+	// Serializes a unit of work on a named resource using sp_getapplock in Transaction-owner mode.
+	// Combined with the enclosing transaction this turns a read-then-write sequence into a single atomic
+	// critical section (C03/CWE-367): a second caller contending for the same resource waits here until
+	// the first commits, so it can no longer act on pre-write state. The lock is released automatically
+	// when the transaction ends. Two callers use this: SubmitOrderAsync serializes per portfolio (its
+	// frequency/commission checks are portfolio-wide), and RecordTradeAsync serializes per position
+	// (portfolio+security) and acquires it BEFORE inserting the trade so concurrent fills cannot form the
+	// insert-then-lock deadlock cycle (QA finding F1). Distinct resource names mean the two paths do not
+	// block each other.
+	private static async Task AcquireAppLockAsync(SqlConnection connection, SqlTransaction transaction, string resource, CancellationToken cancellationToken)
 	{
 		await using var command = new SqlCommand("sys.sp_getapplock", connection, transaction)
 		{
 			CommandType = CommandType.StoredProcedure,
 		};
-		command.Parameters.Add(new SqlParameter("@Resource", SqlDbType.NVarChar, 255) { Value = $"StockSharpLegacy:Order:Portfolio:{portfolioId}" });
+		command.Parameters.Add(new SqlParameter("@Resource", SqlDbType.NVarChar, 255) { Value = resource });
 		command.Parameters.Add(new SqlParameter("@LockMode", SqlDbType.VarChar, 32) { Value = "Exclusive" });
 		command.Parameters.Add(new SqlParameter("@LockOwner", SqlDbType.VarChar, 32) { Value = "Transaction" });
 		command.Parameters.Add(new SqlParameter("@LockTimeout", SqlDbType.Int) { Value = 15000 });
@@ -214,8 +218,29 @@ public class SqlLegacyOrderGateway
 		// sp_getapplock returns >= 0 on success (0 granted immediately, 1 granted after waiting) and < 0
 		// on failure (-1 timeout, -2 cancelled, -3 deadlock victim, -999 validation error).
 		if (returnValue.Value is int returnCode && returnCode < 0)
-			throw new InvalidOperationException($"Could not acquire the order submission lock for portfolio {portfolioId} (sp_getapplock returned {returnCode}).");
+			throw new InvalidOperationException($"Could not acquire the application lock '{resource}' (sp_getapplock returned {returnCode}).");
 	}
+
+	// Resolves the portfolio/security scope of the position a fill belongs to, from its order. The order
+	// row was written by a previously-committed SubmitOrderAsync, so this is a plain committed read; it is
+	// used to key the per-position application lock BEFORE any row is modified (QA finding F1).
+	private static async Task<(int PortfolioId, int SecurityId)> ResolveOrderScopeAsync(
+		SqlConnection connection, SqlTransaction transaction, long orderId, CancellationToken cancellationToken)
+	{
+		await using var command = new SqlCommand(
+			"SELECT portfolio_id, security_id FROM dbo.Orders WHERE order_id = @order_id", connection, transaction);
+		command.Parameters.Add(new SqlParameter("@order_id", SqlDbType.BigInt) { Value = orderId });
+
+		await using var reader = await command.ExecuteReaderAsync(CommandBehavior.SingleRow, cancellationToken);
+
+		if (!await reader.ReadAsync(cancellationToken))
+			throw new InvalidOperationException($"SqlLegacyOrderGateway: order_id {orderId} not found");
+
+		return (reader.GetInt32(0), reader.GetInt32(1));
+	}
+
+	// A SQL Server deadlock victim surfaces as SqlException with error number 1205.
+	private static bool IsDeadlockVictim(SqlException exception) => exception.Number == 1205;
 
 	/// <summary>
 	/// Records a fill against a SQL-side order and recomputes the affected position. The dbo.Trades
@@ -223,32 +248,111 @@ public class SqlLegacyOrderGateway
 	/// exactly once by <see cref="PositionRecalculationService"/>. The old trg_Trades_PositionRecalc
 	/// trigger - and the double-count hazard of the trigger and a standalone recalc both firing for the
 	/// same trade - is gone; the recompute is no longer "automatic" inside SQL.
+	/// <para>
+	/// Concurrency: a per-position (portfolio+security) application lock is acquired BEFORE the trade is
+	/// inserted, so concurrent fills of the same instrument serialize cleanly instead of forming the
+	/// insert-then-lock deadlock cycle that would otherwise arise from inserting the trade first and only
+	/// then locking the position row. If a transient deadlock (SQL error 1205) still occurs, the whole
+	/// unit of work is retried on a fresh transaction a bounded number of times.
+	/// </para>
+	/// <para>
+	/// Idempotency: pass <paramref name="externalTradeId"/> - the external execution/trade id of the
+	/// logical fill - to make recording exactly-once. When supplied, a duplicate call (a client retry, or
+	/// the deadlock retry above) no-ops instead of inserting a second trade row, so the position is not
+	/// double-counted (uniqueness is enforced by the filtered index UQ_Trades_external_trade_id). When it
+	/// is <see langword="null"/> (the default) the fill is always inserted, preserving the original
+	/// behavior for callers that do not supply a key.
+	/// </para>
 	/// </summary>
 	/// <param name="orderId">The order the fill is recorded against.</param>
 	/// <param name="qty">The fill quantity.</param>
 	/// <param name="price">The fill price.</param>
+	/// <param name="externalTradeId">
+	/// Optional business idempotency key (external execution/trade id). When supplied, re-recording the
+	/// same key no-ops so the fill is applied at most once; when <see langword="null"/> the fill is always
+	/// recorded.
+	/// </param>
 	/// <param name="cancellationToken">The cancellation token.</param>
-	public async Task RecordTradeAsync(long orderId, decimal qty, decimal price, CancellationToken cancellationToken = default)
+	public async Task RecordTradeAsync(long orderId, decimal qty, decimal price, long? externalTradeId = null, CancellationToken cancellationToken = default)
+	{
+		// Bounded deadlock-retry. A deadlock victim's transaction is rolled back atomically (its dbo.Trades
+		// INSERT is undone), so re-running the whole unit of work on a fresh transaction is safe; combined
+		// with the optional externalTradeId idempotency key even a post-commit client retry cannot
+		// double-record a logical fill (QA findings F1 + F2). With the lock-before-insert ordering below a
+		// same-position deadlock should no longer occur - this loop is defense-in-depth for any residual
+		// cross-resource contention and rethrows once the attempts are exhausted (never hangs).
+		const int maxAttempts = 3;
+
+		for (var attempt = 1; ; attempt++)
+		{
+			try
+			{
+				await RecordTradeCoreAsync(orderId, qty, price, externalTradeId, cancellationToken);
+				return;
+			}
+			catch (SqlException ex) when (IsDeadlockVictim(ex) && attempt < maxAttempts)
+			{
+				// Brief, increasing backoff before retrying on a fresh transaction.
+				await Task.Delay(TimeSpan.FromMilliseconds(25 * attempt), cancellationToken);
+			}
+		}
+	}
+
+	// Single attempt of RecordTradeAsync: lock the position, insert the fill (idempotently when a key is
+	// supplied), recompute the position exactly once, and commit - all in one transaction.
+	private async Task RecordTradeCoreAsync(long orderId, decimal qty, decimal price, long? externalTradeId, CancellationToken cancellationToken)
 	{
 		await using var connection = CreateConnection();
 		await connection.OpenAsync(cancellationToken);
 		await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(IsolationLevel.ReadCommitted, cancellationToken);
 
-		// Plain parameterized INSERT of the fill.
-		await using (var insert = new SqlCommand(
-			"INSERT INTO dbo.Trades (order_id, qty, price) VALUES (@order_id, @qty, @price)", connection, transaction))
+		// Resolve the position this fill belongs to, then serialize concurrent fills of that position
+		// BEFORE inserting the trade. Acquiring the lock first is what breaks the insert-then-lock deadlock
+		// cycle (QA finding F1): a second concurrent fill for the same position blocks here, before it
+		// inserts its own dbo.Trades row, so two transactions can never each hold the other's uncommitted
+		// trade row while contending for the position lock. Position scope (not the submission path's
+		// portfolio scope) is deliberate - fills for different securities do not contend.
+		var (portfolioId, securityId) = await ResolveOrderScopeAsync(connection, transaction, orderId, cancellationToken);
+		await AcquireAppLockAsync(connection, transaction, $"StockSharpLegacy:Position:{portfolioId}:{securityId}", cancellationToken);
+
+		// Plain parameterized INSERT of the fill. With an idempotency key the INSERT no-ops when a trade
+		// with that key already exists, so a retry records the logical fill at most once (QA finding F2);
+		// rowsInserted tells us whether a new trade actually entered the set.
+		int rowsInserted;
+
+		if (externalTradeId is null)
 		{
+			await using var insert = new SqlCommand(
+				"INSERT INTO dbo.Trades (order_id, qty, price) VALUES (@order_id, @qty, @price)", connection, transaction);
 			insert.Parameters.Add(new SqlParameter("@order_id", SqlDbType.BigInt) { Value = orderId });
 			insert.Parameters.Add(new SqlParameter("@qty", SqlDbType.Decimal) { Precision = 18, Scale = 4, Value = qty });
 			insert.Parameters.Add(new SqlParameter("@price", SqlDbType.Decimal) { Precision = 18, Scale = 4, Value = price });
 
-			await insert.ExecuteNonQueryAsync(cancellationToken);
+			rowsInserted = await insert.ExecuteNonQueryAsync(cancellationToken);
+		}
+		else
+		{
+			await using var insert = new SqlCommand(
+				"""
+				INSERT INTO dbo.Trades (order_id, qty, price, external_trade_id)
+				SELECT @order_id, @qty, @price, @external_trade_id
+				WHERE NOT EXISTS (SELECT 1 FROM dbo.Trades WHERE external_trade_id = @external_trade_id)
+				""", connection, transaction);
+			insert.Parameters.Add(new SqlParameter("@order_id", SqlDbType.BigInt) { Value = orderId });
+			insert.Parameters.Add(new SqlParameter("@qty", SqlDbType.Decimal) { Precision = 18, Scale = 4, Value = qty });
+			insert.Parameters.Add(new SqlParameter("@price", SqlDbType.Decimal) { Precision = 18, Scale = 4, Value = price });
+			insert.Parameters.Add(new SqlParameter("@external_trade_id", SqlDbType.BigInt) { Value = externalTradeId.Value });
+
+			rowsInserted = await insert.ExecuteNonQueryAsync(cancellationToken);
 		}
 
 		// Recompute the position from the persisted trade set exactly once, inside the same transaction.
-		// The service takes UPDLOCK/HOLDLOCK on the position row, so concurrent fills for the same
-		// position are serialized and the trade is applied once and only once (no double-count).
-		await _positionRecalculationService.ApplyTradeAsync(connection, transaction, orderId, cancellationToken);
+		// The service also takes UPDLOCK/HOLDLOCK on the position row (defense for standalone callers); here
+		// it runs uncontended because we already hold the per-position application lock. Skip the recompute
+		// when the INSERT was a duplicate no-op: the trade set is unchanged, so the position already
+		// reflects this fill and must not be applied again.
+		if (rowsInserted > 0)
+			await _positionRecalculationService.ApplyTradeAsync(connection, transaction, orderId, cancellationToken);
 
 		await transaction.CommitAsync(cancellationToken);
 	}
