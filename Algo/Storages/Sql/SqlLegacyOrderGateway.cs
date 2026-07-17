@@ -20,9 +20,10 @@ using StockSharp.Algo.Risk;
 ///   <item>rows are written with plain parameterised <c>INSERT ... RETURNING</c>
 ///   (no stored procedures, no T-SQL <c>OUTPUT</c> parameters);</item>
 ///   <item>position recomputation is delegated to
-///   <see cref="PositionRecalculationService"/> exactly once per inserted trade -
-///   the position-recalc database trigger was removed in the consolidation
-///   (see Database/003_Triggers.sql), so this single call is now the sole applier.</item>
+///   <see cref="PositionRecalculationService"/> exactly once per inserted trade, inside
+///   the SAME transaction as the trade insert - the position-recalc database trigger was
+///   removed in the consolidation (see Database/003_Triggers.sql), so this single call is
+///   now the sole applier.</item>
 /// </list>
 ///
 /// This is an adapter that sits <i>alongside</i> <see cref="IEntityRegistry"/>,
@@ -42,12 +43,12 @@ public class SqlLegacyOrderGateway
 	// The logic that used to live in dbo.usp_ValidatePreTradeRisk now lives here (AAP 0.1/0.6).
 	private readonly PreTradeRiskService _preTradeRisk = new();
 
-	// The gateway owns a single PositionRecalculationService and calls ApplyAsync exactly
-	// once per inserted trade (single-apply invariant, AAP 0.6.5). The service enforces that
-	// invariant DURABLY at the database level (it claims each trade_id in the processedtrades
-	// ledger inside its own transaction), so an accidental re-apply of the same trade is an
-	// idempotent no-op even across service instances, process restarts, or concurrent callers -
-	// not merely within one in-memory instance.
+	// The gateway owns a single PositionRecalculationService and calls ApplyAsync exactly once for each
+	// freshly-inserted trade, inside the SAME gateway-owned transaction as the trade INSERT (single-apply
+	// invariant, AAP 0.6.5). The authoritative guarantee is STRUCTURAL - one atomic transaction per trade
+	// with a fresh unique trade_id, so each committed trade is applied exactly once and a rolled-back
+	// attempt persists nothing - NOT a database ledger table; the service adds an in-process best-effort
+	// guard on top (see PositionRecalculationService). Constructed once and reused across calls.
 	private readonly PositionRecalculationService _positionRecalc = new();
 
 	/// <summary>
@@ -77,24 +78,20 @@ public class SqlLegacyOrderGateway
 		await using var connection = CreateConnection();
 		await connection.OpenAsync(cancellationToken);
 
-		// dbo. qualifier dropped: objects live in the public schema (unqualified).
-		await using (var select = new NpgsqlCommand("SELECT portfolio_id FROM portfolios WHERE name = @name", connection))
-		{
-			select.Parameters.Add(new NpgsqlParameter("name", NpgsqlDbType.Varchar) { Value = portfolio.Name });
+		// Atomic upsert-or-select (F7): a single INSERT ... ON CONFLICT (name) DO UPDATE ... RETURNING
+		// removes the former SELECT-then-INSERT race in which two concurrent callers could both miss the row
+		// and both attempt the INSERT (the second hitting UQ_Portfolios_name). DO UPDATE (a no-op touch of
+		// name) rather than DO NOTHING is used deliberately: DO NOTHING returns NO row on conflict, whereas
+		// DO UPDATE always yields the existing row via RETURNING. The conflict target (name) matches
+		// UQ_Portfolios_name. currency is not modeled on BusinessEntities.Portfolio, so an auto-created row
+		// lands on the column default ('USD'); dbo. qualifier dropped (objects live in the public schema).
+		await using var command = new NpgsqlCommand(
+			"INSERT INTO portfolios (name) VALUES (@name) " +
+			"ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name " +
+			"RETURNING portfolio_id", connection);
+		command.Parameters.Add(new NpgsqlParameter("name", NpgsqlDbType.Varchar) { Value = portfolio.Name });
 
-			if (await select.ExecuteScalarAsync(cancellationToken) is int existingId)
-				return existingId;
-		}
-
-		// currency isn't modeled on BusinessEntities.Portfolio the way it is on the
-		// portfolios table, so newly auto-created rows always land on the column
-		// default ('USD') regardless of what the security/portfolio actually trades in.
-		// T-SQL "OUTPUT INSERTED.portfolio_id" -> Postgres "RETURNING portfolio_id".
-		await using var insert = new NpgsqlCommand(
-			"INSERT INTO portfolios (name) VALUES (@name) RETURNING portfolio_id", connection);
-		insert.Parameters.Add(new NpgsqlParameter("name", NpgsqlDbType.Varchar) { Value = portfolio.Name });
-
-		return (int)await insert.ExecuteScalarAsync(cancellationToken);
+		return (int)await command.ExecuteScalarAsync(cancellationToken);
 	}
 
 	/// <summary>
@@ -111,27 +108,22 @@ public class SqlLegacyOrderGateway
 		await using var connection = CreateConnection();
 		await connection.OpenAsync(cancellationToken);
 
-		await using (var select = new NpgsqlCommand(
-			"""
-			SELECT security_id FROM securities
-			WHERE security_code = @code AND (board_code = @board OR (@board IS NULL AND board_code IS NULL))
-			""", connection))
-		{
-			select.Parameters.Add(new NpgsqlParameter("code", NpgsqlDbType.Varchar) { Value = security.Code });
-			select.Parameters.Add(new NpgsqlParameter("board", NpgsqlDbType.Varchar) { Value = (object)boardCode ?? DBNull.Value });
+		// Atomic upsert-or-select (F7): INSERT ... ON CONFLICT (security_code, board_code) DO UPDATE ...
+		// RETURNING removes the former SELECT-then-INSERT race. The conflict target matches
+		// UQ_Securities_code_board, declared UNIQUE NULLS NOT DISTINCT (Phase-2 schema fix) so a NULL
+		// board_code participates in the uniqueness check - reproducing the old
+		// "@board IS NULL AND board_code IS NULL" match and preventing duplicate (code, NULL board) rows.
+		// DO UPDATE (a no-op touch of security_code) guarantees a RETURNING row on an existing match, where
+		// DO NOTHING would return none. T-SQL "OUTPUT INSERTED.security_id" -> Postgres "RETURNING security_id".
+		await using var command = new NpgsqlCommand(
+			"INSERT INTO securities (security_code, board_code, security_type) VALUES (@code, @board, @type) " +
+			"ON CONFLICT (security_code, board_code) DO UPDATE SET security_code = EXCLUDED.security_code " +
+			"RETURNING security_id", connection);
+		command.Parameters.Add(new NpgsqlParameter("code", NpgsqlDbType.Varchar) { Value = security.Code });
+		command.Parameters.Add(new NpgsqlParameter("board", NpgsqlDbType.Varchar) { Value = (object)boardCode ?? DBNull.Value });
+		command.Parameters.Add(new NpgsqlParameter("type", NpgsqlDbType.Varchar) { Value = (object)security.Type?.ToString() ?? DBNull.Value });
 
-			if (await select.ExecuteScalarAsync(cancellationToken) is int existingId)
-				return existingId;
-		}
-
-		// T-SQL "OUTPUT INSERTED.security_id" -> Postgres "RETURNING security_id".
-		await using var insert = new NpgsqlCommand(
-			"INSERT INTO securities (security_code, board_code, security_type) VALUES (@code, @board, @type) RETURNING security_id", connection);
-		insert.Parameters.Add(new NpgsqlParameter("code", NpgsqlDbType.Varchar) { Value = security.Code });
-		insert.Parameters.Add(new NpgsqlParameter("board", NpgsqlDbType.Varchar) { Value = (object)boardCode ?? DBNull.Value });
-		insert.Parameters.Add(new NpgsqlParameter("type", NpgsqlDbType.Varchar) { Value = (object)security.Type?.ToString() ?? DBNull.Value });
-
-		return (int)await insert.ExecuteScalarAsync(cancellationToken);
+		return (int)await command.ExecuteScalarAsync(cancellationToken);
 	}
 
 	/// <summary>
@@ -144,7 +136,10 @@ public class SqlLegacyOrderGateway
 	/// now lives in the canonical C# <see cref="PreTradeRiskService"/> under Algo/Risk/, so this gateway
 	/// makes NO decision of its own: it delegates to the service and is a pure relay of the returned
 	/// { <see cref="SqlOrderSubmitResult.IsValid"/>, <see cref="SqlOrderSubmitResult.RejectReason"/> }.
-	/// Both accepted and rejected orders are still persisted (parity with the retired proc), so a
+	/// The validation reads and the order INSERT run in ONE transaction, serialized per-portfolio by a
+	/// transaction-scoped advisory lock, so a concurrent burst cannot slip orders past the rolling
+	/// frequency / daily-volume / position gate between the check and the INSERT (the read-then-write
+	/// TOCTOU). Both accepted and rejected orders are still persisted (parity with the retired proc), so a
 	/// rejected order continues to count toward the rolling order-frequency window. The public
 	/// signature is preserved for the demo and other callers; <paramref name="requestedBy"/> is
 	/// retained on the signature but is not persisted (the orders table has no such column - it was
@@ -155,80 +150,121 @@ public class SqlLegacyOrderGateway
 		int portfolioId, int securityId, Sides side, decimal volume, decimal? price, OrderTypes orderType,
 		long? externalTransactionId = null, string requestedBy = null, CancellationToken cancellationToken = default)
 	{
-		await using var connection = CreateConnection();
-		await connection.OpenAsync(cancellationToken);
-
-		// 'B'/'S' side sign carries over unchanged from the SQL side.
-		var sideCode = side == Sides.Buy ? "B" : "S";
-
-		// Business decision delegated to the canonical PreTradeRiskService (Algo/Risk). The old
-		// dbo.usp_SubmitOrder StoredProcedure call (which ran usp_ValidatePreTradeRisk internally) is
-		// retired; the gateway is now a pure relay of the service's decision. The already-open
-		// connection + token are passed through so the DB-state-aware gate can read
-		// risklimits/positions/orders/trades for the position, frequency and daily-volume checks.
-		var validation = await _preTradeRisk.ValidateAsync(connection, portfolioId, securityId, sideCode, volume, price, cancellationToken);
-		var status = validation.IsValid ? "ACCEPTED" : "REJECTED";
-
-		// StoredProcedure call replaced by service delegation + parameterized INSERT (business logic
-		// moved to Algo/Risk; usp_SubmitOrder/usp_ValidatePreTradeRisk retired). The LIMIT/MARKET
-		// order_type carries over unchanged. T-SQL "OUTPUT INSERTED.order_id" -> Postgres
-		// "RETURNING order_id".
-		await using var command = new NpgsqlCommand(
-			"""
-			INSERT INTO orders
-				(portfolio_id, security_id, side, qty, price, order_type, status, reject_reason, external_transaction_id, submitted_date)
-			VALUES
-				(@portfolio_id, @security_id, @side, @qty, @price, @order_type, @status, @reject_reason, @external_transaction_id, now() at time zone 'utc')
-			RETURNING order_id
-			""", connection);
-
-		command.Parameters.Add(new NpgsqlParameter("portfolio_id", NpgsqlDbType.Integer) { Value = portfolioId });
-		command.Parameters.Add(new NpgsqlParameter("security_id", NpgsqlDbType.Integer) { Value = securityId });
-		command.Parameters.Add(new NpgsqlParameter("side", NpgsqlDbType.Varchar) { Value = sideCode });
-		// qty / price are NUMERIC(18,4): bind as decimal (never double/float) so the schema's
-		// scale is preserved and no downstream >= comparison can silently loosen (AAP 0.6.4).
-		command.Parameters.Add(new NpgsqlParameter("qty", NpgsqlDbType.Numeric) { Value = volume });
-		command.Parameters.Add(new NpgsqlParameter("price", NpgsqlDbType.Numeric) { Value = (object)price ?? DBNull.Value });
-		command.Parameters.Add(new NpgsqlParameter("order_type", NpgsqlDbType.Varchar) { Value = MapOrderType(orderType) });
-		// both ACCEPTED and REJECTED orders are persisted (parity with usp_SubmitOrder; rejected
-		// orders still count toward the frequency window).
-		command.Parameters.Add(new NpgsqlParameter("status", NpgsqlDbType.Varchar) { Value = status });
-		command.Parameters.Add(new NpgsqlParameter("reject_reason", NpgsqlDbType.Varchar) { Value = (object)validation.RejectReason ?? DBNull.Value });
-		command.Parameters.Add(new NpgsqlParameter("external_transaction_id", NpgsqlDbType.Bigint) { Value = (object)externalTransactionId ?? DBNull.Value });
-		// submitted_date is written by the SQL expression now() at time zone 'utc' (== SYSUTCDATETIME(),
-		// the UTC time source, AAP 0.6.4); last_updated is left to its column DEFAULT. requestedBy is
-		// intentionally neither persisted nor forwarded to the risk gate (see the remarks above).
-
-		var orderId = (long)await command.ExecuteScalarAsync(cancellationToken);
-
-		// Pure relay of the service decision: IsValid/RejectReason come straight from the gate;
-		// OrderId from RETURNING.
-		return new()
+		// F23: exhaustive side mapping. An undefined Sides value is a programming error and must NOT silently
+		// fall through to "S" (the retired ternary treated everything that was not Buy as a sell, so a bad
+		// enum value would be recorded as a sell); reject it, mirroring MapOrderType's exhaustive switch.
+		var sideCode = side switch
 		{
-			OrderId = orderId,
-			IsValid = validation.IsValid,
-			RejectReason = validation.RejectReason,
+			Sides.Buy => "B",
+			Sides.Sell => "S",
+			_ => throw new ArgumentOutOfRangeException(nameof(side), side, "Order side must be Buy or Sell."),
 		};
+
+		// F1: run the DB-state-aware validation reads AND the order INSERT inside ONE gateway-owned
+		// transaction, serialized per-portfolio by a transaction-scoped advisory lock, so a concurrent burst
+		// cannot slip extra orders past the rolling frequency / daily-volume / position gate between a check
+		// and the INSERT (the former read-then-write TOCTOU). A bounded retry re-runs the whole unit if
+		// Postgres reports a transient serialization failure or deadlock; each failed attempt has fully rolled
+		// back, so no partial order row can leak and the retry re-reads fresh state.
+		const int maxAttempts = 3;
+
+		for (var attempt = 1; ; attempt++)
+		{
+			try
+			{
+				await using var connection = CreateConnection();
+				await connection.OpenAsync(cancellationToken);
+				await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+
+				// Per-portfolio serialization. Lock key (portfolio_id, 0): the 0 sentinel is disjoint from
+				// PositionRecalculationService's (portfolio_id, security_id) lock, whose security_id is always
+				// >= 1, so an order submission and a position apply never contend on the same advisory key.
+				using (var lockCommand = new NpgsqlCommand(
+					"SELECT pg_advisory_xact_lock(@portfolio_id, 0)", connection, transaction))
+				{
+					lockCommand.Parameters.Add(new NpgsqlParameter("portfolio_id", NpgsqlDbType.Integer) { Value = portfolioId });
+					await lockCommand.ExecuteNonQueryAsync(cancellationToken);
+				}
+
+				// Business decision delegated to the canonical PreTradeRiskService (Algo/Risk). It reads
+				// risklimits/positions/orders/trades on THIS connection + transaction so its view is
+				// consistent with, and serialized against, the INSERT below.
+				var validation = await _preTradeRisk.ValidateAsync(
+					connection, transaction, portfolioId, securityId, sideCode, volume, price, cancellationToken);
+				var status = validation.IsValid ? "ACCEPTED" : "REJECTED";
+
+				// Parameterized INSERT (StoredProcedure call retired; business logic moved to Algo/Risk). Both
+				// ACCEPTED and REJECTED orders are persisted (parity with usp_SubmitOrder; a rejected order
+				// still counts toward the frequency window). T-SQL "OUTPUT INSERTED.order_id" -> "RETURNING".
+				await using var command = new NpgsqlCommand(
+					"INSERT INTO orders " +
+					"(portfolio_id, security_id, side, qty, price, order_type, status, reject_reason, external_transaction_id, submitted_date) " +
+					"VALUES " +
+					"(@portfolio_id, @security_id, @side, @qty, @price, @order_type, @status, @reject_reason, @external_transaction_id, now() at time zone 'utc') " +
+					"RETURNING order_id", connection, transaction);
+
+				command.Parameters.Add(new NpgsqlParameter("portfolio_id", NpgsqlDbType.Integer) { Value = portfolioId });
+				command.Parameters.Add(new NpgsqlParameter("security_id", NpgsqlDbType.Integer) { Value = securityId });
+				command.Parameters.Add(new NpgsqlParameter("side", NpgsqlDbType.Varchar) { Value = sideCode });
+				// qty / price are NUMERIC(18,4): bind as decimal (never double/float) so the schema's
+				// scale is preserved and no downstream >= comparison can silently loosen (AAP 0.6.4).
+				command.Parameters.Add(new NpgsqlParameter("qty", NpgsqlDbType.Numeric) { Value = volume });
+				command.Parameters.Add(new NpgsqlParameter("price", NpgsqlDbType.Numeric) { Value = (object)price ?? DBNull.Value });
+				command.Parameters.Add(new NpgsqlParameter("order_type", NpgsqlDbType.Varchar) { Value = MapOrderType(orderType) });
+				command.Parameters.Add(new NpgsqlParameter("status", NpgsqlDbType.Varchar) { Value = status });
+				command.Parameters.Add(new NpgsqlParameter("reject_reason", NpgsqlDbType.Varchar) { Value = (object)validation.RejectReason ?? DBNull.Value });
+				command.Parameters.Add(new NpgsqlParameter("external_transaction_id", NpgsqlDbType.Bigint) { Value = (object)externalTransactionId ?? DBNull.Value });
+				// submitted_date is written by now() at time zone 'utc' (== SYSUTCDATETIME(), the UTC time
+				// source, AAP 0.6.4); last_updated is left to its column DEFAULT. requestedBy is intentionally
+				// neither persisted nor forwarded to the risk gate (see the remarks above).
+
+				var orderId = (long)await command.ExecuteScalarAsync(cancellationToken);
+
+				await transaction.CommitAsync(cancellationToken);
+
+				// Pure relay of the service decision: IsValid/RejectReason from the gate; OrderId from RETURNING.
+				return new()
+				{
+					OrderId = orderId,
+					IsValid = validation.IsValid,
+					RejectReason = validation.RejectReason,
+				};
+			}
+			catch (PostgresException ex) when (attempt < maxAttempts &&
+				(ex.SqlState == PostgresErrorCodes.SerializationFailure || ex.SqlState == PostgresErrorCodes.DeadlockDetected))
+			{
+				// Transient serialization failure / deadlock: the failed transaction has already rolled back
+				// (await using disposal), so no partial order row persists. Fall through to retry the whole
+				// validate+insert unit against fresh state; the final attempt lets the exception propagate.
+			}
+		}
 	}
 
 	/// <summary>
 	/// Records a fill against an order. Inserts into the trades table and then applies the
-	/// trade's effect to the position exactly once via <see cref="PositionRecalculationService"/>.
-	/// The old <c>trg_Trades_PositionRecalc</c> trigger that used to recompute the position in the
-	/// database was removed in the consolidation, so this explicit single call is now the sole
-	/// applier - callers must NOT apply the same trade a second time (AAP 0.6.5).
+	/// trade's effect to the position exactly once via <see cref="PositionRecalculationService"/>,
+	/// inside a single gateway-owned transaction so the trade row and the position update commit
+	/// together or not at all (atomicity, AAP 0.6.5). The old <c>trg_Trades_PositionRecalc</c> trigger
+	/// that used to recompute the position in the database was removed in the consolidation, so this
+	/// explicit single call is now the sole applier - callers must NOT apply the same trade a second time.
 	/// </summary>
 	public async Task RecordTradeAsync(long orderId, decimal qty, decimal price, CancellationToken cancellationToken = default)
 	{
 		await using var connection = CreateConnection();
 		await connection.OpenAsync(cancellationToken);
 
+		// Atomicity (F2, AAP 0.6.5): the trade INSERT and the position recompute run in ONE gateway-owned
+		// transaction, so a trade row can never be committed without its position effect (nor vice versa).
+		// The recalculation service enrols in this transaction - it neither begins nor commits it and takes
+		// its per-(portfolio, security) advisory lock on it - and the gateway commits once at the end.
+		await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+
 		// Insert the fill, capturing the generated trade id. executed_date via now() at time zone
 		// 'utc' (UTC time source, AAP 0.6.4). T-SQL "OUTPUT INSERTED.trade_id" -> Postgres
 		// "RETURNING trade_id" (was OUTPUT INSERTED / trigger-driven flow).
 		long tradeId;
 		await using (var insert = new NpgsqlCommand(
-			"INSERT INTO trades (order_id, qty, price, executed_date) VALUES (@order_id, @qty, @price, now() at time zone 'utc') RETURNING trade_id", connection))
+			"INSERT INTO trades (order_id, qty, price, executed_date) VALUES (@order_id, @qty, @price, now() at time zone 'utc') RETURNING trade_id", connection, transaction))
 		{
 			insert.Parameters.Add(new NpgsqlParameter("order_id", NpgsqlDbType.Bigint) { Value = orderId });
 			// qty / price are NUMERIC(18,4): bind as decimal (never double/float) - AAP 0.6.4.
@@ -239,10 +275,12 @@ public class SqlLegacyOrderGateway
 		}
 
 		// Single-apply invariant (AAP 0.6.5): the trg_Trades_PositionRecalc trigger was removed, so the
-		// gateway is the sole applier and calls the recalculation service exactly once per inserted trade.
-		// The service owns neither the connection nor a transaction (the gateway does), matching the
-		// transactional context the retired procedure ran in.
-		await _positionRecalc.ApplyAsync(connection, orderId, tradeId, qty, price, cancellationToken);
+		// gateway is the sole applier and calls the recalculation service exactly once for this freshly-
+		// inserted trade, on THIS connection + transaction. The service owns neither the connection nor the
+		// transaction (the gateway does), so the trade row and the position write form one atomic unit.
+		await _positionRecalc.ApplyAsync(connection, transaction, orderId, tradeId, qty, price, cancellationToken);
+
+		await transaction.CommitAsync(cancellationToken);
 	}
 
 	/// <summary>

@@ -39,23 +39,30 @@ public sealed class PreTradeRiskResult
 /// CancelOrders against the whole portfolio as messages flow through <see cref="RiskMessageAdapter"/>,
 /// and it never rejects the specific order that tripped it. This service is the opposite model - a
 /// classic pre-trade gate that blocks the single order before it is ever accepted. Both patterns are
-/// preserved; where a rule exists on both sides they now consume the SAME canonical definitions in
-/// <see cref="CanonicalRiskRules"/>, so they can no longer silently disagree (AAP 0.6.1/0.6.2).
+/// preserved. The genuinely shared definition is the rolling ORDER-FREQUENCY evaluator in
+/// <see cref="CanonicalRiskRules"/>, consumed by BOTH this gate and <see cref="RiskOrderFreqRule"/> -
+/// that is what removes their former divergence (AAP 0.6.1). This gate additionally applies the canonical
+/// enabled-limit / "meets or exceeds" ceiling convention from <see cref="CanonicalRiskRules"/>. The
+/// circuit-breaker price / quantity / position / commission rules are NOT rewritten: they keep their own
+/// threshold values and evaluate their own context-specific subjects (different by design, AAP 0.6.2), so
+/// this service does not claim to share those threshold definitions with them.
 /// </para>
 /// <para>
 /// Unlike the pure in-memory circuit-breaker rules, this gate is DATABASE-STATE-AWARE: it reads the
 /// most-specific <c>risklimits</c> row, the current <c>positions</c> row, recent and same-day
 /// <c>orders</c>, and (for a market order) the last <c>trades</c> price. It runs those reads on an
-/// ALREADY-OPEN connection supplied by the gateway and never opens, closes, disposes, or begins/commits
-/// a transaction on it - the gateway owns the connection and its transaction. Every accept/reject
-/// decision stays inside this service; the gateway is a pure relay of the returned
-/// <see cref="PreTradeRiskResult"/>.
+/// ALREADY-OPEN connection AND the in-flight transaction supplied by the gateway, so the validation
+/// observes the same snapshot as - and is serialized with - the caller's order INSERT; it never opens,
+/// closes, or disposes the connection and never begins, commits, or rolls back the transaction (the
+/// gateway owns both lifecycles). Every accept/reject decision stays inside this service; the gateway
+/// is a pure relay of the returned <see cref="PreTradeRiskResult"/>.
 /// </para>
 /// <para>
 /// All money / quantity / price arithmetic uses <see cref="decimal"/> (never <c>double</c>/<c>float</c>)
 /// to preserve the schema's <c>NUMERIC(18,4)</c> / <c>NUMERIC(9,6)</c> scale, so a "meets or exceeds"
-/// comparison can never silently loosen (hard NFR, AAP 0.6.4). The "&gt;=" rejection semantics and the
-/// "NULL limit = not enforced" convention are ported from the SQL procedure exactly.
+/// comparison can never silently loosen (hard NFR, AAP 0.6.4). The "&gt;=" rejection semantics are
+/// ported from the SQL procedure exactly; the "NULL-or-zero limit = not enforced" convention follows
+/// the frozen AAP (0.6.4), which unifies the null/zero meaning across the SQL and C# sides.
 /// </para>
 /// </remarks>
 public sealed class PreTradeRiskService
@@ -82,11 +89,17 @@ public sealed class PreTradeRiskService
 	/// Validates a single prospective order against every configured pre-trade ceiling and returns the
 	/// accept/reject outcome. A faithful C# port of the retired <c>dbo.usp_ValidatePreTradeRisk</c>
 	/// procedure: the seven checks run in the SAME order, each rejects immediately on the first breach,
-	/// and each uses the "&gt;=" meets-or-exceeds comparison with the "NULL = not enforced" convention.
+	/// and each uses the "&gt;=" meets-or-exceeds comparison with the "NULL-or-zero = not enforced" convention.
 	/// </summary>
 	/// <param name="connection">
 	/// An already-open <see cref="NpgsqlConnection"/> owned by the caller. This service never opens,
-	/// closes, disposes, or begins/commits a transaction on it.
+	/// closes, or disposes it.
+	/// </param>
+	/// <param name="transaction">
+	/// The caller's in-flight <see cref="NpgsqlTransaction"/> on <paramref name="connection"/>. Every read
+	/// this gate performs runs on it, so the validation observes the same snapshot as - and is serialized
+	/// with - the caller's subsequent order INSERT; this service NEVER begins, commits, or rolls it back
+	/// (the gateway owns that lifecycle).
 	/// </param>
 	/// <param name="portfolioId">The portfolio the order is submitted for (<c>orders.portfolio_id</c>).</param>
 	/// <param name="securityId">The security the order is for (<c>orders.security_id</c>).</param>
@@ -98,18 +111,19 @@ public sealed class PreTradeRiskService
 	/// <see cref="PreTradeRiskResult.Valid"/> when every configured check passes; otherwise a rejected
 	/// result carrying the reason for the first breached check.
 	/// </returns>
-	/// <exception cref="ArgumentNullException"><paramref name="connection"/> is <see langword="null"/>.</exception>
+	/// <exception cref="ArgumentNullException"><paramref name="connection"/> or <paramref name="transaction"/> is <see langword="null"/>.</exception>
 	// order_type and requested_by from the original SQL signature are intentionally OMITTED: order_type is
 	// unused by every check (market vs limit is detected by price == null), and requested_by was a descoped
 	// compliance tag the proc never read. Dropping them keeps this gate's contract to exactly what it uses.
 	//
 	// The assembly is [CLSCompliant(true)] (common_meta.props), but the Npgsql provider types are not
-	// CLS-compliant. Surfacing the gateway's open NpgsqlConnection here is intentional (this gate is
-	// database-state-aware and must run on the gateway's connection/transaction), so opt this member out of
-	// CLS checking, matching PositionRecalculationService.ApplyAsync and the repository convention.
+	// CLS-compliant. Surfacing the gateway's open NpgsqlConnection/NpgsqlTransaction here is intentional (this
+	// gate is database-state-aware and must run on the gateway's connection/transaction), so opt this member
+	// out of CLS checking, matching PositionRecalculationService.ApplyAsync and the repository convention.
 	[CLSCompliant(false)]
 	public async Task<PreTradeRiskResult> ValidateAsync(
 		NpgsqlConnection connection,
+		NpgsqlTransaction transaction,
 		int portfolioId,
 		int securityId,
 		string side,
@@ -119,6 +133,9 @@ public sealed class PreTradeRiskService
 	{
 		if (connection is null)
 			throw new ArgumentNullException(nameof(connection));
+
+		if (transaction is null)
+			throw new ArgumentNullException(nameof(transaction));
 
 		// One UTC instant for the whole validation (the SQL proc used a single SYSUTCDATETIME()).
 		// The Postgres columns are `timestamp WITHOUT time zone` holding UTC; Npgsql rejects a DateTime
@@ -165,7 +182,7 @@ public sealed class PreTradeRiskService
 			"effective_date DESC " +
 			"LIMIT 1";
 
-		using (var limitsCommand = new NpgsqlCommand(limitsSql, connection))
+		using (var limitsCommand = new NpgsqlCommand(limitsSql, connection, transaction))
 		{
 			limitsCommand.Parameters.Add(new NpgsqlParameter("portfolio_id", NpgsqlDbType.Integer) { Value = portfolioId });
 			limitsCommand.Parameters.Add(new NpgsqlParameter("security_id", NpgsqlDbType.Integer) { Value = securityId });
@@ -188,25 +205,32 @@ public sealed class PreTradeRiskService
 			}
 		}
 
-		// No configured ceilings at all => nothing to enforce (the same "unlimited" convention the C#
-		// RiskRule classes use for an unset threshold). This list matches the SQL guard EXACTLY: note that
-		// max_order_freq_window_sec and commission_rate are deliberately NOT part of it - a window or a rate
-		// alone enforces nothing without its paired count / total ceiling.
-		if (maxOrderPrice is null && maxOrderQty is null && maxOrderValue is null
-			&& maxPositionSize is null && maxDailyVolume is null
-			&& maxOrderFreqCount is null && maxCommissionTotal is null)
+		// No ENFORCED ceilings at all => nothing to check (a NULL or 0 limit means "unlimited", the AAP 0.6.4
+		// convention the C# RiskRule classes also use). Evaluated through the canonical enabled-limit predicates
+		// so this early-out uses the SAME null-or-zero-is-unlimited rule as the checks below (F3). Note that
+		// max_order_freq_window_sec and commission_rate are not tested on their own: a window or a rate alone
+		// enforces nothing without its paired ceiling (IsFrequencyEnabled requires BOTH count and window; the
+		// commission check requires max_commission_total).
+		if (!CanonicalRiskRules.IsCeilingEnabled(maxOrderPrice)
+			&& !CanonicalRiskRules.IsCeilingEnabled(maxOrderQty)
+			&& !CanonicalRiskRules.IsCeilingEnabled(maxOrderValue)
+			&& !CanonicalRiskRules.IsCeilingEnabled(maxPositionSize)
+			&& !CanonicalRiskRules.IsCeilingEnabled(maxDailyVolume)
+			&& !CanonicalRiskRules.IsFrequencyEnabled(maxOrderFreqCount, maxOrderFreqWindowSec)
+			&& !CanonicalRiskRules.IsCeilingEnabled(maxCommissionTotal))
 			return PreTradeRiskResult.Valid;
 
 		// --- 1. Order price ceiling (mirrors RiskOrderPriceRule; rejects when price >= limit) ---
 		// Uses the shared CanonicalRiskRules.MeetsOrExceeds so the gate and the circuit-breaker price rule
-		// apply the identical ">=" comparison. MeetsOrExceeds already embeds the "limit IS NOT NULL" guard,
-		// so a breach guarantees maxOrderPrice.HasValue.
+		// apply the identical ">=" comparison. MeetsOrExceeds embeds the canonical enabled-limit guard
+		// (present AND > 0, so NULL or 0 = unlimited), so a breach guarantees maxOrderPrice.HasValue.
 		if (price is not null && CanonicalRiskRules.MeetsOrExceeds(price.Value, maxOrderPrice))
 			return PreTradeRiskResult.Reject(
 				$"Order price {price.Value.To<string>()} meets/exceeds limit {maxOrderPrice.Value.To<string>()}");
 
 		// --- 2. Order qty ceiling (mirrors RiskOrderVolumeRule; rejects when qty >= limit) ---
-		if (maxOrderQty is not null && q >= maxOrderQty.Value)
+		// Canonical MeetsOrExceeds: NULL or 0 max_order_qty = unlimited; positive => ">=" rejects (F3).
+		if (CanonicalRiskRules.MeetsOrExceeds(q, maxOrderQty))
 			return PreTradeRiskResult.Reject(
 				$"Order qty {q.To<string>()} meets/exceeds limit {maxOrderQty.Value.To<string>()}");
 
@@ -214,47 +238,49 @@ public sealed class PreTradeRiskService
 		// Order notional value existed only in SQL; promoted to a first-class C# gate rule (AAP 0.6.2).
 		// RiskManager's circuit breaker does not enforce it, so this gate is now its only home. It is only
 		// meaningful when a price is supplied (a market order has no ex-ante notional), matching the SQL
-		// "@price IS NOT NULL". Product stays decimal so the >= comparison cannot silently loosen.
-		if (price is not null && maxOrderValue is not null && (q * price.Value) >= maxOrderValue.Value)
+		// "@price IS NOT NULL". Product stays decimal and the canonical MeetsOrExceeds (NULL or 0 = unlimited)
+		// keeps the ">=" comparison from silently loosening (F3).
+		if (price is not null && CanonicalRiskRules.MeetsOrExceeds(q * price.Value, maxOrderValue))
 			return PreTradeRiskResult.Reject(
 				$"Order value {(q * price.Value).To<string>()} meets/exceeds limit {maxOrderValue.Value.To<string>()}");
 
 		// --- 4. Order frequency (mirrors RiskOrderFreqRule) ---
-		if (maxOrderFreqCount is not null && maxOrderFreqWindowSec is not null)
+		// Canonical IsFrequencyEnabled: enforced only when BOTH count and window are present and > 0 (F3).
+		if (CanonicalRiskRules.IsFrequencyEnabled(maxOrderFreqCount, maxOrderFreqWindowSec))
 		{
 			var window = TimeSpan.FromSeconds(maxOrderFreqWindowSec.Value);
 			var cutoff = now - window; // Kind=Unspecified, matches the `timestamp` values Npgsql reads back.
 
-			// Pre-filter to the trailing window in SQL (index-friendly, and parity with the proc's WHERE
-			// submitted_date >= DATEADD(SECOND, -window, SYSUTCDATETIME())), then recount with the SAME
-			// canonical evaluator RiskOrderFreqRule now uses, so the gate and the circuit breaker can never
-			// disagree on a frequency decision (AAP 0.6.1). Rejected orders are ALSO persisted in `orders`, so
-			// they legitimately count toward frequency - matching the SQL COUNT(*); do not filter them out.
-			var recentTimes = new List<DateTime>();
+			// BOUNDED COUNT(*) of the orders already inside the trailing window - only the count crosses the
+			// wire, never the rows (F12). This is exact parity with the proc's
+			// "WHERE submitted_date >= DATEADD(SECOND, -window, SYSUTCDATETIME())": the inclusive lower bound
+			// is the same one CanonicalRiskRules.CountWithinWindow applies, so the count is identical to
+			// materialising the timestamps and counting them, without the unbounded fetch. Rejected orders are
+			// ALSO persisted in `orders`, so they legitimately count toward frequency - matching the SQL COUNT(*).
+			long recentCount;
 
 			using (var freqCommand = new NpgsqlCommand(
-				"SELECT submitted_date FROM orders WHERE portfolio_id = @portfolio_id AND submitted_date >= @cutoff", connection))
+				"SELECT COUNT(*) FROM orders WHERE portfolio_id = @portfolio_id AND submitted_date >= @cutoff", connection, transaction))
 			{
 				freqCommand.Parameters.Add(new NpgsqlParameter("portfolio_id", NpgsqlDbType.Integer) { Value = portfolioId });
 				freqCommand.Parameters.Add(new NpgsqlParameter("cutoff", NpgsqlDbType.Timestamp) { Value = cutoff });
 
-				await using var freqReader = await freqCommand.ExecuteReaderAsync(cancellationToken);
-
-				while (await freqReader.ReadAsync(cancellationToken))
-					recentTimes.Add(freqReader.GetDateTime(0));
+				// Postgres COUNT(*) is bigint -> long.
+				var scalar = await freqCommand.ExecuteScalarAsync(cancellationToken);
+				recentCount = scalar is long countValue ? countValue : Convert.ToInt64(scalar);
 			}
 
-			// recent + 1 >= max is exactly CanonicalRiskRules.IsOrderFrequencyBreached(recentTimes, now, window, max)
-			// and the SQL "@recentOrderCount + 1 >= @max_order_freq_count"; recent is computed explicitly here only
-			// so the reject message can report the prospective count.
-			var recent = CanonicalRiskRules.CountWithinWindow(recentTimes, now, window);
-			if (recent + 1 >= maxOrderFreqCount.Value)
+			// recentCount + 1 >= max is the exact SQL "@recentOrderCount + 1 >= @max_order_freq_count", routed
+			// through the shared bounded-count canonical evaluator so the gate and RiskOrderFreqRule can never
+			// disagree on a frequency decision (AAP 0.6.1). The "+1" accounts for the prospective order.
+			if (CanonicalRiskRules.IsOrderFrequencyBreached(recentCount, maxOrderFreqCount.Value))
 				return PreTradeRiskResult.Reject(
-					$"Order frequency {(recent + 1).To<string>()} in {maxOrderFreqWindowSec.Value.To<string>()}s meets/exceeds limit {maxOrderFreqCount.Value.To<string>()}");
+					$"Order frequency {(recentCount + 1).To<string>()} in {maxOrderFreqWindowSec.Value.To<string>()}s meets/exceeds limit {maxOrderFreqCount.Value.To<string>()}");
 		}
 
 		// --- 5. Resulting position size ceiling (shares RiskPositionSizeRule's threshold) ---
-		if (maxPositionSize is not null)
+		// Canonical IsCeilingEnabled: NULL or 0 max_position_size = unlimited (F3).
+		if (CanonicalRiskRules.IsCeilingEnabled(maxPositionSize))
 		{
 			// GATE subject is the HYPOTHETICAL post-fill position (current qty + signed order qty). This differs
 			// from RiskPositionSizeRule, which checks the CURRENT position from PositionChangeMessage.CurrentValue.
@@ -263,7 +289,7 @@ public sealed class PreTradeRiskService
 			var currentQty = 0m;
 
 			using (var positionCommand = new NpgsqlCommand(
-				"SELECT qty FROM positions WHERE portfolio_id = @portfolio_id AND security_id = @security_id", connection))
+				"SELECT qty FROM positions WHERE portfolio_id = @portfolio_id AND security_id = @security_id", connection, transaction))
 			{
 				positionCommand.Parameters.Add(new NpgsqlParameter("portfolio_id", NpgsqlDbType.Integer) { Value = portfolioId });
 				positionCommand.Parameters.Add(new NpgsqlParameter("security_id", NpgsqlDbType.Integer) { Value = securityId });
@@ -275,13 +301,15 @@ public sealed class PreTradeRiskService
 			var signedDelta = side == "B" ? q : -q; // 'B' adds, 'S' subtracts (SQL side sign).
 			var resulting = currentQty + signedDelta;
 
-			if (Math.Abs(resulting) >= maxPositionSize.Value)
+			// MeetsOrExceeds embeds the enabled-limit guard, so maxPositionSize.HasValue holds inside the breach.
+			if (CanonicalRiskRules.MeetsOrExceeds(Math.Abs(resulting), maxPositionSize))
 				return PreTradeRiskResult.Reject(
 					$"Resulting position {resulting.To<string>()} meets/exceeds limit {maxPositionSize.Value.To<string>()}");
 		}
 
 		// --- 6. Cumulative commission ceiling (pre-fill ESTIMATE) ---
-		if (maxCommissionTotal is not null)
+		// Canonical IsCeilingEnabled: NULL or 0 max_commission_total = unlimited (F3).
+		if (CanonicalRiskRules.IsCeilingEnabled(maxCommissionTotal))
 		{
 			// This is a pre-fill ESTIMATE (a forecast). It is intentionally NOT merged with the circuit breaker's
 			// realized-commission rules (RiskCommissionRule / RiskOrderCommissionRule / RiskTransactionCommissionRule),
@@ -295,7 +323,7 @@ public sealed class PreTradeRiskService
 				// Market order: best-effort last traded price for the security (may stay null if it never traded).
 				using var lastTradeCommand = new NpgsqlCommand(
 					"SELECT t.price FROM trades t JOIN orders o ON o.order_id = t.order_id " +
-					"WHERE o.security_id = @security_id ORDER BY t.executed_date DESC LIMIT 1", connection);
+					"WHERE o.security_id = @security_id ORDER BY t.executed_date DESC LIMIT 1", connection, transaction);
 				lastTradeCommand.Parameters.Add(new NpgsqlParameter("security_id", NpgsqlDbType.Integer) { Value = securityId });
 
 				var lastPriceResult = await lastTradeCommand.ExecuteScalarAsync(cancellationToken);
@@ -303,12 +331,15 @@ public sealed class PreTradeRiskService
 					estPrice = lastPrice;
 			}
 
-			// Existing notional over this portfolio's trades; SUM is NULL when there are none => 0 (SQL ISNULL parity).
+			// Existing gross notional over this portfolio, read as a BOUNDED rollup: SUM(cumulative_gross_notional)
+			// over the portfolio's positions rows (at most one per security) instead of re-summing every historical
+			// trade row (F13). PositionRecalculationService maintains cumulative_gross_notional as SUM(qty*price)
+			// per (portfolio, security) under the single-apply invariant, so this equals the retired unbounded
+			// SUM(t.qty*t.price) over the portfolio's trades exactly. SUM is NULL when there are no positions => 0.
 			var existingNotional = 0m;
 
 			using (var notionalCommand = new NpgsqlCommand(
-				"SELECT SUM(t.qty * t.price) FROM trades t JOIN orders o ON o.order_id = t.order_id " +
-				"WHERE o.portfolio_id = @portfolio_id", connection))
+				"SELECT SUM(cumulative_gross_notional) FROM positions WHERE portfolio_id = @portfolio_id", connection, transaction))
 			{
 				notionalCommand.Parameters.Add(new NpgsqlParameter("portfolio_id", NpgsqlDbType.Integer) { Value = portfolioId });
 				existingNotional = await ExecuteDecimalScalarAsync(notionalCommand, 0m, cancellationToken);
@@ -317,13 +348,14 @@ public sealed class PreTradeRiskService
 			// Estimated cumulative commission = existing notional * rate + prospective notional * rate. All decimal;
 			// ISNULL(@estPrice, 0) parity via (estPrice ?? 0m) so a market order with no last trade contributes 0.
 			var est = existingNotional * rate + q * (estPrice ?? 0m) * rate;
-			if (est >= maxCommissionTotal.Value)
+			if (CanonicalRiskRules.MeetsOrExceeds(est, maxCommissionTotal))
 				return PreTradeRiskResult.Reject(
 					$"Estimated cumulative commission {est.To<string>()} meets/exceeds limit {maxCommissionTotal.Value.To<string>()}");
 		}
 
 		// --- 7. Daily traded volume ceiling ---
-		if (maxDailyVolume is not null)
+		// Canonical IsCeilingEnabled: NULL or 0 max_daily_volume = unlimited (F3).
+		if (CanonicalRiskRules.IsCeilingEnabled(maxDailyVolume))
 		{
 			// Daily traded volume existed only in SQL; promoted to a first-class C# gate rule. The half-open
 			// [dayStart, dayEnd) range reproduces CAST(submitted_date AS DATE) = CAST(SYSUTCDATETIME() AS DATE)
@@ -336,7 +368,7 @@ public sealed class PreTradeRiskService
 				"SELECT SUM(qty) FROM orders " +
 				"WHERE portfolio_id = @portfolio_id AND security_id = @security_id " +
 				"AND status IN ('ACCEPTED','FILLED','PARTFILLED') " +
-				"AND submitted_date >= @day_start AND submitted_date < @day_end", connection))
+				"AND submitted_date >= @day_start AND submitted_date < @day_end", connection, transaction))
 			{
 				dailyCommand.Parameters.Add(new NpgsqlParameter("portfolio_id", NpgsqlDbType.Integer) { Value = portfolioId });
 				dailyCommand.Parameters.Add(new NpgsqlParameter("security_id", NpgsqlDbType.Integer) { Value = securityId });
@@ -346,7 +378,7 @@ public sealed class PreTradeRiskService
 				todayQty = await ExecuteDecimalScalarAsync(dailyCommand, 0m, cancellationToken);
 			}
 
-			if (todayQty + q >= maxDailyVolume.Value)
+			if (CanonicalRiskRules.MeetsOrExceeds(todayQty + q, maxDailyVolume))
 				return PreTradeRiskResult.Reject(
 					$"Daily volume {(todayQty + q).To<string>()} meets/exceeds limit {maxDailyVolume.Value.To<string>()}");
 		}

@@ -4,20 +4,22 @@ namespace StockSharp.Algo.Risk;
 /// The risks control manager.
 /// </summary>
 /// <remarks>
-/// Business risk logic now has a single canonical C# home. The shared thresholds and
-/// the rolling-window order-frequency evaluator live in <see cref="CanonicalRiskRules"/>,
-/// and the per-order accept/reject gate lives in <see cref="PreTradeRiskService"/> (which
-/// re-expresses the retired usp_ValidatePreTradeRisk in C#). This class remains the
-/// portfolio-wide circuit breaker: a triggered rule takes a global action
-/// (ClosePositions/StopTrading/CancelOrders via <see cref="RiskMessageAdapter"/>) rather
-/// than rejecting the one order that tripped it, whereas <see cref="PreTradeRiskService"/>
-/// is the classic per-order gate that rejects a single order before it is accepted (and it
-/// also enforces the order-notional-value and daily-traded-volume limits that used to exist
-/// only on the SQL side). Where a rule exists on both sides - order frequency being the
-/// prime example - the circuit-breaker rule (<see cref="RiskOrderFreqRule"/>) and the gate
-/// now consume the SAME canonical definitions in <see cref="CanonicalRiskRules"/>, so the
-/// two can no longer silently diverge. See /LEGACY_LAYER.md at the repo root for the full
-/// merged-versus-preserved rule table.
+/// Business risk logic now has a single canonical C# home. The rolling-window order-frequency
+/// evaluator and the gate's numeric-ceiling comparison convention live in
+/// <see cref="CanonicalRiskRules"/> (the per-check limit values themselves are NOT stored there -
+/// the gate reads them from the applicable RiskLimits row at evaluation time), and the per-order
+/// accept/reject gate lives in <see cref="PreTradeRiskService"/> (which re-expresses the retired
+/// usp_ValidatePreTradeRisk in C#). This class remains the portfolio-wide circuit breaker: a
+/// triggered rule takes a global action (ClosePositions/StopTrading/CancelOrders via
+/// <see cref="RiskMessageAdapter"/>) rather than rejecting the one order that tripped it, whereas
+/// <see cref="PreTradeRiskService"/> is the classic per-order gate that rejects a single order
+/// before it is accepted (and it also enforces the order-notional-value and daily-traded-volume
+/// limits that used to exist only on the SQL side). Where a rule exists on both sides - order
+/// frequency being the prime example - the circuit-breaker rule (<see cref="RiskOrderFreqRule"/>)
+/// and the gate now consume the SAME canonical frequency evaluator in
+/// <see cref="CanonicalRiskRules"/>, so the two can no longer silently diverge. Rules that exist
+/// on both sides but evaluate different subjects (for example commission and position size) are
+/// preserved on each side by design rather than merged.
 /// </remarks>
 public class RiskManager : BaseLogReceiver, IRiskManager
 {

@@ -63,7 +63,13 @@ CREATE TABLE Securities
     security_type   VARCHAR(20)   NULL,       -- Stock/Future/Option/...
 
     CONSTRAINT PK_Securities PRIMARY KEY (security_id),
-    CONSTRAINT UQ_Securities_code_board UNIQUE (security_code, board_code)
+    -- NULLS NOT DISTINCT (PostgreSQL 15+): treat NULL board_code values as EQUAL so a
+    -- second (security_code, NULL) row is rejected. PostgreSQL's default treats NULLs as
+    -- DISTINCT (which would allow duplicate (AAPL, NULL) rows); SQL Server's UNIQUE treats
+    -- NULLs as equal, so this preserves the original single-NULL-per-code semantics and lets
+    -- the gateway's INSERT ... ON CONFLICT (security_code, board_code) upsert match rows that
+    -- have a NULL board_code.
+    CONSTRAINT UQ_Securities_code_board UNIQUE NULLS NOT DISTINCT (security_code, board_code)
 );
 
 -- ============================================================================
@@ -182,6 +188,18 @@ CREATE INDEX IX_Trades_executed_date ON Trades (executed_date);
 -- service (like the old logic before it) does not have access to. It's
 -- refreshed separately by the EOD mark-to-market batch (outside the scope of
 -- this brief). Treat this column as stale/EOD-only, not real-time.
+--
+-- cumulative_gross_notional is a maintained transactional ROLLUP of every trade's
+-- gross notional (abs(qty) * price) applied to this (portfolio, security) position.
+-- PositionRecalculationService.ApplyAsync increments it by the trade's gross notional
+-- in the SAME atomic transaction as the qty/avg_price write, so it stays exact. The
+-- PreTradeRiskService commission gate then reads a BOUNDED aggregate -
+-- SUM(cumulative_gross_notional) over a portfolio's Positions rows (bounded by the
+-- number of traded securities) - instead of re-summing the entire Trades history on
+-- every order. The rollup equals the historical SUM(trades.qty * trades.price) because
+-- each trade contributes its notional exactly once (single-apply invariant, AAP 0.6.5).
+-- This is a column on an EXISTING table, so the schema stays at seven pure-storage
+-- tables; it holds no business logic (the C# service owns the arithmetic).
 -- ============================================================================
 CREATE TABLE Positions
 (
@@ -192,37 +210,14 @@ CREATE TABLE Positions
     avg_price        NUMERIC(18,4)   NOT NULL DEFAULT 0,
     realized_pnl     NUMERIC(18,4)   NOT NULL DEFAULT 0,
     unrealized_pnl   NUMERIC(18,4)   NOT NULL DEFAULT 0,
+    -- maintained rollup of applied gross notional (abs(qty)*price); see header note
+    cumulative_gross_notional  NUMERIC(18,4)  NOT NULL DEFAULT 0,
     updated_date     TIMESTAMP       NOT NULL DEFAULT (now() at time zone 'utc'),
 
     CONSTRAINT PK_Positions PRIMARY KEY (position_id),
     CONSTRAINT FK_Positions_Portfolios FOREIGN KEY (portfolio_id) REFERENCES Portfolios (portfolio_id),
     CONSTRAINT FK_Positions_Securities FOREIGN KEY (security_id) REFERENCES Securities (security_id),
     CONSTRAINT UQ_Positions_portfolio_security UNIQUE (portfolio_id, security_id)
-);
-
--- ============================================================================
--- ProcessedTrades
---
--- Durable, cross-process single-apply ledger for the C# PositionRecalculationService
--- (AAP 0.6.5). The position-recalc trigger was removed, so that service is the sole
--- applier of a trade's effect on a Position; it claims a trade_id here (INSERT ...
--- ON CONFLICT (trade_id) DO NOTHING) inside the SAME transaction as the position
--- write, so re-applying the same trade - from a second service instance, a process
--- restart, or a concurrent call - is an idempotent no-op at the DATABASE level rather
--- than relying on process-local memory. The PRIMARY KEY on trade_id is what enforces
--- that uniqueness. This is still PURE STORAGE (a uniqueness/audit ledger): it holds no
--- business logic. There is deliberately NO FK to Trades - the guard is keyed purely on
--- the trade_id value, so the applier stays decoupled from the Trades row lifecycle (and
--- so parity tests can drive it with synthetic trade ids that have no Trades row).
--- ============================================================================
-CREATE TABLE ProcessedTrades
-(
-    trade_id       BIGINT        NOT NULL,   -- the applied trade's id (single-apply key)
-    -- UTC instant the trade's position effect was applied; same now() at time zone 'utc'
-    -- UTC time source and naive-TIMESTAMP convention as every other timestamp here.
-    applied_date   TIMESTAMP     NOT NULL DEFAULT (now() at time zone 'utc'),
-
-    CONSTRAINT PK_ProcessedTrades PRIMARY KEY (trade_id)
 );
 
 -- ============================================================================

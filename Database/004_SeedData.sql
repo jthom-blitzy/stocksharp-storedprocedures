@@ -2,8 +2,11 @@
 	StockSharpLegacy - seed data
 	----------------------------------------
 	Minimal reference data so the schema and the C# demo are exercisable
-	without wiring up the full C# app first. Safe to re-run: guarded by
-	existence checks against the unique keys.
+	without wiring up the full C# app first. Safe to re-run (idempotent):
+	Portfolios and Securities are guarded by ON CONFLICT against their unique
+	keys (UQ_Portfolios_name, UQ_Securities_code_board), while RiskLimits has
+	no unique key on (portfolio_id, security_id) and is instead guarded by an
+	explicit NOT EXISTS check (see each INSERT below).
 */
 
 -- Portfolios has a unique key on name (UQ_Portfolios_name), so ON CONFLICT

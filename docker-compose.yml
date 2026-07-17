@@ -19,10 +19,15 @@
 # lets `app` reach `db` by its service name over DNS. No pgadmin, no secrets
 # manager, nothing AWS-specific.
 #
-# Canonical dev-only credentials — shared verbatim with
-# Algo/Storages/Sql/SqlLegacyConnection.cs and the demo narrative:
-#   user=postgres  password=postgres  database=stocksharp  host(service)=db
-# These are LOCAL DEVELOPMENT credentials only; they are deliberately not secret.
+# Dev-only credentials (LOCAL DEVELOPMENT stand-in for the AWS model; deliberately
+# NOT secret). Following least-privilege (finding F17) there are TWO distinct roles:
+#   * postgres / postgres — the bootstrap SUPERUSER. Used ONLY to initialize the
+#     cluster (the Database/*.sql init scripts) and by the healthcheck below; it is
+#     NOT used by the application.
+#   * app_user / app_pw   — a NON-superuser login with DML-only rights on the seven
+#     tables, provisioned by Database/005_AppRole.sql. The `app` service connects as
+#     THIS role, so the demo never runs with cluster-superuser privileges.
+# database=stocksharp   host(service)=db
 # =============================================================================
 
 services:
@@ -36,8 +41,10 @@ services:
     # POSTGRES_DB makes the entrypoint CREATE the `stocksharp` database on first
     # init — this replaces the old T-SQL `CREATE DATABASE` guard, so the SQL
     # init scripts neither create nor switch databases. POSTGRES_USER / _PASSWORD
-    # set the superuser the app (and the healthcheck) authenticate with. The
-    # list form (- KEY=value) is used throughout so YAML never coerces a value.
+    # set the bootstrap SUPERUSER used to run the init scripts and by the
+    # healthcheck; the application authenticates as the least-privilege app_user
+    # role instead (see Database/005_AppRole.sql and the `app` service). The list
+    # form (- KEY=value) is used throughout so YAML never coerces a value.
     environment:
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=postgres
@@ -48,7 +55,8 @@ services:
       # The official postgres image auto-executes *.sql / *.sh files placed here
       # in ALPHABETICAL order, on FIRST initialization only (empty data dir).
       # With 002_StoredProcedures.sql retired, the effective order is:
-      #     001_Schema.sql -> 003_Triggers.sql -> 004_SeedData.sql
+      #     001_Schema.sql -> 003_Triggers.sql -> 004_SeedData.sql -> 005_AppRole.sql
+      # (005 provisions the least-privilege app_user AFTER the schema/seed exist.)
       # The 002 numbering gap is harmless, and the non-*.sql Database/README.md
       # is ignored by the init runner. `:ro` keeps the host scripts read-only.
       - ./Database:/docker-entrypoint-initdb.d:ro
@@ -57,10 +65,14 @@ services:
       # `docker compose down -v` to force a clean re-initialization.
       - pgdata:/var/lib/postgresql/data
 
-    # Expose the standard PostgreSQL port on the host for convenience (psql / GUI
-    # clients), mirroring the port the previous README documented.
+    # Publish PostgreSQL on the host for convenience (psql / GUI clients), but bind
+    # ONLY to the loopback interface 127.0.0.1 (finding F17). The bare "5432:5432"
+    # form binds 0.0.0.0 — every host interface — which would expose the database
+    # (and its dev-only superuser) to the local network; "127.0.0.1:5432:5432"
+    # restricts it to this machine. The `app` service does NOT use this published
+    # port: it reaches the database over the Compose network by the service name `db`.
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
 
     # Healthcheck — CRITICAL: it gates the `app` service (below) through
     # depends_on: condition: service_healthy, and MUST only report healthy once
@@ -108,10 +120,22 @@ services:
     # variable name STOCKSHARP_LEGACY_SQL_CONNECTION is RETAINED across the SQL
     # Server -> PostgreSQL migration (AAP 0.7.2 minimal-change decision) and is
     # exactly the variable SqlLegacyConnection.Resolve() reads. `Host=db` resolves
-    # to this service via Compose DNS; the credentials match the db service above.
+    # to this service via Compose DNS.
+    #
+    # Username/Password use the least-privilege app_user role (finding F17), NOT the
+    # cluster superuser — the demo only performs DML on the seven tables, all of which
+    # app_user is granted by Database/005_AppRole.sql.
+    #
+    # "GSS Encryption Mode=Disable" (finding F19): Npgsql 10 defaults GssEncryptionMode
+    # to Prefer, so on this Kerberos-less Linux runtime image it would probe for
+    # libgssapi_krb5.so.2 on every connection — emitting a noisy (though harmless)
+    # stderr error and risking connection hangs. Disabling GSS for this local,
+    # password-authenticated stack removes the probe entirely; no Kerberos library is
+    # installed in the runtime image by design (see Dockerfile).
+    #
     # Quoted because the value contains '=' and ';'.
     environment:
-      - "STOCKSHARP_LEGACY_SQL_CONNECTION=Host=db;Port=5432;Database=stocksharp;Username=postgres;Password=postgres"
+      - "STOCKSHARP_LEGACY_SQL_CONNECTION=Host=db;Port=5432;Database=stocksharp;Username=app_user;Password=app_pw;GSS Encryption Mode=Disable"
 
     # No `restart:` policy (defaults to `no`): the demo is a one-shot walkthrough
     # that prints its three scenarios and exits. Auto-restarting would loop it

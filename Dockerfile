@@ -71,7 +71,28 @@ WORKDIR /app
 # app DLL plus its managed dependencies, including Npgsql.dll). The SDK, the
 # sources, and the NuGet caches stay behind in the build stage, keeping the
 # runtime image small.
-COPY --from=build /app/publish .
+#
+# --chown=app:app makes the copied files owned by the non-root `app` user we drop
+# to below (finding F18), so they stay readable/executable after the privilege
+# drop. (Publish output is world-readable by default; the explicit chown makes the
+# ownership unambiguous rather than relying on that default.)
+COPY --from=build --chown=app:app /app/publish .
+
+# F18 — run as the built-in NON-root `app` user (uid/gid 1654) that the official
+# mcr.microsoft.com/dotnet/runtime image ships, instead of the default root. The
+# demo is an outbound PostgreSQL client that writes nothing to the image
+# filesystem, so it needs no elevated privileges; dropping to `app` follows
+# least-privilege container practice. Declared AFTER the COPY so the copy runs as
+# root and the files are chowned to `app` for the runtime user.
+USER app
+
+# F19 — no Kerberos/GSSAPI library is installed in this runtime image ON PURPOSE.
+# Npgsql 10 defaults GssEncryptionMode to Prefer and would otherwise try to load
+# libgssapi_krb5.so.2 on every connection (absent from the Kerberos-less .NET Linux
+# images), emitting a harmless-but-noisy stderr error and risking connection hangs.
+# The connection string supplied by docker-compose.yml — and the SqlLegacyConnection
+# host fallback — set "GSS Encryption Mode=Disable", which stops the probe at the
+# source, so adding a Kerberos runtime dependency here is unnecessary.
 
 # Run the published console assembly via the portable host (`dotnet <dll>`), so
 # the entry point is independent of the native apphost.
