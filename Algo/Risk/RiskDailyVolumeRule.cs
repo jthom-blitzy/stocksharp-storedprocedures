@@ -20,15 +20,21 @@ namespace StockSharp.Algo.Risk;
 /// <list type="bullet">
 /// <item><b>Partitioned</b> by (portfolio, security) rather than a single global counter, so one
 /// instrument's flow cannot mask or inflate another's.</item>
-/// <item><b>Keyed to the UTC calendar day</b> (matching the gate); crossing to a newer UTC day
-/// clears the prior day's totals, and a stale message from an already-closed earlier day is not
-/// accumulated (the gate remains authoritative for past days). The active day is <b>bounded by the
-/// wall-clock UTC day</b>: a future-dated message (whether adversarial or from clock skew) is clamped
-/// to today and can never advance the active day into the future, so it cannot erase the current
-/// day's accumulated totals and silently disable enforcement (review finding CR-3).</item>
+/// <item><b>Keyed to the trusted-clock UTC calendar day</b> (matching the gate, which scopes its
+/// query by the server's current UTC day): the accumulation day is taken from the trusted processing
+/// clock (<see cref="UtcNow"/>), <b>not</b> from the caller-supplied <see cref="Message.LocalTime"/>.
+/// Every message processed "now" counts against "now"'s bucket; crossing to a newer UTC day clears the
+/// prior day's totals. Because a skewed, stale, or default timestamp can no longer choose the bucket,
+/// it can neither be back-dated to an already-closed day to dodge accumulation nor forward-dated to
+/// erase the current day's totals and silently disable enforcement (review findings CR-28 / CWE-20 /
+/// CWE-367). This trusted-clock bucketing subsumes the earlier future-day clamp (CR-3). The clock is
+/// injectable purely as a deterministic test seam (review finding CR-24).</item>
+/// <item><b>Normalized to the canonical DECIMAL(18,4) scale</b>: each submitted volume is normalized
+/// via <see cref="RiskLimitSet.NormalizeMoneySaturating"/> before accumulation, so the in-stream
+/// counter is never less strict than the gate at sub-scale boundaries (review finding CR-27).</item>
 /// <item><b>Deterministic and synchronized</b>: accumulation is guarded by a lock, non-positive
-/// (malformed) volumes contribute nothing, and the running total is accumulated with overflow-safe
-/// (saturating) arithmetic.</item>
+/// (malformed or sub-scale) volumes contribute nothing, and the running total is accumulated with
+/// overflow-safe (saturating) arithmetic.</item>
 /// </list>
 /// Because a replace message is counted as additional submitted volume, this in-stream counter is
 /// conservative (it can trip earlier, never later, than the persisted gate) — consistent with the
@@ -47,7 +53,11 @@ public class RiskDailyVolumeRule : RiskRule
 	// Running submitted-volume totals partitioned by (portfolio, security) for the current UTC day.
 	private readonly Dictionary<(string Portfolio, string Security), decimal> _dailyTotals = [];
 	private readonly object _sync = new();
+
+	// The trusted-clock UTC day the partitioned totals currently belong to.
 	private DateTime? _currentUtcDay;
+
+	private Func<DateTime> _utcNow = static () => DateTime.UtcNow;
 
 	/// <summary>
 	/// Daily volume.
@@ -74,17 +84,24 @@ public class RiskDailyVolumeRule : RiskRule
 		}
 	}
 
+	/// <summary>
+	/// The trusted UTC processing clock used to determine the current calendar day. Defaults to
+	/// <see cref="DateTime.UtcNow"/> - the server/processing clock, mirroring the SQL gate scoping its
+	/// daily-volume query by the server's current UTC day - so a caller-supplied, stale, skewed, or
+	/// default <see cref="Message.LocalTime"/> can no longer choose the accumulation bucket and thereby
+	/// dodge the daily cap by back-dating (review findings CR-28 / CWE-20 / CWE-367, and CR-24 for the
+	/// deterministic test seam). Exposed only as an injectable test seam; it is never persisted (see
+	/// <see cref="Save"/>/<see cref="Load"/>) and is hidden from the UI. Never null.
+	/// </summary>
+	[Browsable(false)]
+	public Func<DateTime> UtcNow
+	{
+		get => _utcNow;
+		set => _utcNow = value ?? throw new ArgumentNullException(nameof(value));
+	}
+
 	/// <inheritdoc />
 	protected override string GetTitle() => _volume.To<string>();
-
-	/// <summary>
-	/// Normalize a message timestamp to its UTC calendar day, matching the gate's UTC-day scope.
-	/// A <see cref="DateTimeKind.Local"/> value is converted to UTC; <see cref="DateTimeKind.Utc"/>
-	/// and <see cref="DateTimeKind.Unspecified"/> values (the platform stamps these timestamps in
-	/// UTC) are used as-is.
-	/// </summary>
-	private static DateTime ToUtcDay(DateTime time)
-		=> (time.Kind == DateTimeKind.Local ? time.ToUniversalTime() : time).Date;
 
 	/// <inheritdoc />
 	public override bool ProcessMessage(Message message)
@@ -109,40 +126,38 @@ public class RiskDailyVolumeRule : RiskRule
 		if (limit <= 0)
 			return false;
 
-		var orderVolume = order.Volume;
+		// Normalize the submitted volume to the canonical DECIMAL(18,4) persistence scale (review
+		// finding CR-27) before accumulating, so the in-stream counter cannot be made less strict than
+		// the gate at sub-scale boundaries: a value such as 0.00004 that rounds up to 0.0001 at the gate
+		// accumulates as 0.0001 here too. Saturating (rather than throwing) keeps a single malformed
+		// message from tearing down the whole message pipeline mid-stream.
+		var orderVolume = RiskLimitSet.NormalizeMoneySaturating(order.Volume);
 
-		// Non-positive (malformed) volume carries no exposure and is not accumulated.
+		// Non-positive (malformed, or sub-scale rounding to zero) volume carries no exposure.
 		if (orderVolume <= 0)
 			return false;
 
-		var utcDay = ToUtcDay(message.LocalTime);
 		var key = (order.PortfolioName ?? string.Empty, order.SecurityId.ToString());
 
-		// Bound the message's day by the wall-clock UTC day (review finding CR-3). A future-dated
-		// message - whether adversarial or the result of clock skew - must never be able to advance
-		// the active day into the future, because doing so would clear the current day's totals and
-		// then make every real current-day message look "stale" (day < _currentUtcDay), silently
-		// disabling enforcement until the wall clock caught up. Clamping the effective day to today
-		// keeps such a message accumulating against the current day (fail-safe/conservative) instead.
-		// Past-dated messages are left untouched, so historical replay/backtests are unaffected.
-		var nowUtcDay = DateTime.UtcNow.Date;
-		var effectiveDay = utcDay > nowUtcDay ? nowUtcDay : utcDay;
+		// Determine the accumulation day from the TRUSTED processing clock rather than the
+		// caller-supplied message.LocalTime (review findings CR-28 / CWE-20 / CWE-367): the SQL gate
+		// scopes its daily-volume query by the server's current UTC day, so every message processed
+		// "now" must count against "now"'s bucket. A skewed, stale, or default timestamp from an
+		// untrusted producer can therefore no longer land in a different day bucket - in particular it
+		// can no longer be back-dated to an "already-closed" day to dodge accumulation, nor forward-dated
+		// to clear the current day's totals. This trusted-clock bucketing subsumes the earlier
+		// future-day clamp (CR-3): the message timestamp no longer influences the active day at all.
+		var effectiveDay = _utcNow().Date;
 
 		lock (_sync)
 		{
 			if (_currentUtcDay is null || effectiveDay > _currentUtcDay)
 			{
-				// Advance to a new UTC day: the prior day's partitioned totals are cleared. Because
-				// effectiveDay is bounded by today, this can only ever advance up to the real current
-				// UTC day, never to an arbitrary future day supplied by an incoming message.
+				// Advance to a new UTC day (per the trusted clock): the prior day's partitioned totals
+				// are cleared. The trusted clock is monotonically non-decreasing, so this only ever
+				// advances forward to the real current UTC day.
 				_currentUtcDay = effectiveDay;
 				_dailyTotals.Clear();
-			}
-			else if (effectiveDay < _currentUtcDay)
-			{
-				// Stale/out-of-order message from an already-closed earlier UTC day. The gate's
-				// persisted query is authoritative for past days, so this is not accumulated here.
-				return false;
 			}
 
 			_dailyTotals.TryGetValue(key, out var total);

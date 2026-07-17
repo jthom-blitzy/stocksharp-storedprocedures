@@ -1,32 +1,22 @@
-================================================================
- QA EVIDENCE 06 - Docker SQL Server healthy (loopback-bound)
-================================================================
-Branch : blitzy-e686e219-30ce-45cc-8608-8ea778391629
-Commit : 78ec6ebefb583a72c36476b12255ddc68b511d64
-Captured: 2026-07-17 13:36:53 UTC
+================================================================================
+Screenshot 06 - SQL Server 2022 container healthy: 'Recovery is complete'
+================================================================================
+container Up; SQL Server ready; raw log: QA/logs/07_docker_recovery.log
 
------ docker ps (stocksharp-legacy-sql) -----
-NAMES                   IMAGE                                        STATUS              PORTS
-stocksharp-legacy-sql   mcr.microsoft.com/mssql/server:2022-latest   Up About a minute   127.0.0.1:14330->1433/tcp
+Provenance
+  Branch          : blitzy-e686e219-30ce-45cc-8608-8ea778391629
+  Evidence commit : EVIDENCE_COMMIT_PENDING   (stamped here at the Phase-10 provenance commit; see QA/README.md)
+  Build/run TFM   : net10.0  (StockSharpTargets=net10.0; net6.0 is NOT a configured build target in this workspace)
+  Captured (UTC)  : 2026-07-17T20:18:37Z
+  Source of truth : the raw machine logs / TRX under QA/logs/ (this file quotes them verbatim)
+  Capture mode    : headless CI Linux container - no desktop/window-manager/video device; per AAP 0.6.7
+                    the "screenshot" ships as this captioned text plus a faithful terminal-styled PNG
+                    rendering of the same bytes (no photographic claim, no branding).
+--------------------------------------------------------------------------------
 
------ docker port (MA-13: bound to loopback 127.0.0.1, NOT 0.0.0.0) -----
-1433/tcp -> 127.0.0.1:14330
+$ docker ps --filter name=stocksharp-legacy-sql --format '{{.Names}} | {{.Status}} | {{.Ports}}'
+stocksharp-legacy-sql | Up 7 hours | 127.0.0.1:14330->1433/tcp | mcr.microsoft.com/mssql/server:2022-latest
 
------ SQL Server recovery-complete marker (docker logs) -----
-
+$ docker logs stocksharp-legacy-sql 2>&1 | grep -E 'ready for client connections|Recovery is complete'
 2026-07-17 13:35:40.34 spid68s     SQL Server is now ready for client connections. This is an informational message; no user action is required.
-
 2026-07-17 13:35:41.25 spid51s     Recovery is complete. This is an informational message only. No user action is required.
-
------ Database provisioned (clean seed markers) -----
-orders=0
-trades=0
-positions=0
-riskLimits=1
-portfolios=1
-securities=2
-
-----------------------------------------------------------------
-RESULT: container Up, 'Recovery is complete', and the port is published on the
-LOOPBACK interface (127.0.0.1:14330->1433/tcp), NOT 0.0.0.0 (review finding
-MA-13 / CWE-668). Database StockSharpLegacy provisioned with the clean seed.

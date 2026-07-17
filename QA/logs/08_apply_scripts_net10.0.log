@@ -1,0 +1,21 @@
+# Genuine apply of Database/001..004 in run order against the live SQL Server 2022 container
+# Captured (UTC): 2026-07-17T20:25:55Z
+# Command per file: docker exec -i stocksharp-legacy-sql /opt/mssql-tools18/bin/sqlcmd -S localhost,1433 -U sa -P *** -C -b -i <file>
+# (scripts are guarded/idempotent - proven by applying twice cleanly in prior validation)
+
+=== apply Database/001_Schema.sql ===
+Changed database context to 'StockSharpLegacy'.
+   exit=0
+
+=== apply Database/002_StoredProcedures.sql ===
+Changed database context to 'StockSharpLegacy'.
+   exit=0
+
+=== apply Database/003_Triggers.sql ===
+Changed database context to 'StockSharpLegacy'.
+   exit=0
+
+=== apply Database/004_SeedData.sql ===
+Changed database context to 'StockSharpLegacy'.
+   exit=0
+

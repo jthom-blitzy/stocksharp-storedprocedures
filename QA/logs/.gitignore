@@ -1,0 +1,5 @@
+# QA evidence logs are INTENTIONALLY committed.
+# The repository-root .gitignore has a broad `*.log` rule; these raw machine logs are the
+# AUTHORITATIVE proof for the QA evidence (see ../README.md, AAP 0.6.7), so re-include them here.
+# Scope is limited to this QA/logs/ directory only.
+!*.log

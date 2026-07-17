@@ -63,15 +63,22 @@ public class RiskOrderValueRule : RiskRule
 		if (Value <= 0)
 			return false;
 
-		// Malformed / non-positive inputs carry no notional exposure.
-		if (volume <= 0 || price <= 0)
+		// Normalize volume and price to DECIMAL(18,4) scale BEFORE multiplying, exactly as the pre-trade
+		// gate does ((volume * price) on the persisted-scale values) so this stream rule is at least as
+		// strict as the gate at the fourth-decimal boundary (review finding CR-27). Out-of-range magnitudes
+		// saturate rather than throwing mid-stream.
+		var nVolume = RiskLimitSet.NormalizeMoneySaturating(volume);
+		var nPrice = RiskLimitSet.NormalizeMoneySaturating(price);
+
+		// Malformed / non-positive inputs (including sub-scale values that round to zero) carry no notional.
+		if (nVolume <= 0 || nPrice <= 0)
 			return false;
 
 		decimal notional;
 
 		try
 		{
-			notional = checked(volume * price);
+			notional = checked(nVolume * nPrice);
 		}
 		catch (OverflowException)
 		{

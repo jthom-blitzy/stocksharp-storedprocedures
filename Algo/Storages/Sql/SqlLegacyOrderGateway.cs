@@ -9,18 +9,23 @@ using StockSharp.Algo.Risk;
 /// <summary>
 /// ADO.NET gateway onto the StockSharpLegacy database (schema lives under /Database at the repo
 /// root). Deliberately raw <see cref="SqlCommand"/> calls, not an ORM. Following the SQL -&gt; C#
-/// risk-logic consolidation this is a <i>data-access adapter with no business logic</i>: it performs
-/// plain parameterized INSERT/SELECT statements for orders, trades and positions, and it additionally
-/// issues SQL Server application locks (<c>sp_getapplock</c>/<c>sp_releaseapplock</c>) purely as a
-/// concurrency-control mechanism to serialize concurrent submits and fills for a portfolio - those
-/// locks carry no risk decisioning. Every risk decision and position calculation is delegated to the
-/// C# services in the <see cref="StockSharp.Algo.Risk"/> namespace -
+/// risk-logic consolidation this is a <i>data-access adapter that holds no risk or P&amp;L
+/// decisioning</i>: every risk decision and every position / realized-P&amp;L calculation is delegated
+/// to the C# services in the <see cref="StockSharp.Algo.Risk"/> namespace -
 /// <see cref="PreTradeRiskService"/> for the seven-check pre-trade gate and
-/// <see cref="PositionRecalculationService"/> for average-cost / realized-P&amp;L. The database no
-/// longer holds any stored-procedure business logic, so there are no CommandType.StoredProcedure
-/// decisioning calls here any more (the old EXEC dbo.usp_SubmitOrder path is gone). Transactions run at
-/// READ COMMITTED isolation; it is the application lock (not a serializable range lock) that makes the
-/// validate-then-insert and fill-then-recompute sequences atomic against concurrent callers.
+/// <see cref="PositionRecalculationService"/> for average-cost / realized-P&amp;L. What the gateway
+/// itself still owns is data-access <i>orchestration</i>, not business decisioning: parameterized
+/// INSERT/SELECT for orders, trades and positions; up-front structural validation of the public order
+/// contract; a fillable / no-over-fill integrity guard before a trade row is written; and driving the
+/// position UPDATE/INSERT through the recompute service. It serializes concurrent submits and fills for
+/// a portfolio by acquiring SQL Server application locks with <c>sys.sp_getapplock</c> in
+/// Transaction-owner mode; those locks are released automatically when the owning transaction commits or
+/// rolls back (there is no explicit <c>sp_releaseapplock</c> call), and they carry no risk decisioning.
+/// The database no longer holds any stored-procedure business logic, so there are no
+/// CommandType.StoredProcedure decisioning calls here any more (the old EXEC dbo.usp_SubmitOrder path is
+/// gone). Transactions run at READ COMMITTED isolation; it is the application lock (not a serializable
+/// range lock) that makes the validate-then-insert and fill-then-recompute sequences atomic against
+/// concurrent callers.
 ///
 /// This is an adapter that sits <i>alongside</i> <see cref="IEntityRegistry"/>,
 /// not a replacement for it: Securities/Exchanges/subscriptions are still
@@ -141,13 +146,14 @@ public class SqlLegacyOrderGateway
 	/// breaches a limit), which is still recorded as REJECTED for the audit trail.
 	/// </para>
 	/// <para>
-	/// Idempotency (review finding M09): when <paramref name="externalTransactionId"/> is supplied,
-	/// re-submitting the same key returns the ORIGINAL outcome instead of inserting a second order, so a
-	/// client retry cannot create a duplicate. If the same key is replayed with a materially different
-	/// payload (different security, side, quantity, price or order type) a
-	/// <see cref="SqlLegacyIdempotencyConflictException"/> is thrown rather than silently ignoring the
-	/// mismatch. The lookup and the INSERT run under the shared per-portfolio application lock, so the
-	/// check-then-insert is atomic against concurrent same-portfolio submissions.
+	/// <paramref name="externalTransactionId"/> is stored verbatim on the row as a plain correlation
+	/// column so a support engineer can tie a dbo.Orders row back to the in-memory Order.TransactionId; it
+	/// is NOT used as a deduplication key and the gateway performs no keyed replay lookup (the AAP
+	/// idempotency model is the single-apply full replay of the position recompute, AAP 0.6.4, not durable
+	/// business-key dedup). <paramref name="requestedBy"/> is accepted for backward compatibility with the
+	/// original public signature (review finding M06/#14); the SQL-side plumbing that once carried it was an
+	/// unused compliance-ask field and was intentionally dropped in the SQL -&gt; C# consolidation (AAP
+	/// 0.6.6), so the value has no persistence target and does not affect the outcome.
 	/// </para>
 	/// </remarks>
 	/// <param name="portfolioId">The SQL-side portfolio identifier.</param>
@@ -156,17 +162,23 @@ public class SqlLegacyOrderGateway
 	/// <param name="volume">The order quantity (must be positive).</param>
 	/// <param name="price">The order price (positive for Limit); must be null for a Market order.</param>
 	/// <param name="orderType">The order type (Limit or Market only).</param>
-	/// <param name="externalTransactionId">Optional business idempotency key stored on the row; a duplicate key returns the original outcome.</param>
+	/// <param name="externalTransactionId">Optional correlation id stored verbatim on the row (not a dedup key).</param>
+	/// <param name="requestedBy">Accepted for backward compatibility; retained but not persisted (AAP 0.6.6).</param>
 	/// <param name="cancellationToken">The cancellation token.</param>
 	/// <returns>The submission outcome: the new order_id, whether it was accepted, and any reject reason.</returns>
 	/// <exception cref="ArgumentOutOfRangeException"><paramref name="side"/> is not Buy/Sell, or <paramref name="volume"/> is not positive.</exception>
 	/// <exception cref="ArgumentException">The <paramref name="price"/> does not match the <paramref name="orderType"/> (Limit needs a positive price; Market needs none).</exception>
 	/// <exception cref="NotSupportedException"><paramref name="orderType"/> is neither Limit nor Market.</exception>
-	/// <exception cref="SqlLegacyIdempotencyConflictException"><paramref name="externalTransactionId"/> was reused with a different payload.</exception>
 	public async Task<SqlOrderSubmitResult> SubmitOrderAsync(
 		int portfolioId, int securityId, Sides side, decimal volume, decimal? price, OrderTypes orderType,
-		long? externalTransactionId = null, CancellationToken cancellationToken = default)
+		long? externalTransactionId = null, string requestedBy = null, CancellationToken cancellationToken = default)
 	{
+		// requestedBy is accepted for backward compatibility with the original public contract (review
+		// finding #14). Its former SQL plumbing (@requested_by) was an unused compliance-ask field dropped in
+		// the SQL -> C# consolidation (AAP 0.6.6), so there is no column to persist it to; discard explicitly
+		// to document that this is intentional, not an oversight.
+		_ = requestedBy;
+
 		// M07 - validate the whole structural contract up front, before opening any database resources, so
 		// a malformed order fails fast and deterministically and never reaches persistence. A risk breach
 		// (a well-formed order over a limit) is a different thing and is still recorded as REJECTED below.
@@ -184,47 +196,6 @@ public class SqlLegacyOrderGateway
 		// held for the life of the transaction and released on commit/rollback.
 		await AcquireAppLockAsync(connection, transaction, PortfolioLockResource(portfolioId), cancellationToken);
 
-		// M09 - order-submit idempotency. Under the portfolio lock, look for an order already recorded
-		// under this key; a duplicate submission (client retry) returns the ORIGINAL outcome, and a key
-		// reused for a different payload is a conflict (thrown), never a silent second order.
-		if (externalTransactionId is long submitKey)
-		{
-			var existing = await TryGetOrderByKeyAsync(connection, transaction, portfolioId, submitKey, cancellationToken);
-
-			if (existing is not null)
-			{
-				var incomingSide = MapSide(side);
-				var incomingType = MapOrderType(orderType);
-				var normalizedVolume = decimal.Round(volume, 4, MidpointRounding.AwayFromZero);
-				var normalizedPrice = price is decimal rawPrice ? decimal.Round(rawPrice, 4, MidpointRounding.AwayFromZero) : (decimal?)null;
-
-				var samePayload =
-					existing.SecurityId == securityId &&
-					string.Equals(existing.Side, incomingSide, StringComparison.Ordinal) &&
-					existing.Qty == normalizedVolume &&
-					existing.Price == normalizedPrice &&
-					string.Equals(existing.OrderType, incomingType, StringComparison.Ordinal);
-
-				if (!samePayload)
-				{
-					throw new SqlLegacyIdempotencyConflictException(
-						"order", submitKey.ToString(),
-						$"external_transaction_id {submitKey} was already used for a different order " +
-						$"(existing: security {existing.SecurityId}, {existing.Side} {existing.Qty} @ {(existing.Price?.ToString() ?? "MKT")} {existing.OrderType}; " +
-						$"replay: security {securityId}, {incomingSide} {normalizedVolume} @ {(normalizedPrice?.ToString() ?? "MKT")} {incomingType}).");
-				}
-
-				await transaction.CommitAsync(cancellationToken);
-
-				return new()
-				{
-					OrderId = existing.OrderId,
-					IsValid = string.Equals(existing.Status, "ACCEPTED", StringComparison.Ordinal),
-					RejectReason = existing.RejectReason,
-				};
-			}
-		}
-
 		var evaluation = await _preTradeRiskService.ValidateAsync(
 			connection, transaction, portfolioId, securityId, side, volume, price, orderType, cancellationToken);
 
@@ -233,7 +204,8 @@ public class SqlLegacyOrderGateway
 		long orderId;
 
 		// Plain parameterized INSERT - no decisioning here. Rejected orders are recorded too (with the
-		// reason). Note dbo.Orders.CK_Orders_qty enforces qty > 0, so an "Invalid qty" rejection is not
+		// reason). external_transaction_id is stored verbatim as a plain correlation column (not a dedup
+		// key). Note dbo.Orders.CK_Orders_qty enforces qty > 0, so an "Invalid qty" rejection is not
 		// storable and surfaces as a constraint error, exactly as the old usp_SubmitOrder INSERT did.
 		await using (var insert = new SqlCommand(
 			"""
@@ -287,8 +259,13 @@ public class SqlLegacyOrderGateway
 
 		if (orderType == OrderTypes.Limit)
 		{
-			if (price is not decimal limitPrice || limitPrice <= 0m)
-				throw new ArgumentException("A Limit order requires a positive price.", nameof(price));
+			// CR-13: coerce the price to the persisted DECIMAL(18,4) scale FIRST, then require it to remain
+			// positive, so a sub-tick price such as 0.00004 (which rounds to 0.0000 when stored) is rejected
+			// as structurally invalid up front rather than being persisted as a 0.0000 price that no ceiling
+			// comparison (price >= limit) could ever catch. This is the gateway-side half of the
+			// normalize-then-validate the pre-trade gate also performs in its preamble.
+			if (price is not decimal limitPrice || RiskLimitSet.NormalizeMoney(limitPrice, nameof(price)) <= 0m)
+				throw new ArgumentException("A Limit order requires a positive price (a sub-tick price that rounds to zero at DECIMAL(18,4) scale is rejected).", nameof(price));
 		}
 		else if (price is not null)
 		{
@@ -306,52 +283,17 @@ public class SqlLegacyOrderGateway
 		_ => throw new ArgumentOutOfRangeException(nameof(side), side, "Order side must be Buy or Sell."),
 	};
 
-	// M09 helper - reads the order already recorded under an external_transaction_id for this portfolio
-	// (or null if none), scoped by the portfolio lock the caller holds. Returns the payload columns the
-	// idempotency comparison needs plus the persisted outcome (status/reject_reason).
-	private static async Task<ExistingOrder> TryGetOrderByKeyAsync(
-		SqlConnection connection, SqlTransaction transaction, int portfolioId, long externalTransactionId, CancellationToken cancellationToken)
-	{
-		await using var command = new SqlCommand(
-			"""
-			SELECT order_id, security_id, side, qty, price, order_type, status, reject_reason
-			FROM dbo.Orders
-			WHERE portfolio_id = @portfolio_id AND external_transaction_id = @external_transaction_id
-			""", connection, transaction);
-		command.Parameters.Add(new SqlParameter("@portfolio_id", SqlDbType.Int) { Value = portfolioId });
-		command.Parameters.Add(new SqlParameter("@external_transaction_id", SqlDbType.BigInt) { Value = externalTransactionId });
-
-		await using var reader = await command.ExecuteReaderAsync(CommandBehavior.SingleRow, cancellationToken);
-
-		if (!await reader.ReadAsync(cancellationToken))
-			return null;
-
-		return new ExistingOrder(
-			reader.GetInt64(0),
-			reader.GetInt32(1),
-			reader.GetString(2).Trim(),
-			reader.GetDecimal(3),
-			await reader.IsDBNullAsync(4, cancellationToken) ? null : reader.GetDecimal(4),
-			reader.GetString(5).Trim(),
-			reader.GetString(6).Trim(),
-			await reader.IsDBNullAsync(7, cancellationToken) ? null : reader.GetString(7));
-	}
-
-	// The payload + outcome of an order already persisted under an external_transaction_id (M09).
-	private sealed record ExistingOrder(
-		long OrderId, int SecurityId, string Side, decimal Qty, decimal? Price, string OrderType, string Status, string RejectReason);
-
 	// Serializes a unit of work on a named resource using sys.sp_getapplock (a SQL-Server-specific
 	// application-lock primitive) in Transaction-owner mode. Combined with the enclosing transaction this
 	// turns a read-then-write sequence into a single atomic critical section (C03/CWE-367): a second caller
 	// contending for the same resource waits here until the first commits, so it can no longer act on
-	// pre-write state. The lock is released automatically when the transaction ends. The submission path
-	// and the fill path share ONE portfolio-scoped lock domain (StockSharpLegacy:Portfolio:{id}) as the
-	// OUTER lock, so a submit and a fill for the same portfolio serialize against each other (review
-	// finding C04 / the submit-vs-fill TOCTOU); the fill path then takes a narrower per-position lock as an
-	// INNER lock, and, for a keyed fill, a per-key lock as the innermost lock. Acquired in that strict
-	// order (portfolio -> position -> trade-key) the locks form a total order, so the gateway can never
-	// deadlock on its own application locks.
+	// pre-write state. The lock is released automatically when the transaction ends (commit or rollback) -
+	// there is no explicit sp_releaseapplock call. The submission path and the fill path share ONE
+	// portfolio-scoped lock domain (StockSharpLegacy:Portfolio:{id}) as the OUTER lock, so a submit and a
+	// fill for the same portfolio serialize against each other (review finding C04 / the submit-vs-fill
+	// TOCTOU); the fill path then takes a narrower per-position lock as an INNER lock. Acquired in that
+	// strict order (portfolio -> position) the locks form a total order, so the gateway can never deadlock
+	// on its own application locks.
 	private static async Task AcquireAppLockAsync(SqlConnection connection, SqlTransaction transaction, string resource, CancellationToken cancellationToken)
 	{
 		await using var command = new SqlCommand("sys.sp_getapplock", connection, transaction)
@@ -413,16 +355,10 @@ public class SqlLegacyOrderGateway
 	/// <summary>
 	/// Records a fill against a SQL-side order and recomputes the affected position. The dbo.Trades
 	/// INSERT and the position recompute run inside ONE transaction, and the recompute is performed
-	/// exactly once by <see cref="PositionRecalculationService"/>. The old trg_Trades_PositionRecalc
-	/// trigger - and the double-count hazard of the trigger and a standalone recalc both firing for the
-	/// same trade - is gone; the recompute is no longer "automatic" inside SQL.
-	/// <para>
-	/// This overload records an <b>un-keyed</b> fill (no business idempotency key), so every call inserts a
-	/// new dbo.Trades row. Use the <see cref="RecordTradeAsync(long, decimal, decimal, long, CancellationToken)"/>
-	/// overload to make recording exactly-once under retries. This 4-argument signature is the original,
-	/// backward-compatible one (review finding M06); the idempotency key is a <i>separate</i> overload
-	/// rather than an inserted middle parameter, so existing positional callers keep compiling.
-	/// </para>
+	/// exactly once by <see cref="PositionRecalculationService"/> (a single full chronological replay of
+	/// the persisted trade set). The old trg_Trades_PositionRecalc trigger - and the double-count hazard of
+	/// the trigger and a standalone recalc both firing for the same trade - is gone; the recompute is no
+	/// longer "automatic" inside SQL.
 	/// <para>
 	/// Validation (review finding M08): before a new fill is inserted the gateway verifies, under the
 	/// application locks, that the order is fillable (status ACCEPTED or PARTFILLED - a REJECTED or
@@ -435,7 +371,9 @@ public class SqlLegacyOrderGateway
 	/// and a submission for the same portfolio serialize against each other, and a narrower per-position
 	/// lock as its INNER lock, both acquired BEFORE the trade is inserted so concurrent fills cannot form
 	/// the insert-then-lock deadlock cycle. If a transient deadlock (SQL error 1205) still occurs, the whole
-	/// unit of work is retried on a fresh transaction a bounded number of times.
+	/// unit of work is retried on a fresh transaction a bounded number of times; a deadlock victim's
+	/// transaction is rolled back (its INSERT undone) before the retry, so re-running inserts the fill
+	/// exactly once.
 	/// </para>
 	/// </summary>
 	/// <param name="orderId">The order the fill is recorded against.</param>
@@ -444,42 +382,14 @@ public class SqlLegacyOrderGateway
 	/// <param name="cancellationToken">The cancellation token.</param>
 	/// <exception cref="InvalidOperationException">The order is not fillable, or the fill would over-fill it.</exception>
 	public Task RecordTradeAsync(long orderId, decimal qty, decimal price, CancellationToken cancellationToken = default)
-		=> RecordTradeWithRetryAsync(orderId, qty, price, null, cancellationToken);
+		=> RecordTradeWithRetryAsync(orderId, qty, price, cancellationToken);
 
-	/// <summary>
-	/// Records a fill against a SQL-side order <b>idempotently</b>, keyed by
-	/// <paramref name="externalTradeId"/> (the external execution/trade id of the logical fill), and
-	/// recomputes the affected position exactly once. Re-recording the same key - a client retry, or the
-	/// internal deadlock retry - applies the fill at most once instead of inserting a second trade row, so
-	/// the position is never double-counted; uniqueness is backed by the filtered index
-	/// UQ_Trades_external_trade_id.
-	/// <para>
-	/// The key is <b>required</b> on this overload (review finding M06/M09): a caller that wants
-	/// exactly-once semantics must supply a real key rather than passing <see langword="null"/>, which
-	/// would silently degrade to at-least-once. Replaying the same key with a materially different payload
-	/// (different order, quantity or price) throws <see cref="SqlLegacyIdempotencyConflictException"/>
-	/// rather than silently ignoring the mismatch. The same fillable/over-fill validation (M08) as the
-	/// un-keyed overload applies to the first, non-duplicate recording.
-	/// </para>
-	/// </summary>
-	/// <param name="orderId">The order the fill is recorded against.</param>
-	/// <param name="qty">The fill quantity (must be positive).</param>
-	/// <param name="price">The fill price (must be positive).</param>
-	/// <param name="externalTradeId">The required business idempotency key (external execution/trade id).</param>
-	/// <param name="cancellationToken">The cancellation token.</param>
-	/// <exception cref="InvalidOperationException">The order is not fillable, or the fill would over-fill it.</exception>
-	/// <exception cref="SqlLegacyIdempotencyConflictException"><paramref name="externalTradeId"/> was reused with a different payload.</exception>
-	public Task RecordTradeAsync(long orderId, decimal qty, decimal price, long externalTradeId, CancellationToken cancellationToken = default)
-		=> RecordTradeWithRetryAsync(orderId, qty, price, externalTradeId, cancellationToken);
-
-	// Shared implementation for both public overloads: a bounded deadlock-retry around a single atomic
-	// attempt. A deadlock victim's transaction is rolled back atomically (its dbo.Trades INSERT is undone),
-	// so re-running the whole unit of work on a fresh transaction is safe; combined with the idempotency
-	// key even a post-commit client retry cannot double-record a logical fill (QA findings F1 + F2). With
-	// the lock-before-insert ordering below a same-position deadlock should no longer occur - this loop is
-	// defense-in-depth for any residual cross-resource contention and rethrows once the attempts are
-	// exhausted (never hangs).
-	private async Task RecordTradeWithRetryAsync(long orderId, decimal qty, decimal price, long? externalTradeId, CancellationToken cancellationToken)
+	// Bounded deadlock-retry around a single atomic attempt. A deadlock victim's transaction is rolled back
+	// atomically (its dbo.Trades INSERT is undone), so re-running the whole unit of work on a fresh
+	// transaction inserts the fill exactly once. With the lock-before-insert ordering below a same-position
+	// deadlock should no longer occur - this loop is defense-in-depth for any residual cross-resource
+	// contention and rethrows once the attempts are exhausted (never hangs).
+	private async Task RecordTradeWithRetryAsync(long orderId, decimal qty, decimal price, CancellationToken cancellationToken)
 	{
 		const int maxAttempts = 3;
 
@@ -487,7 +397,7 @@ public class SqlLegacyOrderGateway
 		{
 			try
 			{
-				await RecordTradeCoreAsync(orderId, qty, price, externalTradeId, cancellationToken);
+				await RecordTradeCoreAsync(orderId, qty, price, cancellationToken);
 				return;
 			}
 			catch (SqlException ex) when (IsDeadlockVictim(ex) && attempt < maxAttempts)
@@ -499,10 +409,9 @@ public class SqlLegacyOrderGateway
 	}
 
 	// Single attempt of RecordTradeAsync: acquire the shared portfolio (outer) + per-position (inner) locks
-	// (and, for a keyed fill, the per-key innermost lock) BEFORE touching any row, enforce the M08 fillable
-	// / over-fill guard, insert the fill (exactly-once when keyed), recompute the position exactly once, and
-	// commit - all in one transaction.
-	private async Task RecordTradeCoreAsync(long orderId, decimal qty, decimal price, long? externalTradeId, CancellationToken cancellationToken)
+	// BEFORE touching any row, enforce the M08 fillable / over-fill guard, insert the fill, recompute the
+	// position exactly once (full chronological replay), and commit - all in one transaction.
+	private async Task RecordTradeCoreAsync(long orderId, decimal qty, decimal price, CancellationToken cancellationToken)
 	{
 		await using var connection = CreateConnection();
 		await connection.OpenAsync(cancellationToken);
@@ -525,61 +434,20 @@ public class SqlLegacyOrderGateway
 		// (QA finding F1): concurrent fills of the same position serialize here before either inserts its
 		// dbo.Trades row, so two transactions can never each hold the other's uncommitted trade row while
 		// contending for the position. Acquired AFTER the portfolio lock, so the lock order is a strict
-		// total order (portfolio -> position -> trade-key) and the gateway cannot self-deadlock.
+		// total order (portfolio -> position) and the gateway cannot self-deadlock.
 		await AcquireAppLockAsync(connection, transaction, $"StockSharpLegacy:Position:{portfolioId}:{securityId}", cancellationToken);
-
-		// Keyed idempotency (review finding M09). Take the innermost per-key lock so that even two fills for
-		// DIFFERENT positions replaying the SAME key serialize (their portfolio/position locks differ, so
-		// only this lock orders them), then look the key up: an exact-payload match is applied exactly once
-		// (no second insert, no second recompute); a same-key/different-payload replay is a conflict.
-		if (externalTradeId is long tradeKey)
-		{
-			await AcquireAppLockAsync(connection, transaction, $"StockSharpLegacy:TradeKey:{tradeKey}", cancellationToken);
-
-			var existingTrade = await TryGetTradeByKeyAsync(connection, transaction, tradeKey, cancellationToken);
-
-			if (existingTrade is not null)
-			{
-				var replayQty = decimal.Round(qty, 4, MidpointRounding.AwayFromZero);
-				var replayPrice = decimal.Round(price, 4, MidpointRounding.AwayFromZero);
-
-				var samePayload = existingTrade.OrderId == orderId && existingTrade.Qty == replayQty && existingTrade.Price == replayPrice;
-
-				if (!samePayload)
-				{
-					throw new SqlLegacyIdempotencyConflictException(
-						"trade", tradeKey.ToString(),
-						$"external_trade_id {tradeKey} was already used for a different fill " +
-						$"(existing: order {existingTrade.OrderId}, {existingTrade.Qty} @ {existingTrade.Price}; " +
-						$"replay: order {orderId}, {replayQty} @ {replayPrice}).");
-				}
-
-				// Exact duplicate -> apply exactly once: no insert, no recompute, the position already
-				// reflects this fill. Commit so the (read-only) transaction and its locks release cleanly.
-				await transaction.CommitAsync(cancellationToken);
-				return;
-			}
-		}
 
 		// M08 - under the locks, verify this NEW fill is legal against the current order state: the order
 		// must be fillable (ACCEPTED/PARTFILLED) and the cumulative fills must not exceed the ordered qty.
 		await GuardFillableAsync(connection, transaction, orderId, qty, cancellationToken);
 
-		// Plain parameterized INSERT of the fill. For a keyed fill the per-key lock + the not-exists check
-		// above already guarantee this is the first insert of the key, so no WHERE NOT EXISTS guard is
-		// needed; for an un-keyed fill this is the original always-insert behavior.
+		// Plain parameterized INSERT of the fill.
 		await using (var insert = new SqlCommand(
-			externalTradeId is null
-				? "INSERT INTO dbo.Trades (order_id, qty, price) VALUES (@order_id, @qty, @price)"
-				: "INSERT INTO dbo.Trades (order_id, qty, price, external_trade_id) VALUES (@order_id, @qty, @price, @external_trade_id)",
-			connection, transaction))
+			"INSERT INTO dbo.Trades (order_id, qty, price) VALUES (@order_id, @qty, @price)", connection, transaction))
 		{
 			insert.Parameters.Add(new SqlParameter("@order_id", SqlDbType.BigInt) { Value = orderId });
 			insert.Parameters.Add(new SqlParameter("@qty", SqlDbType.Decimal) { Precision = 18, Scale = 4, Value = qty });
 			insert.Parameters.Add(new SqlParameter("@price", SqlDbType.Decimal) { Precision = 18, Scale = 4, Value = price });
-
-			if (externalTradeId is long key)
-				insert.Parameters.Add(new SqlParameter("@external_trade_id", SqlDbType.BigInt) { Value = key });
 
 			await insert.ExecuteNonQueryAsync(cancellationToken);
 		}
@@ -626,26 +494,6 @@ public class SqlLegacyOrderGateway
 		if (priorFills + normalizedQty > orderedQty)
 			throw new InvalidOperationException($"SqlLegacyOrderGateway: fill of {normalizedQty} would over-fill order_id {orderId} (already filled {priorFills} of {orderedQty}).");
 	}
-
-	// M09 helper - reads the trade already recorded under an external_trade_id (or null if none), scoped by
-	// the per-key lock the caller holds. Returns the payload the idempotency comparison needs.
-	private static async Task<ExistingTrade> TryGetTradeByKeyAsync(
-		SqlConnection connection, SqlTransaction transaction, long externalTradeId, CancellationToken cancellationToken)
-	{
-		await using var command = new SqlCommand(
-			"SELECT order_id, qty, price FROM dbo.Trades WHERE external_trade_id = @external_trade_id", connection, transaction);
-		command.Parameters.Add(new SqlParameter("@external_trade_id", SqlDbType.BigInt) { Value = externalTradeId });
-
-		await using var reader = await command.ExecuteReaderAsync(CommandBehavior.SingleRow, cancellationToken);
-
-		if (!await reader.ReadAsync(cancellationToken))
-			return null;
-
-		return new ExistingTrade(reader.GetInt64(0), reader.GetDecimal(1), reader.GetDecimal(2));
-	}
-
-	// The payload of a trade already persisted under an external_trade_id (M09).
-	private sealed record ExistingTrade(long OrderId, decimal Qty, decimal Price);
 
 	/// <summary>
 	/// Reads the current SQL-side position for a portfolio/security pair, or

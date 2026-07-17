@@ -146,6 +146,61 @@ public class RiskLimitSet
 	/// <returns><see langword="true"/> when the ceiling is enforced (non-null and <c>&gt; 0</c>).</returns>
 	public static bool IsCeilingEnforced(decimal? ceiling) => ceiling is decimal c && c > 0m;
 
+	/// <summary>
+	/// The maximum magnitude representable by the StockSharpLegacy money columns, which are all
+	/// <c>DECIMAL(18,4)</c> (the largest 18-digit value with four fractional digits). Exposed so every
+	/// consumer that must coerce a value to the persisted scale shares the same domain bound.
+	/// </summary>
+	public const decimal MoneyScaleMax = 99_999_999_999_999.9999m;
+
+	/// <summary>
+	/// Coerces a monetary value to the <c>DECIMAL(18,4)</c> domain of the StockSharpLegacy money columns,
+	/// the single canonical normalization shared by every risk-enforcement pattern. The value is rounded
+	/// to four fractional digits away from zero (matching SQL Server's arithmetic rounding when a value is
+	/// assigned to a <c>DECIMAL(18,4)</c> column or variable) and an out-of-range magnitude fails
+	/// deterministically, the C# analogue of the SQL arithmetic-overflow error. Both the pre-trade gate
+	/// (<see cref="PreTradeRiskService"/>) and the stream circuit-breaker rules call this so their
+	/// comparisons use the exact value that would be persisted, closing the sub-scale drift where stream
+	/// enforcement could otherwise be less strict than the gate at the fourth-decimal boundary.
+	/// </summary>
+	/// <param name="value">The raw monetary value to coerce.</param>
+	/// <param name="name">The name of the value, used in the overflow message.</param>
+	/// <returns>The value rounded to <c>DECIMAL(18,4)</c> scale.</returns>
+	/// <exception cref="OverflowException"><paramref name="value"/> rounds to a magnitude outside the <c>DECIMAL(18,4)</c> range.</exception>
+	public static decimal NormalizeMoney(decimal value, string name)
+	{
+		var rounded = Math.Round(value, 4, MidpointRounding.AwayFromZero);
+
+		if (rounded > MoneyScaleMax || rounded < -MoneyScaleMax)
+			throw new OverflowException($"{name} value {value} is outside the DECIMAL(18,4) range supported by the StockSharpLegacy schema.");
+
+		return rounded;
+	}
+
+	/// <summary>
+	/// Coerces a value to the <c>DECIMAL(18,4)</c> scale like <see cref="NormalizeMoney"/>, but
+	/// <b>saturates</b> to &#177;<see cref="MoneyScaleMax"/> instead of throwing when the value is out of
+	/// range. The stream circuit-breaker rules use this in their "breach when value &gt;= ceiling"
+	/// comparisons so that an out-of-range input is coerced to the largest representable magnitude - which
+	/// is necessarily at or above any finite ceiling and therefore treated as a breach - rather than raising
+	/// mid-stream. This keeps the stream rules at least as strict as the gate at the fourth-decimal boundary
+	/// (review finding CR-27) while never throwing on adversarial input during message processing.
+	/// </summary>
+	/// <param name="value">The raw value to coerce.</param>
+	/// <returns>The value rounded to <c>DECIMAL(18,4)</c> scale, clamped to the representable range.</returns>
+	public static decimal NormalizeMoneySaturating(decimal value)
+	{
+		var rounded = Math.Round(value, 4, MidpointRounding.AwayFromZero);
+
+		if (rounded > MoneyScaleMax)
+			return MoneyScaleMax;
+
+		if (rounded < -MoneyScaleMax)
+			return -MoneyScaleMax;
+
+		return rounded;
+	}
+
 	/// <summary>The enforced order-price ceiling, or <see langword="null"/> when not enforced (null/non-positive).</summary>
 	public decimal? EffectiveMaxOrderPrice => IsCeilingEnforced(MaxOrderPrice) ? MaxOrderPrice : null;
 
@@ -218,12 +273,87 @@ public class RiskLimitSet
 		!IsFrequencyEnforced;
 
 	/// <summary>
+	/// The single authoritative validator for a limit set, shared by <b>both</b> enforcement patterns so a
+	/// malformed configuration fails closed identically in each. A <see langword="null"/> or <c>0</c>
+	/// ceiling remains the AAP-mandated "not enforced" convention (see <see cref="IsCeilingEnforced(decimal?)"/>)
+	/// and is accepted, but a <b>negative</b> ceiling, a negative frequency count/window, a negative
+	/// <see cref="CommissionRate"/>, or a half-specified frequency pair
+	/// (<see cref="IsFrequencyMalformed"/>) is a configuration error that this method rejects by throwing.
+	/// This closes the fail-open hole where a negative stored value was silently treated as "not enforced"
+	/// (which disabled the check) and reconciles the gate and the manager factory, which previously
+	/// diverged (the gate silently ignored a malformed frequency pair while the factory threw).
+	/// </summary>
+	/// <remarks>
+	/// This is a C#-layer guard by design: the SQL→C# consolidation relocates every risk decision out of
+	/// the database (AAP §0.1.1, §0.7.1), so the authoritative rejection lives here in the business layer
+	/// rather than as a <c>CHECK</c> constraint on <c>dbo.RiskLimits</c> (adding one would reintroduce a
+	/// business rule into SQL and modify the frozen schema the refactor keeps as pure DDL, AAP §0.2.1).
+	/// The pre-trade gate (<see cref="PreTradeRiskService"/>) calls this on every loaded row before it
+	/// enforces, and the circuit-breaker factory (<see cref="RiskManager.CreateRules(RiskLimitSet, RiskActions)"/>)
+	/// calls it before it builds rules, so no consumer can act on an invalid configuration.
+	/// </remarks>
+	/// <exception cref="ArgumentException">
+	/// A ceiling, the frequency count/window, or the commission rate is negative, or exactly one of the
+	/// frequency count/window is specified (a malformed pair).
+	/// </exception>
+	public void Validate()
+	{
+		static void RejectNegativeCeiling(decimal? value, string name)
+		{
+			if (value is decimal v && v < 0m)
+				throw new ArgumentException(
+					$"Malformed risk limit: {name} must not be negative (was {v.ToString(System.Globalization.CultureInfo.InvariantCulture)}). " +
+					"Use null or 0 to leave the limit unenforced; a positive value to enforce it.", name);
+		}
+
+		RejectNegativeCeiling(MaxOrderPrice, nameof(MaxOrderPrice));
+		RejectNegativeCeiling(MaxOrderQty, nameof(MaxOrderQty));
+		RejectNegativeCeiling(MaxOrderValue, nameof(MaxOrderValue));
+		RejectNegativeCeiling(MaxPositionSize, nameof(MaxPositionSize));
+		RejectNegativeCeiling(MaxDailyVolume, nameof(MaxDailyVolume));
+		RejectNegativeCeiling(MaxCommissionTotal, nameof(MaxCommissionTotal));
+
+		if (MaxOrderFreqCount is int fc && fc < 0)
+			throw new ArgumentException(
+				$"Malformed risk limit: {nameof(MaxOrderFreqCount)} must not be negative (was {fc.ToString(System.Globalization.CultureInfo.InvariantCulture)}).",
+				nameof(MaxOrderFreqCount));
+
+		if (MaxOrderFreqWindowSeconds is int fw && fw < 0)
+			throw new ArgumentException(
+				$"Malformed risk limit: {nameof(MaxOrderFreqWindowSeconds)} must not be negative (was {fw.ToString(System.Globalization.CultureInfo.InvariantCulture)}).",
+				nameof(MaxOrderFreqWindowSeconds));
+
+		if (CommissionRate < 0m)
+			throw new ArgumentException(
+				$"Malformed risk limit: {nameof(CommissionRate)} must not be negative (was {CommissionRate.ToString(System.Globalization.CultureInfo.InvariantCulture)}). " +
+				"The legacy commission estimate used the configured rate directly, so a negative rate is a configuration error rather than a value to silently clamp.",
+				nameof(CommissionRate));
+
+		if (IsFrequencyMalformed)
+			throw new ArgumentException(
+				$"Malformed order-frequency limit: exactly one of count ({MaxOrderFreqCount?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "null"}) " +
+				$"and window-seconds ({MaxOrderFreqWindowSeconds?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "null"}) is set. " +
+				"Specify both (to enforce) or neither (to disable).", nameof(MaxOrderFreqCount));
+	}
+
+	/// <summary>
 	/// Selects the single most-specific active limit set for the given scope, mirroring the
 	/// selection in dbo.usp_ValidatePreTradeRisk: portfolio+security rows outrank portfolio-only
 	/// rows, which outrank security-only rows; ties are broken by the most recent
 	/// <see cref="EffectiveDate"/>. Only <see cref="IsActive"/> rows whose scope keys match
 	/// (or are null/wildcard) are considered.
 	/// </summary>
+	/// <remarks>
+	/// When <paramref name="nowUtc"/> is supplied, rows whose <see cref="EffectiveDate"/> is in the
+	/// future relative to that instant are excluded, so a limit set scheduled to take effect later cannot
+	/// supersede the current row before its effective date. This is the injectable analogue of the
+	/// <c>effective_date &lt;= SYSUTCDATETIME()</c> cutoff the pre-trade gate applies server-side, and it
+	/// keeps the pure selection deterministic in unit tests (pass a fixed instant) while closing the
+	/// future-effective activation hole. When <paramref name="nowUtc"/> is <see langword="null"/> no
+	/// time cutoff is applied and selection depends only on scope specificity and recency, preserving the
+	/// historical behaviour for callers that have already time-filtered their candidates (such as the gate,
+	/// whose SQL <c>WHERE</c> clause performs the authoritative cutoff against the database clock).
+	/// </remarks>
 	/// <param name="candidates">
 	/// The candidate limit sets (e.g. the rows loaded from dbo.RiskLimits). Cannot be null; any
 	/// <see langword="null"/> element is skipped defensively rather than throwing, so a sparse or
@@ -232,8 +362,12 @@ public class RiskLimitSet
 	/// </param>
 	/// <param name="portfolioId">The portfolio identifier to match.</param>
 	/// <param name="securityId">The security identifier to match.</param>
+	/// <param name="nowUtc">
+	/// The current UTC instant used as the effective-date cutoff: rows with a later
+	/// <see cref="EffectiveDate"/> are excluded. <see langword="null"/> (the default) applies no cutoff.
+	/// </param>
 	/// <returns>The most-specific matching set, or null when none applies.</returns>
-	public static RiskLimitSet SelectMostSpecific(IEnumerable<RiskLimitSet> candidates, int portfolioId, int securityId)
+	public static RiskLimitSet SelectMostSpecific(IEnumerable<RiskLimitSet> candidates, int portfolioId, int securityId, DateTime? nowUtc = null)
 	{
 		if (candidates is null)
 			throw new ArgumentNullException(nameof(candidates));
@@ -242,7 +376,8 @@ public class RiskLimitSet
 			.Where(c => c is not null
 				&& c.IsActive
 				&& (c.PortfolioId == portfolioId || c.PortfolioId is null)
-				&& (c.SecurityId == securityId || c.SecurityId is null))
+				&& (c.SecurityId == securityId || c.SecurityId is null)
+				&& (nowUtc is null || c.EffectiveDate <= nowUtc.Value))
 			.OrderBy(c => c.PortfolioId is not null && c.SecurityId is not null ? 0
 				: c.PortfolioId is not null ? 1
 				: 2)

@@ -1,29 +1,35 @@
-================================================================
- 03 - Risk-consolidation suite 198/198 GREEN (+ honest full-suite disclosure)
-================================================================
-Branch  : blitzy-e686e219-30ce-45cc-8608-8ea778391629
-Commit  : 78ec6ebefb583a72c36476b12255ddc68b511d64
-Captured: 2026-07-17
-Command : dotnet test Tests/Tests.csproj -c Release --framework net10.0 --filter "...~PreTradeRiskServiceTests|~PositionRecalculationTests|~CommissionTests|~RiskTests|~LegacyOracleParityTests"
-----------------------------------------------------------------
-######## FOCUSED SUITE (per-class counts) ########
-Passed!  - Failed:     0, Passed:   198, Skipped:     0, Total:   198, Duration: 5 s - StockSharp.Tests.dll (net10.0)
-######## per-class breakdown (count [TestMethod] per focused class) ########
-  PreTradeRiskServiceTests: 35 [TestMethod] (19 Live_)
-  PositionRecalculationTests: 42 [TestMethod] (29 Live_)
-  CommissionTests: 34 [TestMethod] (2 Live_)
-  RiskTests: 72 [TestMethod] (0 Live_)
-  LegacyOracleParityTests: 15 [TestMethod] (15 Live_)
+================================================================================
+Screenshot 03 - Targeted risk-consolidation suite: 196/196 passed
+================================================================================
+Failed: 0, Passed: 196, Skipped: 0; raw log + full TRX retained in QA/logs/
 
-----------------------------------------------------------------
-RESULT: 198 passed, 0 failed, 0 skipped (Total 198) across the FIVE test
-classes this refactor owns, including 65 Live_* tests executed against the
-real SQL Server 2022 container (15 of them differential tests against the
-verbatim legacy stored procedures - the LegacyOracleParityTests oracle).
+Provenance
+  Branch          : blitzy-e686e219-30ce-45cc-8608-8ea778391629
+  Evidence commit : EVIDENCE_COMMIT_PENDING   (stamped here at the Phase-10 provenance commit; see QA/README.md)
+  Build/run TFM   : net10.0  (StockSharpTargets=net10.0; net6.0 is NOT a configured build target in this workspace)
+  Captured (UTC)  : 2026-07-17T20:18:37Z
+  Source of truth : the raw machine logs / TRX under QA/logs/ (this file quotes them verbatim)
+  Capture mode    : headless CI Linux container - no desktop/window-manager/video device; per AAP 0.6.7
+                    the "screenshot" ships as this captioned text plus a faithful terminal-styled PNG
+                    rendering of the same bytes (no photographic claim, no branding).
+--------------------------------------------------------------------------------
 
-HONEST FULL-SUITE DISCLOSURE: the entire Tests/Tests.csproj (the whole
-StockSharp platform - thousands of tests across many unrelated subsystems,
-many needing external market-data/network/infra) is NOT green-by-design in a
-headless container and is long-running; it is classified separately (see the
-"Note on the full test suite" section of QA/README.md). This frame is scoped
-to the risk-consolidation work delivered.
+Test run for /tmp/blitzy/stocksharp-storedprocedures/blitzy-e686e219-30ce-45cc-8608-8ea778391629_28a5ac/Tests/bin/Release/net10.0/StockSharp.Tests.dll (.NETCoreApp,Version=v10.0)
+A total of 1 test files matched the specified pattern.
+Results File: /tmp/blitzy/stocksharp-storedprocedures/blitzy-e686e219-30ce-45cc-8608-8ea778391629_28a5ac/QA/logs/test_targeted_net10.0.trx
+
+Passed!  - Failed:     0, Passed:   196, Skipped:     0, Total:   196, Duration: 7 s - StockSharp.Tests.dll (net10.0)
+
+# Per-class breakdown parsed from the genuine TRX (QA/logs/test_targeted_net10.0.trx):
+#   RiskTests 85
+#   CommissionTests 34
+#   PreTradeRiskServiceTests 40
+#   PositionRecalculationTests 37
+#   -------------------------------
+#   TOTAL 196   (of which 47 are Live_* integration tests run against the real SQL Server 2022 container)
+#
+# Scope note (finding #21): this is the FOCUSED risk-consolidation suite - the four test classes
+# this refactor owns (RiskTests, CommissionTests, PreTradeRiskServiceTests, PositionRecalculationTests).
+# The full multi-project solution suite also contains external-dependency/integration tests outside
+# this refactor's scope; no full-solution pass/fail tally is claimed here - only this observed 196/196 run,
+# for which the complete raw TRX is retained under QA/logs/.

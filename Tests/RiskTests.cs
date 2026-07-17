@@ -244,12 +244,15 @@ public class RiskTests : BaseTestClass
 	[TestMethod]
 	public void ManagerCreateRulesDisabledValuesProduceNoRule()
 	{
-		// Null and non-positive ceilings, and a fully-null frequency pair, are all "not enforced".
+		// Null and ZERO ceilings, and a fully-null frequency pair, are all the AAP-mandated "not enforced"
+		// convention (AAP §0.3.1): they produce no rule. A NEGATIVE ceiling is NOT "not enforced" - it is a
+		// configuration error that must fail closed, proven separately by
+		// ManagerCreateRulesNegativeConfigFailsClosed (review findings CR-7 / CR-12).
 		var limits = new RiskLimitSet
 		{
 			MaxOrderPrice = 0m,
 			MaxOrderQty = null,
-			MaxOrderValue = -1m,
+			MaxOrderValue = 0m,
 			MaxPositionSize = 0m,
 			MaxDailyVolume = null,
 			MaxCommissionTotal = 0m,
@@ -261,6 +264,54 @@ public class RiskTests : BaseTestClass
 		var manager = new RiskManager();
 		manager.ApplyCanonicalLimits(limits);
 		manager.Rules.Count.AssertEqual(0);
+	}
+
+	[TestMethod]
+	public void ManagerCreateRulesNegativeConfigFailsClosed()
+	{
+		// CR-7 / CR-12: a NEGATIVE ceiling, a negative commission rate, or a half-specified frequency pair
+		// must FAIL CLOSED (throw) rather than being silently treated as "not enforced" (which would disable
+		// the check - the previous fail-open behaviour). The circuit-breaker factory routes through the single
+		// authoritative RiskLimitSet.Validate, so it rejects exactly the same malformed configurations the
+		// pre-trade gate rejects, closing the gate-vs-factory inconsistency the review flagged.
+		ThrowsExactly<ArgumentException>(() => RiskManager.CreateRules(new RiskLimitSet { MaxOrderPrice = -1m }, RiskActions.StopTrading));
+		ThrowsExactly<ArgumentException>(() => RiskManager.CreateRules(new RiskLimitSet { MaxOrderQty = -1m }, RiskActions.StopTrading));
+		ThrowsExactly<ArgumentException>(() => RiskManager.CreateRules(new RiskLimitSet { MaxOrderValue = -1m }, RiskActions.StopTrading));
+		ThrowsExactly<ArgumentException>(() => RiskManager.CreateRules(new RiskLimitSet { MaxPositionSize = -1m }, RiskActions.StopTrading));
+		ThrowsExactly<ArgumentException>(() => RiskManager.CreateRules(new RiskLimitSet { MaxDailyVolume = -1m }, RiskActions.StopTrading));
+		ThrowsExactly<ArgumentException>(() => RiskManager.CreateRules(new RiskLimitSet { MaxCommissionTotal = -1m }, RiskActions.StopTrading));
+		ThrowsExactly<ArgumentException>(() => RiskManager.CreateRules(new RiskLimitSet { CommissionRate = -0.0001m }, RiskActions.StopTrading));
+
+		// A negative apply must leave the existing configuration untouched (built-first-then-swap), exactly
+		// like the malformed-frequency case.
+		var manager = new RiskManager();
+		manager.ApplyCanonicalLimits(new RiskLimitSet { MaxOrderPrice = 500m });
+		manager.Rules.Count.AssertEqual(1);
+		ThrowsExactly<ArgumentException>(() => manager.ApplyCanonicalLimits(new RiskLimitSet { MaxOrderValue = -1m }));
+		manager.Rules.Count.AssertEqual(1);
+		manager.Rules.OfType<RiskOrderPriceRule>().Single().Price.AssertEqual(500m);
+	}
+
+	[TestMethod]
+	public void RiskLimitSetValidateAcceptsNullZeroAndPositive()
+	{
+		// The authoritative validator ACCEPTS the AAP "not enforced" convention (null/0) and positive values,
+		// so Validate() only ever rejects genuinely malformed configuration (negatives / half-specified freq).
+		new RiskLimitSet().Validate(); // all-null => unlimited, valid
+		new RiskLimitSet
+		{
+			MaxOrderPrice = 0m,
+			MaxOrderQty = 1000m,
+			MaxOrderValue = 0m,
+			MaxPositionSize = 100m,
+			MaxDailyVolume = 250000m,
+			MaxOrderFreqCount = 5,
+			MaxOrderFreqWindowSeconds = 60,
+			MaxCommissionTotal = 5000m,
+			CommissionRate = 0.0005m,
+		}.Validate();
+		// Both-null frequency is coherently "not enforced", not malformed.
+		new RiskLimitSet { MaxOrderPrice = 500m }.Validate();
 	}
 
 	[TestMethod]
@@ -373,13 +424,12 @@ public class RiskTests : BaseTestClass
 		var token = CancellationToken;
 		var testAdapter = new TestInnerAdapter();
 		var riskManager = new RiskManager();
-		IRiskManager asAbstraction = riskManager; // drive configuration purely through the abstraction (MA-1)
 		var adapter = new RiskMessageAdapter(testAdapter, riskManager);
 
 		var messages = new List<Message>();
 		adapter.NewOutMessageAsync += (m, ct) => { messages.Add(m); return default; };
 
-		asAbstraction.ApplyCanonicalLimits(new RiskLimitSet { MaxPositionSize = 100m }, RiskActions.StopTrading);
+		riskManager.ApplyCanonicalLimits(new RiskLimitSet { MaxPositionSize = 100m }, RiskActions.StopTrading);
 
 		// Trip the SHORT side to also exercise CR-2 through the pipeline.
 		await adapter.SendInMessageAsync(new PositionChangeMessage
@@ -432,6 +482,53 @@ public class RiskTests : BaseTestClass
 		var clone = manager.Clone();
 		clone.Rules.Count.AssertEqual(originalCount);
 		clone.Rules.OfType<RiskPositionSizeRule>().Count().AssertEqual(2);
+	}
+
+	[TestMethod]
+	public void ManagerLoadCloneThenReapplyHasNoStaleCanonicalRules()
+	{
+		// CR-2: Save/Load and Clone serialize rules by value and lose the reference identity
+		// ApplyCanonicalLimits tracks in _canonicalRules. Before the fix a reapply AFTER a load/clone kept
+		// the reloaded canonical rules (treated as "unrelated") and APPENDED the replacements, leaving stale
+		// duplicates. Load must reconstruct canonical provenance under _rulesLock so a subsequent apply
+		// replaces the reloaded canonical rules cleanly while still preserving genuinely unrelated rules.
+		var manager = new RiskManager();
+
+		// One unrelated (non-canonical) rule that must survive a load-then-reapply, plus three canonical rules.
+		var pnl = new RiskPnLRule { PnL = new() { Value = -1000, Type = UnitTypes.Absolute }, Action = RiskActions.StopTrading };
+		manager.Rules.Add(pnl);
+		manager.ApplyCanonicalLimits(new RiskLimitSet { MaxOrderPrice = 500m, MaxOrderQty = 1000m, MaxCommissionTotal = 5000m }, RiskActions.StopTrading);
+		manager.Rules.Count.AssertEqual(4); // pnl + price + qty + commission
+
+		var storage = new SettingsStorage();
+		manager.Save(storage);
+
+		// --- Load path: reapply a DIFFERENT canonical set on the loaded manager ---
+		var loaded = new RiskManager();
+		loaded.Load(storage);
+		loaded.Rules.Count.AssertEqual(4);
+
+		loaded.ApplyCanonicalLimits(new RiskLimitSet { MaxOrderValue = 999m });
+		// The reloaded canonical rules are REPLACED (no stale price/qty/commission, no duplicates); the
+		// non-canonical PnL rule is preserved; only the new value rule remains canonical.
+		loaded.Rules.OfType<RiskOrderPriceRule>().Any().AssertFalse();
+		loaded.Rules.OfType<RiskOrderVolumeRule>().Any().AssertFalse();
+		loaded.Rules.OfType<RiskOrderCommissionRule>().Any().AssertFalse();
+		loaded.Rules.OfType<RiskOrderValueRule>().Single().Value.AssertEqual(999m);
+		loaded.Rules.OfType<RiskPnLRule>().Count().AssertEqual(1);
+		loaded.Rules.Count.AssertEqual(2); // value + pnl
+
+		// --- Clone path: Clone delegates to Load, so provenance is reconstructed identically ---
+		var clone = (RiskManager)manager.Clone();
+		clone.Rules.Count.AssertEqual(4);
+
+		clone.ApplyCanonicalLimits(new RiskLimitSet { MaxOrderValue = 777m });
+		clone.Rules.OfType<RiskOrderPriceRule>().Any().AssertFalse();
+		clone.Rules.OfType<RiskOrderVolumeRule>().Any().AssertFalse();
+		clone.Rules.OfType<RiskOrderCommissionRule>().Any().AssertFalse();
+		clone.Rules.OfType<RiskOrderValueRule>().Single().Value.AssertEqual(777m);
+		clone.Rules.OfType<RiskPnLRule>().Count().AssertEqual(1);
+		clone.Rules.Count.AssertEqual(2); // value + pnl
 	}
 
 	[TestMethod]
@@ -1062,39 +1159,29 @@ public class RiskTests : BaseTestClass
 			Action = RiskActions.CancelOrders
 		};
 
-		var startTime = DateTime.UtcNow;
+		// The rule stamps each order with the TRUSTED processing clock (review finding CR-28), NOT the
+		// caller-supplied Message.LocalTime, so the timeline is driven deterministically through the
+		// injected clock. (LocalTime is deliberately ignored and left unset on the messages below.)
+		var startTime = new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+		var clock = startTime;
+		rule.UtcNow = () => clock;
 
 		for (int i = 0; i < 2; i++)
 		{
-			var orderMsg = new OrderRegisterMessage
-			{
-				SecurityId = Helper.CreateSecurityId(),
-				LocalTime = startTime.AddSeconds(i)
-			};
-
-			rule.ProcessMessage(orderMsg).AssertFalse();
+			clock = startTime.AddSeconds(i);
+			rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId() }).AssertFalse();
 		}
 
-		var thirdOrderMsg = new OrderRegisterMessage
-		{
-			SecurityId = Helper.CreateSecurityId(),
-			LocalTime = startTime.AddSeconds(5)
-		};
+		clock = startTime.AddSeconds(5);
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId() }).AssertTrue();
 
-		rule.ProcessMessage(thirdOrderMsg).AssertTrue();
-
-		var fourthOrderMsg = new OrderRegisterMessage
-		{
-			SecurityId = Helper.CreateSecurityId(),
-			LocalTime = startTime.AddSeconds(6)
-		};
-
+		clock = startTime.AddSeconds(6);
 		// Rolling-count semantics: the trailing Interval window at t+6s still contains the three
 		// prior orders (t+0s, t+1s, t+5s), so this order also trips (recentCount 3 + 1 >= Count 3).
 		// The former fixed-window rule reset its bucket once the third order tripped and would have
 		// returned false here; the rolling count is a deliberate, at-least-as-strict tightening and
 		// keeps rejecting while the window stays saturated.
-		rule.ProcessMessage(fourthOrderMsg).AssertTrue();
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId() }).AssertTrue();
 	}
 
 	[TestMethod]
@@ -1106,15 +1193,16 @@ public class RiskTests : BaseTestClass
 			Interval = TimeSpan.FromSeconds(10)
 		};
 
-		var orderMsg = new OrderRegisterMessage
-		{
-			SecurityId = Helper.CreateSecurityId(),
-			LocalTime = DateTime.UtcNow
-		};
+		// Drive the trusted clock (review finding CR-28); all three orders fall inside a single window.
+		var clock = new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+		rule.UtcNow = () => clock;
+
+		var orderMsg = new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId() };
 
 		rule.ProcessMessage(orderMsg);
 		rule.Reset();
 
+		// After Reset the rolling state (and watermark) are cleared, so counting restarts from zero.
 		rule.ProcessMessage(orderMsg).AssertFalse();
 		rule.ProcessMessage(orderMsg).AssertTrue();
 	}
@@ -1149,24 +1237,23 @@ public class RiskTests : BaseTestClass
 		// Old fixed-window fire vector (characterization of the pre-refactor algorithm).
 		var oldFires = OldFixedWindowFires(count, interval, times);
 
-		// New rolling-count fire vector: feed the identical timestamps into a single fresh delivered rule.
+		// New rolling-count fire vector: feed the identical timestamps into a single fresh delivered rule
+		// by driving its TRUSTED clock (review finding CR-28) - the rule ignores Message.LocalTime.
 		var rule = new RiskOrderFreqRule
 		{
 			Count = count,
 			Interval = interval,
 		};
 
+		var clock = start;
+		rule.UtcNow = () => clock;
+
 		var newFires = new bool[times.Length];
 
 		for (var i = 0; i < times.Length; i++)
 		{
-			var msg = new OrderRegisterMessage
-			{
-				SecurityId = Helper.CreateSecurityId(),
-				LocalTime = times[i],
-			};
-
-			newFires[i] = rule.ProcessMessage(msg);
+			clock = times[i];
+			newFires[i] = rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId() });
 		}
 
 		// Never-looser: whenever the old fixed-window rule fired, the new rolling rule must also fire.
@@ -1239,26 +1326,19 @@ public class RiskTests : BaseTestClass
 			Interval = TimeSpan.FromSeconds(60),
 		};
 
-		var start = DateTime.UtcNow;
+		// Drive the trusted clock (review finding CR-28); the rule ignores Message.LocalTime.
+		var start = new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+		var clock = start;
+		rule.UtcNow = () => clock;
 
 		foreach (var off in new[] { 0, 1, 2, 59 })
 		{
-			var msg = new OrderRegisterMessage
-			{
-				SecurityId = Helper.CreateSecurityId(),
-				LocalTime = start.AddSeconds(off),
-			};
-
-			rule.ProcessMessage(msg).AssertFalse();
+			clock = start.AddSeconds(off);
+			rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId() }).AssertFalse();
 		}
 
-		var boundaryMsg = new OrderRegisterMessage
-		{
-			SecurityId = Helper.CreateSecurityId(),
-			LocalTime = start.AddSeconds(60),
-		};
-
-		rule.ProcessMessage(boundaryMsg).AssertTrue();
+		clock = start.AddSeconds(60);
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId() }).AssertTrue();
 	}
 
 	[TestMethod]
@@ -1276,14 +1356,23 @@ public class RiskTests : BaseTestClass
 			Interval = TimeSpan.FromSeconds(50),
 		};
 
-		var start = DateTime.UtcNow;
+		// Drive the trusted clock (review finding CR-28); the rule ignores Message.LocalTime. The final
+		// step moves the clock BACKWARD (200s -> 100s), exercising the bounded-skew fail-closed path.
+		var start = new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+		var clock = start;
+		rule.UtcNow = () => clock;
 
-		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), LocalTime = start.AddSeconds(80) }).AssertFalse();
-		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), LocalTime = start.AddSeconds(90) }).AssertFalse();
-		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), LocalTime = start.AddSeconds(200) }).AssertFalse();
+		clock = start.AddSeconds(80);
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId() }).AssertFalse();
+		clock = start.AddSeconds(90);
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId() }).AssertFalse();
+		clock = start.AddSeconds(200);
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId() }).AssertFalse();
 
-		// Late (out-of-order) event: trips conservatively rather than silently under-counting.
-		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), LocalTime = start.AddSeconds(100) }).AssertTrue();
+		// Backward clock step (200s -> 100s): the bounded state for the earlier instant may already have
+		// been evicted, so the rule trips conservatively (fail closed) rather than silently under-counting.
+		clock = start.AddSeconds(100);
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId() }).AssertTrue();
 	}
 
 	[TestMethod]
@@ -1336,6 +1425,244 @@ public class RiskTests : BaseTestClass
 
 			rule.ProcessMessage(msg);
 		});
+	}
+
+	// Reflection seam: the rolling-count queue is private state; the CR-6 capacity-bound test reads its
+	// size to prove the bound holds continuously. RiskOrderFreqRule has no InternalsVisibleTo, so a test
+	// process reflects the private field (Queue<DateTime> exposes the non-generic ICollection.Count).
+	private static int FreqQueueCount(RiskOrderFreqRule rule)
+	{
+		var field = typeof(RiskOrderFreqRule).GetField("_times", BindingFlags.NonPublic | BindingFlags.Instance);
+		return ((System.Collections.ICollection)field.GetValue(rule)).Count;
+	}
+
+	// Reflection seam: the running commission total is private base state; the CR-15 thread-safety and
+	// overflow tests read it directly to assert exact/saturated accumulation.
+	private static decimal CommissionTotal(RiskTransactionCommissionRule rule)
+	{
+		var field = typeof(RiskTransactionCommissionRule).GetField("_totalCommission", BindingFlags.NonPublic | BindingFlags.Instance);
+		return (decimal)field.GetValue(rule);
+	}
+
+	[TestMethod]
+	public void OrderFreqCapacityBoundedUnderSaturation()
+	{
+		// CR-6 (DoS/saturation safety): once saturated, the rolling-count queue must retain at most
+		// (Count - 1) timestamps regardless of burst size, so a sustained order stream cannot grow its
+		// memory without bound. A wide window ensures nothing is evicted by TIME - only the capacity bound
+		// can keep the queue small - and we assert the bound holds after every single order in the burst.
+		const int count = 5;
+		var rule = new RiskOrderFreqRule
+		{
+			Count = count,
+			Interval = TimeSpan.FromHours(1),
+		};
+
+		var clock = new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+		rule.UtcNow = () => clock;
+
+		for (var i = 0; i < 20_000; i++)
+		{
+			clock = clock.AddMilliseconds(1); // strictly increasing, all inside the 1h window
+			var breached = rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId() });
+
+			// Correctness is preserved: the rule trips from the Count-th order onward while saturated.
+			breached.AssertEqual(i + 1 >= count);
+
+			// The retained-timestamp count never exceeds (Count - 1), proving the bound holds continuously.
+			(FreqQueueCount(rule) <= count - 1).AssertTrue();
+		}
+
+		// After a long saturated burst the queue is pinned exactly at the (Count - 1) bound.
+		FreqQueueCount(rule).AssertEqual(count - 1);
+	}
+
+	[TestMethod]
+	public void OrderFreqIgnoresUntrustedMessageTime()
+	{
+		// CR-28 / CWE-20 / CWE-367: the rule stamps orders with the trusted clock and IGNORES the
+		// caller-supplied Message.LocalTime, so a manipulated, stale, or absent LocalTime can neither
+		// advance nor dodge the window. Five orders carrying wildly different (unset / far-future /
+		// far-past / MinValue / MaxValue) LocalTime values, all processed at the same trusted instant,
+		// count as five within the 60s window and trip only on the fifth.
+		var rule = new RiskOrderFreqRule { Count = 5, Interval = TimeSpan.FromSeconds(60) };
+
+		var clock = new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+		rule.UtcNow = () => clock;
+
+		var bogusTimes = new[]
+		{
+			default,
+			clock.AddYears(10),
+			clock.AddYears(-10),
+			DateTime.MaxValue,
+			DateTime.MinValue,
+		};
+
+		for (var i = 0; i < bogusTimes.Length; i++)
+		{
+			var breached = rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), LocalTime = bogusTimes[i] });
+			breached.AssertEqual(i == bogusTimes.Length - 1); // only the 5th trips
+		}
+	}
+
+	[TestMethod]
+	public void OrderPriceSubScaleBoundaryMatchesGate()
+	{
+		// CR-27: the stream rule normalizes to DECIMAL(18,4) exactly like the gate/persistence, so a
+		// sub-scale price that rounds UP to the ceiling trips here too (it can no longer slip through as
+		// "just below" while the gate would round it up and reject).
+		var rule = new RiskOrderPriceRule { Price = 500m };
+
+		// 499.99996 rounds (away-from-zero, 4dp) to 500.0000 >= 500 -> trips (gate parity).
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Price = 499.99996m }).AssertTrue();
+		// 499.99994 rounds to 499.9999 < 500 -> does not trip.
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Price = 499.99994m }).AssertFalse();
+	}
+
+	[TestMethod]
+	public void OrderVolumeSubScaleBoundaryMatchesGate()
+	{
+		// CR-27: sub-scale quantity normalization parity with the gate.
+		var rule = new RiskOrderVolumeRule { Volume = 1000m };
+
+		// 999.99996 rounds to 1000.0000 >= 1000 -> trips.
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Volume = 999.99996m }).AssertTrue();
+		// 999.99994 rounds to 999.9999 < 1000 -> does not trip.
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Volume = 999.99994m }).AssertFalse();
+	}
+
+	[TestMethod]
+	public void OrderValueSubScaleBoundaryMatchesGate()
+	{
+		// CR-27: the notional rule normalizes BOTH factors to DECIMAL(18,4) before multiplying, mirroring
+		// the gate computing (qty * price) on persisted-scale values.
+		var rule = new RiskOrderValueRule { Value = 500m };
+
+		// 1 * 499.99996 -> 1.0000 * 500.0000 = 500.0000 >= 500 -> trips.
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Volume = 1m, Price = 499.99996m }).AssertTrue();
+		// 1 * 499.99994 -> 1.0000 * 499.9999 = 499.9999 < 500 -> does not trip.
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Volume = 1m, Price = 499.99994m }).AssertFalse();
+	}
+
+	[TestMethod]
+	public void DailyVolumeSubScaleAccumulationMatchesGate()
+	{
+		// CR-27: each submitted volume is normalized to DECIMAL(18,4) BEFORE accumulation, so two orders
+		// of 499.99996 accumulate as 500.0000 + 500.0000 = 1000.0000 and trip the 1000 ceiling. Summing the
+		// RAW values would give 999.99992 (< 1000) and NOT trip - the exact sub-scale looseness CR-27 fixes.
+		var rule = new RiskDailyVolumeRule { Volume = 1000m };
+
+		var clock = new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+		rule.UtcNow = () => clock;
+
+		var pf = Helper.CreatePortfolio().Name;
+		var sec = Helper.CreateSecurityId();
+
+		rule.ProcessMessage(new OrderRegisterMessage { PortfolioName = pf, SecurityId = sec, Volume = 499.99996m }).AssertFalse(); // 500.0000
+		rule.ProcessMessage(new OrderRegisterMessage { PortfolioName = pf, SecurityId = sec, Volume = 499.99996m }).AssertTrue();  // 1000.0000 >= 1000
+	}
+
+	[TestMethod]
+	public void CommissionOrderDeduplicatesReplayByTradeId()
+	{
+		// CR-15 (concurrency/replay security): a re-delivered execution with the same stable identity must
+		// be counted at most once, so a transport replay/reconnect cannot inflate the running commission
+		// and trip the breaker on phantom cost.
+		var rule = new RiskOrderCommissionRule { Commission = 100m, Action = RiskActions.CancelOrders };
+
+		static ExecutionMessage Fill(long tradeId, decimal commission) => new()
+		{
+			DataTypeEx = DataType.Transactions,
+			HasOrderInfo = true,
+			SecurityId = Helper.CreateSecurityId(),
+			ServerTime = DateTime.UtcNow,
+			TradeId = tradeId,
+			TradePrice = 100m,
+			TradeVolume = 1m,
+			Commission = commission,
+		};
+
+		// First fill: total 60 (< 100).
+		rule.ProcessMessage(Fill(1, 60m)).AssertFalse();
+		// Exact re-delivery of trade #1: deduplicated, total stays 60 (< 100).
+		rule.ProcessMessage(Fill(1, 60m)).AssertFalse();
+		CommissionTotal(rule).AssertEqual(60m);
+		// A genuinely distinct fill (#2): total 120 (>= 100) -> trips.
+		rule.ProcessMessage(Fill(2, 60m)).AssertTrue();
+		CommissionTotal(rule).AssertEqual(120m);
+	}
+
+	[TestMethod]
+	public void CommissionOrderDeduplicatesBySeqNum()
+	{
+		// CR-15: when present, SeqNum is the strongest per-message identity; a replayed message with the
+		// same SeqNum is counted once, a distinct SeqNum is counted again.
+		var rule = new RiskOrderCommissionRule { Commission = 100m };
+
+		static ExecutionMessage Msg(long seqNum, decimal commission) => new()
+		{
+			DataTypeEx = DataType.Transactions,
+			HasOrderInfo = true,
+			SecurityId = Helper.CreateSecurityId(),
+			ServerTime = DateTime.UtcNow,
+			SeqNum = seqNum,
+			OrderId = 42,
+			Commission = commission,
+		};
+
+		rule.ProcessMessage(Msg(7, 60m)).AssertFalse();
+		rule.ProcessMessage(Msg(7, 60m)).AssertFalse(); // same SeqNum -> deduplicated
+		CommissionTotal(rule).AssertEqual(60m);
+		rule.ProcessMessage(Msg(8, 60m)).AssertTrue();  // distinct SeqNum -> counted -> 120 >= 100
+	}
+
+	[TestMethod]
+	public void CommissionAccumulationIsThreadSafe()
+	{
+		// CR-15: concurrent delivery must not lose updates. Feed N distinct executions (distinct SeqNum)
+		// from many threads; the locked, saturating accumulation must total EXACTLY N (no torn adds).
+		const int n = 2000;
+		var rule = new RiskOrderCommissionRule { Commission = decimal.MaxValue }; // ceiling never trips; we measure the total
+
+		System.Threading.Tasks.Parallel.For(0, n, i =>
+		{
+			rule.ProcessMessage(new ExecutionMessage
+			{
+				DataTypeEx = DataType.Transactions,
+				HasOrderInfo = true,
+				SecurityId = Helper.CreateSecurityId(),
+				ServerTime = DateTime.UtcNow,
+				SeqNum = i + 1, // distinct, non-zero identity per message
+				Commission = 1m,
+			});
+		});
+
+		CommissionTotal(rule).AssertEqual((decimal)n);
+	}
+
+	[TestMethod]
+	public void CommissionOverflowSaturates()
+	{
+		// CR-15: a pathological commission stream must SATURATE rather than throw on decimal overflow.
+		var rule = new RiskOrderCommissionRule { Commission = 100m, Action = RiskActions.StopTrading };
+
+		static ExecutionMessage Huge(long tradeId) => new()
+		{
+			DataTypeEx = DataType.Transactions,
+			HasOrderInfo = true,
+			SecurityId = Helper.CreateSecurityId(),
+			ServerTime = DateTime.UtcNow,
+			TradeId = tradeId,
+			TradePrice = 1m,
+			TradeVolume = 1m,
+			Commission = decimal.MaxValue,
+		};
+
+		rule.ProcessMessage(Huge(1)).AssertTrue();          // total = decimal.MaxValue (>= 100)
+		// A second near-overflow add must saturate (catch OverflowException) and remain a breach.
+		rule.ProcessMessage(Huge(2)).AssertTrue();
+		CommissionTotal(rule).AssertEqual(decimal.MaxValue);
 	}
 
 	[TestMethod]
@@ -1400,26 +1727,38 @@ public class RiskTests : BaseTestClass
 		var pf = Helper.CreatePortfolio().Name;
 		var sec1 = Helper.CreateSecurityId();
 		var sec2 = Helper.CreateSecurityId();
+
+		// The day bucket is taken from the TRUSTED clock (review findings CR-28 / CR-24), NOT the
+		// caller-supplied Message.LocalTime, so the rollover is driven deterministically through the
+		// injected clock. (LocalTime is deliberately ignored and left unset on the messages below.)
 		var day = new DateTime(2024, 1, 2, 10, 0, 0, DateTimeKind.Utc);
+		var clock = day;
+		rule.UtcNow = () => clock;
 
 		// Accumulate within the (pf, sec1) partition.
-		rule.ProcessMessage(new OrderRegisterMessage { PortfolioName = pf, SecurityId = sec1, Volume = 600, LocalTime = day }).AssertFalse();
+		rule.ProcessMessage(new OrderRegisterMessage { PortfolioName = pf, SecurityId = sec1, Volume = 600 }).AssertFalse();
 		// A different security in the same portfolio is a separate partition and does not aggregate.
-		rule.ProcessMessage(new OrderRegisterMessage { PortfolioName = pf, SecurityId = sec2, Volume = 600, LocalTime = day.AddMinutes(1) }).AssertFalse();
+		clock = day.AddMinutes(1);
+		rule.ProcessMessage(new OrderRegisterMessage { PortfolioName = pf, SecurityId = sec2, Volume = 600 }).AssertFalse();
 		// Back to sec1: 600 + 600 = 1200 >= 1000 trips (proves sec2's 600 did NOT leak into sec1's total).
-		rule.ProcessMessage(new OrderRegisterMessage { PortfolioName = pf, SecurityId = sec1, Volume = 600, LocalTime = day.AddMinutes(2) }).AssertTrue();
+		clock = day.AddMinutes(2);
+		rule.ProcessMessage(new OrderRegisterMessage { PortfolioName = pf, SecurityId = sec1, Volume = 600 }).AssertTrue();
 
-		// Crossing to a newer UTC day clears the prior day's partition totals.
+		// Crossing to a newer UTC day (per the trusted clock) clears the prior day's partition totals.
 		var nextDay = day.AddDays(1);
-		rule.ProcessMessage(new OrderRegisterMessage { PortfolioName = pf, SecurityId = sec1, Volume = 600, LocalTime = nextDay }).AssertFalse();
+		clock = nextDay;
+		rule.ProcessMessage(new OrderRegisterMessage { PortfolioName = pf, SecurityId = sec1, Volume = 600 }).AssertFalse();
 		// Non-positive (malformed) volume is not accumulated.
-		rule.ProcessMessage(new OrderRegisterMessage { PortfolioName = pf, SecurityId = sec1, Volume = -500, LocalTime = nextDay.AddMinutes(1) }).AssertFalse();
+		clock = nextDay.AddMinutes(1);
+		rule.ProcessMessage(new OrderRegisterMessage { PortfolioName = pf, SecurityId = sec1, Volume = -500 }).AssertFalse();
 		// Replace message counts as additional submitted volume: 600 + 600 = 1200 >= 1000 trips.
-		rule.ProcessMessage(new OrderReplaceMessage { PortfolioName = pf, SecurityId = sec1, Volume = 600, LocalTime = nextDay.AddMinutes(2) }).AssertTrue();
+		clock = nextDay.AddMinutes(2);
+		rule.ProcessMessage(new OrderReplaceMessage { PortfolioName = pf, SecurityId = sec1, Volume = 600 }).AssertTrue();
 
 		// Reset clears all partitioned state.
 		rule.Reset();
-		rule.ProcessMessage(new OrderRegisterMessage { PortfolioName = pf, SecurityId = sec1, Volume = 600, LocalTime = nextDay.AddMinutes(3) }).AssertFalse();
+		clock = nextDay.AddMinutes(3);
+		rule.ProcessMessage(new OrderRegisterMessage { PortfolioName = pf, SecurityId = sec1, Volume = 600 }).AssertFalse();
 	}
 
 	[TestMethod]
@@ -1440,14 +1779,12 @@ public class RiskTests : BaseTestClass
 	}
 
 	[TestMethod]
-	public void DailyVolumeFutureTimestampCannotDisableEnforcement()
+	public void DailyVolumeUsesTrustedClockNotMessageTime()
 	{
-		// CR-3 adversarial timestamp test. A future-dated message (adversarial input or clock skew)
-		// must NOT be able to advance the active UTC day and clear the current day's totals - which,
-		// pre-fix, made every subsequent REAL current-day message look stale (day < _currentUtcDay) and
-		// be silently ignored, disabling daily-volume enforcement until the wall clock caught up. The
-		// fix clamps a future-dated message's effective day to the wall-clock UTC day, so it accumulates
-		// against today rather than erasing it, and later current-day messages remain enforced.
+		// CR-28 / CWE-20 / CWE-367 adversarial timestamp test. The accumulation day is taken from the
+		// TRUSTED processing clock, never from the caller-supplied Message.LocalTime, so timestamp
+		// manipulation cannot dodge the daily cap. This trusted-clock design subsumes the earlier CR-3
+		// future-day clamp: the message timestamp no longer influences the active day at all.
 		var rule = new RiskDailyVolumeRule
 		{
 			Volume = 1000,
@@ -1457,23 +1794,23 @@ public class RiskTests : BaseTestClass
 		var pf = Helper.CreatePortfolio().Name;
 		var sec = Helper.CreateSecurityId();
 
-		var now = DateTime.UtcNow;
-		var future = now.AddDays(5); // far-future adversarial timestamp
+		// Freeze the trusted clock at a fixed "today"; the injected clock is the ONLY thing that moves days.
+		var today = new DateTime(2024, 6, 15, 12, 0, 0, DateTimeKind.Utc);
+		var clock = today;
+		rule.UtcNow = () => clock;
 
-		// 1) A future-dated message arrives first. Pre-fix this advanced the active day to +5d and
-		//    cleared/created that future partition; post-fix it is clamped to today and accumulates
-		//    600 against today's (pf, sec) partition (600 < 1000, so no trip yet).
-		rule.ProcessMessage(new OrderRegisterMessage { PortfolioName = pf, SecurityId = sec, Volume = 600, LocalTime = future }).AssertFalse();
+		// 1) A FUTURE-dated message (adversarial input or clock skew). It cannot advance the active day
+		//    or relocate to a future bucket; it accumulates against today (600 < 1000, no trip yet).
+		rule.ProcessMessage(new OrderRegisterMessage { PortfolioName = pf, SecurityId = sec, Volume = 600, LocalTime = today.AddDays(5) }).AssertFalse();
 
-		// 2) A REAL current-day message. Pre-fix: now < _currentUtcDay(+5d) -> treated as stale ->
-		//    IGNORED (returns false), so enforcement was silently disabled and this could never trip.
-		//    Post-fix: today's partition already holds 600 (from the clamped future message), so this
-		//    adds 600 -> 1200 >= 1000 and correctly trips - proving current-day enforcement is intact.
-		rule.ProcessMessage(new OrderRegisterMessage { PortfolioName = pf, SecurityId = sec, Volume = 600, LocalTime = now }).AssertTrue();
+		// 2) A BACK-dated message. Pre-fix (message-time bucketing) this looked "stale" and was silently
+		//    dropped - a bypass that let an attacker dodge the cap by back-dating. Now it is counted
+		//    against today: 600 + 600 = 1200 >= 1000 -> trips, proving back-dating cannot weaken the cap.
+		rule.ProcessMessage(new OrderRegisterMessage { PortfolioName = pf, SecurityId = sec, Volume = 600, LocalTime = today.AddDays(-3) }).AssertTrue();
 
-		// 3) A genuinely PAST-dated message from an already-closed earlier day is still treated as stale
-		//    and not accumulated (historical replay/backtests are unaffected by the CR-3 clamp).
-		rule.ProcessMessage(new OrderRegisterMessage { PortfolioName = pf, SecurityId = sec, Volume = 5000, LocalTime = now.AddDays(-3) }).AssertFalse();
+		// 3) Only advancing the TRUSTED clock rolls the day and clears totals; a fresh 600 no longer trips.
+		clock = today.AddDays(1);
+		rule.ProcessMessage(new OrderRegisterMessage { PortfolioName = pf, SecurityId = sec, Volume = 600, LocalTime = today }).AssertFalse();
 	}
 
 	[TestMethod]
@@ -1725,6 +2062,11 @@ public class RiskTests : BaseTestClass
 			var props = ruleType
 				.GetModifiableProps()
 				.Where(p => !excludeProps.Contains(p.Name))
+				// Injectable delegate seams (e.g. the RiskOrderFreqRule / RiskDailyVolumeRule UtcNow test
+				// clock) are deliberately NOT part of the Save/Load serialization contract - they are
+				// transient test hooks that default at construction - so they are excluded from this
+				// generic round-trip (they are neither persisted nor comparable by value).
+				.Where(p => !typeof(Delegate).IsAssignableFrom(p.PropertyType))
 				.ToArray();
 
 			foreach (var prop in props)

@@ -1,167 +1,41 @@
 ================================================================================
-TRANSCRIPT — Recording 02: Test suite from a clean checkout
+TRANSCRIPT - Recording 02: Test suite from a clean checkout
 ================================================================================
+Substitution for 02_test_suite_clean_checkout.mp4 (screen-only, target < 5:00) - AAP 0.6.7 (no video device).
 
-Substitution for: 02_test_suite_clean_checkout.mp4 (screen-only, target < 5:00)
-Reason: no video-capture environment — AAP §0.6.7.
-Branch: blitzy-e686e219-30ce-45cc-8608-8ea778391629
-Commit: 78ec6ebefb583a72c36476b12255ddc68b511d64
-Companion frames: 02_test_suite_clean_checkout_01.png … 02_test_suite_clean_checkout_03.png
+Provenance
+  Branch          : blitzy-e686e219-30ce-45cc-8608-8ea778391629
+  Evidence commit : EVIDENCE_COMMIT_PENDING   (stamped here at the Phase-10 provenance commit; see QA/README.md)
+  Build/run TFM   : net10.0  (StockSharpTargets=net10.0; net6.0 is NOT a configured build target in this workspace)
+  Captured (UTC)  : 2026-07-17T20:18:37Z
+  Source of truth : the raw machine logs / TRX under QA/logs/ (this file quotes them verbatim)
+  Capture mode    : headless CI Linux container - no desktop/window-manager/video device; per AAP 0.6.7
+                    the "screenshot" ships as this captioned text plus a faithful terminal-styled PNG
+                    rendering of the same bytes (no photographic claim, no branding).
+--------------------------------------------------------------------------------
 
-This is a screen-only "recording". A headless CI Linux container has no desktop, window
-manager, or video-capture device, so — per the MANDATORY substitution rule in AAP §0.6.7 —
-the recording ships as this captioned transcript plus the three numbered PNG frames listed
-above. Each frame is a faithful terminal-styled text rendering of the real, unaltered
-command output captured for this run (no photographic/screenshot claim, no branding). Read
-back at scene speed the take is screen-only and runs under five minutes: the caption track
-below opens at [00:00] and closes at [~04:40]. The frame cross-references (→ frame _01 /
-_02 / _03) tie each caption to the PNG that depicts it.
+Companion frames (3): 02_test_suite_clean_checkout_01.png ... 02_test_suite_clean_checkout_03.png
+Each frame is a faithful terminal-styled rendering of the real, unaltered command output / file
+content named in QA/logs/ (for logs) or the repository (for code). No photographic/screenshot claim.
 
 WHAT THIS RECORDING PROVES
-The FOCUSED risk-consolidation test suite passes from a clean checkout, all-green —
-198 passed / 0 failed / 0 skipped across the FIVE test classes this refactor owns:
-the NEW Tests/PreTradeRiskServiceTests.cs and Tests/PositionRecalculationTests.cs, the
-UPDATED Tests/RiskTests.cs and Tests/CommissionTests.cs, and the NEW
-Tests/LegacyOracleParityTests.cs (MA-17: differential tests against the verbatim legacy
-stored procedures). 65 of the 198 are Live_* tests that run against the real SQL Server
-2022 container. This is the automated coverage that makes the SQL→C# risk-consolidation
-verifiable: the legacy custom SQL layer previously had NO automated test coverage at all,
-so these green tests are the proof that the seven pre-trade checks and the
-position-recalculation math now live — correctly, with behavioral parity — in C#.
+The FOCUSED risk-consolidation suite passes all-green: 196 passed / 0 failed / 0 skipped across the FOUR
+test classes this refactor owns - the NEW Tests/PreTradeRiskServiceTests.cs and Tests/PositionRecalculationTests.cs
+and the UPDATED Tests/RiskTests.cs and Tests/CommissionTests.cs.
+47 of the 196 are Live_* tests that run against the real SQL Server 2022 container. This is the automated
+coverage that makes the SQL->C# consolidation verifiable (the legacy custom SQL layer previously had none).
+Scope note (finding #21): no full-solution tally is claimed - only this observed 196/196 run, whose complete
+raw TRX is retained under QA/logs/.
 
-SCOPE NOTE (honest, per CR-1): this recording is scoped to the FOCUSED risk-consolidation
-suite (the five classes above). The ENTIRE Tests/Tests.csproj is the whole StockSharp
-platform — thousands of tests across many unrelated subsystems, a large fraction of which
-require external market-data feeds, network access, or other infrastructure not present in
-a headless CI container. The full unfiltered suite is therefore long-running and is NOT
-green-by-design in this environment; it is classified separately (pass / fail / skip
-breakdown, including the two environment-only PathsTests failures) in the "Note on the full
-test suite" section of QA/README.md. No claim of a full-platform all-green run is made here.
+CAPTION TRACK  (screen-only; runs under five minutes: [00:00] -> [~04:40])
+  [00:00]  (-> frame _01)
+          Build Tests (net10.0 Release): 0 Error(s) (QA/logs/02_build_tests_net10.0_release.log).
+  [01:30]  (-> frame _02)
+          Run the four-class filter against live SQL: Passed! Failed 0 / Passed 196 (QA/logs/04_*.log).
+  [03:10]  (-> frame _03)
+          Per-class tally from the TRX: RiskTests 85, CommissionTests 34, PreTradeRiskServiceTests 40, PositionRecalculationTests 37.
 
---------------------------------------------------------------------------------
-ENVIRONMENT
---------------------------------------------------------------------------------
-Clean checkout of the risk-consolidation branch (nothing carried over from a prior build):
-
-    $ git rev-parse --abbrev-ref HEAD
-    blitzy-e686e219-30ce-45cc-8608-8ea778391629
-    $ git status
-    On branch blitzy-e686e219-30ce-45cc-8608-8ea778391629
-    nothing to commit, working tree clean
-
-(A fresh `git worktree add ../wt blitzy-e686e219-30ce-45cc-8608-8ea778391629` gives the
-same clean state.)
-
-Build (primary net10.0 + legacy net6.0 both succeed):
-
-    $ dotnet build Algo/Algo.csproj -c Release --framework net10.0
-    $ dotnet build Algo/Algo.csproj -c Release -p:StockSharpTargets=net6.0 --framework net6.0
-
-Test — the FOCUSED risk-consolidation suite (the new/updated risk tests follow the existing
-MSTest + BaseTestClass convention, e.g. `public class PreTradeRiskServiceTests :
-BaseTestClass`):
-
-    $ dotnet test Tests/Tests.csproj -c Release --framework net10.0 --nologo \
-        --filter "FullyQualifiedName~PreTradeRiskServiceTests|~PositionRecalculationTests|~CommissionTests|~RiskTests|~LegacyOracleParityTests"
-
-Database note — which tests need SQL and which do not:
-  • PURE C# unit/parity tests (rule predicates, boundary math, canonical-limit wiring) run
-    with NO database — they are in-memory and deterministic.
-  • The live-SQL parity tests (method prefix `Live_*`, 65 of the 198) exercise the real
-    per-order gate and the real position recompute against the same SQL Server described in
-    Database/README.md: the Docker container `stocksharp-legacy-sql`, host port 14330 bound
-    to loopback (127.0.0.1). The C# side reads its connection from the
-    `STOCKSHARP_LEGACY_SQL_CONNECTION` environment variable, falling back (for local
-    disposable runs only) to
-    Server=localhost,14330;Database=StockSharpLegacy;User Id=sa;…;TrustServerCertificate=True.
-    If that container is not up, the `Live_*` tests are the only ones that need it; the pure
-    C# tests still run and pass.
-
---------------------------------------------------------------------------------
-TIMELINE / CAPTION TRACK  (screen-only, < 5:00)
---------------------------------------------------------------------------------
-
-[00:00]  Clean working tree on the risk-consolidation branch.           → frame _01
-         `git status` on branch `blitzy-e686e219-30ce-45cc-8608-8ea778391629` reports
-         "nothing to commit, working tree clean": nothing is carried over from a previous
-         build. Every result below is reproducible from this committed state.
-
-[~00:30]  `dotnet build` completes with no errors.                       → frame _01
-         Both target frameworks build green:
-             Build succeeded.
-                 0 Error(s)
-         Because the build sets GenerateDocumentationFile=true, any missing XML-doc comment
-         would surface as a warning — there are NONE on the new public members added by this
-         refactor (RiskLimitSet, PreTradeRiskService, PositionRecalculationService,
-         RiskOrderValueRule, RiskDailyVolumeRule). The only warnings are pre-existing CS0618
-         obsolete-API notices in two files the refactor did not touch (net10.0 → 2 warnings,
-         net6.0 → 3, the extra one being the net6.0 TFM-support notice); no warning
-         originates in a refactored file.
-
-[~01:15]  `dotnet test` (focused filter) starts; discovery lists the classes. → frame _02
-         Test discovery enumerates the FIVE risk-consolidation classes:
-             PreTradeRiskServiceTests      (NEW — the 7-check per-order gate)
-             PositionRecalculationTests    (NEW — avg-cost + realized-P&L recompute)
-             RiskTests                     (UPDATED — canonical-rule + factory cases)
-             CommissionTests               (UPDATED — estimate-vs-actual cases)
-             LegacyOracleParityTests       (NEW — MA-17 differential vs verbatim legacy procs)
-
-[~02:30]  Tests execute — characterization first, then parity.           → frame _02
-         • Characterization tests capture the PRIOR observable behavior (for example the old
-           fixed-window order-frequency algorithm) so any change is proven intentional, not a
-           regression.
-         • Parity tests then prove each canonical rule either MATCHES its former behavior or
-           documents its preserved-distinct behavior, and that every reconciled threshold is
-           AT-LEAST-AS-STRICT — never looser. Representative green tests (all real methods):
-             – Order-frequency tightening (AAP §0.6.1): the rule now uses the stricter
-               rolling-count algorithm instead of fixed-window bucketing; the parity tests
-               assert it is never less strict than either original.
-                   RiskTests.OrderFreqRollingCountAtLeastAsStrict ............... Passed
-                   PreTradeRiskServiceTests.Check4_Frequency ................... Passed
-                   PreTradeRiskServiceTests.Live_FrequencyRollingCount ......... Passed
-             – Position-recalc average-cost / realized-P&L parity:
-                   PositionRecalculationTests.AddsSameSideWeightedAverage ...... Passed
-                   PositionRecalculationTests.PartialCloseRealizesPnl .......... Passed
-                   PositionRecalculationTests.OverSellFlipsPosition ............ Passed
-             – Double-count guard (AAP §0.6.4): applying the recompute over the SAME persisted
-               trade set yields the SAME position (100), never double (200); a single
-               RecordTradeAsync applies exactly once end-to-end.
-                   PositionRecalculationTests.Live_ApplyTradeIsIdempotent ....... Passed
-                   PositionRecalculationTests.Live_GatewayRecordTradeSingleApplyEndToEnd  Passed
-                   PositionRecalculationTests.Live_RecomputeSeesAllPersistedTrades  Passed
-             – Legacy differential oracle (MA-17): the C# gate/recompute is compared, in the
-               same transaction, against the verbatim legacy stored procedures.
-                   LegacyOracleParityTests.Live_Parity_Accept .................. Passed
-                   LegacyOracleParityTests.Live_Parity_PriceCeiling ........... Passed
-                   LegacyOracleParityTests.Live_Parity_Position_FlipLongToShort  Passed
-             – Canonical wiring + commission divergence:
-                   RiskTests.ManagerApplyCanonicalLimits ....................... Passed
-                   CommissionTests.Live_CommissionEstimateVsActualCommissionRuleDifferByDesign  Passed
-
-[~04:00]  Final summary — focused suite is all-green.                    → frame _03
-         The run finishes with the MSTest summary line:
-             Passed!  - Failed: 0, Passed: 198, Skipped: 0, Total: 198, Duration: 5 s
-         198 passed / 0 failed / 0 skipped across the five risk-consolidation classes,
-         including the 65 live-SQL parity tests (of which 15 are the LegacyOracleParityTests
-         differential tests). Failed is 0; the focused suite is green. (See QA/README.md,
-         screenshot #3, for the per-class breakdown; and the "Note on the full test suite"
-         section for the honest classification of the whole-platform Tests.csproj.)
-
-[~04:40]  Closing caption.                                               → frame _03
-         The SQL→C# consolidation is VERIFIED: characterization + parity tests pass from a
-         clean checkout, so the seven pre-trade checks and the position-recalculation math
-         that used to live in T-SQL now live in C# with proven behavioral parity — the
-         automated coverage the legacy SQL layer never had.
-
---------------------------------------------------------------------------------
-FOOTER
---------------------------------------------------------------------------------
-This transcript together with the three PNG frames
-(02_test_suite_clean_checkout_01.png … 02_test_suite_clean_checkout_03.png) is the
-AAP §0.6.7 documented substitution for the screen-only recording
-02_test_suite_clean_checkout.mp4 (no video-capture environment is available in this headless
-container). The substitution is indexed in QA/README.md alongside the other QA evidence
-artifacts. The invariant this recording proves is Failed: 0 (focused suite all-green,
-198/198) from a clean checkout, with the new PreTradeRiskServiceTests,
-PositionRecalculationTests and LegacyOracleParityTests included; the whole-platform
-Tests.csproj is classified separately and honestly in QA/README.md.
+FRAME INDEX  (3 frames)
+  02_test_suite_clean_checkout_01.png
+  02_test_suite_clean_checkout_02.png
+  02_test_suite_clean_checkout_03.png

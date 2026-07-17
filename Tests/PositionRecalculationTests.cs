@@ -317,6 +317,19 @@ public class PositionRecalculationTests : BaseTestClass
 		await cmd.ExecuteNonQueryAsync(ct);
 	}
 
+	// Inserts a trade with an EXPLICIT executed_date (dbo.Trades.executed_date is DATETIME2(3)), used to
+	// stage backdated / out-of-insertion-order fills so the full-replay's chronological ordering can be
+	// asserted independently of trade_id (identity) order.
+	private static async Task InsertTradeAtAsync(SqlConnection c, SqlTransaction t, long orderId, decimal qty, decimal price, DateTime executedDate, CancellationToken ct)
+	{
+		await using var cmd = new SqlCommand("INSERT INTO dbo.Trades (order_id, qty, price, executed_date) VALUES (@o, @qty, @price, @ed)", c, t);
+		cmd.Parameters.Add(new SqlParameter("@o", SqlDbType.BigInt) { Value = orderId });
+		cmd.Parameters.Add(Money("@qty", qty));
+		cmd.Parameters.Add(Money("@price", price));
+		cmd.Parameters.Add(new SqlParameter("@ed", SqlDbType.DateTime2) { Value = executedDate });
+		await cmd.ExecuteNonQueryAsync(ct);
+	}
+
 	// Reads the persisted position row for a scope (null when no row exists).
 	private static async Task<(decimal Qty, decimal Avg, decimal Realized)?> ReadPositionAsync(SqlConnection c, SqlTransaction t, int portfolioId, int securityId, CancellationToken ct)
 	{
@@ -333,36 +346,8 @@ public class PositionRecalculationTests : BaseTestClass
 		return (reader.GetDecimal(0), reader.GetDecimal(1), reader.GetDecimal(2));
 	}
 
-	// Reads the MI-2 recompute checkpoint (last_applied_trade_id) persisted on the position row. Returns -1
-	// when no row exists yet (distinct from the initial stored value of 0 on a freshly created row).
-	private static async Task<long> ReadCheckpointAsync(SqlConnection c, SqlTransaction t, int portfolioId, int securityId, CancellationToken ct)
-	{
-		await using var cmd = new SqlCommand(
-			"SELECT last_applied_trade_id FROM dbo.Positions WHERE portfolio_id = @p AND security_id = @s", c, t);
-		cmd.Parameters.Add(IntParam("@p", portfolioId));
-		cmd.Parameters.Add(IntParam("@s", securityId));
-
-		var value = await cmd.ExecuteScalarAsync(ct);
-		return value is null or DBNull ? -1L : (long)value;
-	}
-
-	// Reads the highest dbo.Trades.trade_id for a scope, used to assert the checkpoint tracks the latest
-	// applied trade. Returns 0 when the scope has no trades.
-	private static async Task<long> MaxTradeIdAsync(SqlConnection c, SqlTransaction t, int portfolioId, int securityId, CancellationToken ct)
-	{
-		await using var cmd = new SqlCommand(
-			"SELECT ISNULL(MAX(tr.trade_id), 0) FROM dbo.Trades tr " +
-			"INNER JOIN dbo.Orders o ON o.order_id = tr.order_id " +
-			"WHERE o.portfolio_id = @p AND o.security_id = @s", c, t);
-		cmd.Parameters.Add(IntParam("@p", portfolioId));
-		cmd.Parameters.Add(IntParam("@s", securityId));
-
-		return Convert.ToInt64(await cmd.ExecuteScalarAsync(ct));
-	}
-
-	// Counts how many dbo.Trades rows exist for an order. Used by the F2 idempotency tests to prove that a
-	// duplicate RecordTradeAsync (same external_trade_id) inserts the fill exactly once, while an un-keyed
-	// duplicate inserts each call.
+	// Counts how many dbo.Trades rows exist for an order. Used to assert that each RecordTradeAsync call
+	// records a distinct fill: the gateway performs plain CRUD inserts with no server-side de-duplication.
 	private static async Task<int> CountTradesAsync(string connectionString, long orderId)
 	{
 		await using var connection = new SqlConnection(connectionString);
@@ -584,45 +569,44 @@ public class PositionRecalculationTests : BaseTestClass
 			afterTwo.AveragePrice.AssertEqual(155m);
 		});
 
+	// #9 / MI-2: the recompute is a FULL chronological replay ordered by (executed_date, trade_id), NOT by
+	// insertion / trade_id order. A trade inserted LAST but dated in the MIDDLE (a backdated reconciliation
+	// fill) must fold into its chronological position. The scenario is deliberately sequence-sensitive:
+	//   chronological order T1(buy 100@100), T2(buy 100@200), T3(sell 100@180) => qty 100, avg 150, realized 3000
+	//   naive insertion order T1, T3, T2 (T2 has the largest trade_id) would give qty 100, avg 200, realized 8000
+	// so the assertion only holds if the replay honors executed_date, proving backdated correctness (#9/#22).
 	[TestMethod]
-	public Task Live_RecomputeCheckpointAdvancesAndBoundsReplay()
+	public Task Live_BackdatedTradeReconciles()
 		=> RunWithFreshScopeAsync(async (svc, c, t, pid, sid) =>
 		{
-			// MI-2: the recompute persists a checkpoint (dbo.Positions.last_applied_trade_id) so each fill
-			// folds only the NEW trades (trade_id > checkpoint) rather than replaying the entire history.
-			// Prove the checkpoint advances to the latest applied trade after each fill, that the position
-			// still reflects the full set, and that a re-apply is idempotent (folds nothing, no double-count).
+			var baseDate = new DateTime(2026, 1, 2, 9, 30, 0, DateTimeKind.Utc);
 
-			// First fill: the position row is created and the checkpoint advances from the initial 0.
-			var buy1 = await InsertOrderAsync(c, t, pid, sid, 'B', 100m, 150m, default);
-			await InsertTradeAsync(c, t, buy1, 100m, 150m, default);
-			var afterOne = await svc.ApplyTradeAsync(c, t, buy1);
-			afterOne.Quantity.AssertEqual(100m);
+			// T1 - earliest: buy 100 @ 100.
+			var o1 = await InsertOrderAsync(c, t, pid, sid, 'B', 100m, 100m, default);
+			await InsertTradeAtAsync(c, t, o1, 100m, 100m, baseDate, default);
 
-			var maxAfterOne = await MaxTradeIdAsync(c, t, pid, sid, default);
-			var cpAfterOne = await ReadCheckpointAsync(c, t, pid, sid, default);
-			(cpAfterOne > 0).AssertTrue();              // advanced past the initial 0
-			cpAfterOne.AssertEqual(maxAfterOne);         // checkpoint tracks the latest applied trade
+			// T3 - latest: sell 100 @ 180 (inserted BEFORE the backdated T2, so it has a smaller trade_id).
+			var o3 = await InsertOrderAsync(c, t, pid, sid, 'S', 100m, 180m, default);
+			await InsertTradeAtAsync(c, t, o3, 100m, 180m, baseDate.AddMinutes(2), default);
 
-			// Second fill: the checkpoint must advance again and the position reflect BOTH trades.
-			var buy2 = await InsertOrderAsync(c, t, pid, sid, 'B', 100m, 160m, default);
-			await InsertTradeAsync(c, t, buy2, 100m, 160m, default);
-			var afterTwo = await svc.ApplyTradeAsync(c, t, buy2);
-			afterTwo.Quantity.AssertEqual(200m);
-			afterTwo.AveragePrice.AssertEqual(155m);
+			// T2 - BACKDATED: buy 100 @ 200, dated between T1 and T3 but inserted LAST (largest trade_id).
+			var o2 = await InsertOrderAsync(c, t, pid, sid, 'B', 100m, 200m, default);
+			await InsertTradeAtAsync(c, t, o2, 100m, 200m, baseDate.AddMinutes(1), default);
 
-			var maxAfterTwo = await MaxTradeIdAsync(c, t, pid, sid, default);
-			var cpAfterTwo = await ReadCheckpointAsync(c, t, pid, sid, default);
-			(cpAfterTwo > cpAfterOne).AssertTrue();      // advanced beyond the first fill's checkpoint
-			cpAfterTwo.AssertEqual(maxAfterTwo);
+			// Recompute over the full set (the order id argument only resolves portfolio/security).
+			var result = await svc.ApplyTradeAsync(c, t, o2);
 
-			// Re-apply the SAME latest trade: every trade_id is <= checkpoint, so the fold is empty and the
-			// position and checkpoint are unchanged (bounded, idempotent; the double-count hazard stays gone).
-			var reapply = await svc.ApplyTradeAsync(c, t, buy2);
-			reapply.Quantity.AssertEqual(200m);
-			reapply.AveragePrice.AssertEqual(155m);
-			var cpReapply = await ReadCheckpointAsync(c, t, pid, sid, default);
-			cpReapply.AssertEqual(cpAfterTwo);           // checkpoint did not move on the no-op re-apply
+			// Chronological fold: T1 buy100@100 -> qty100 avg100; T2 buy100@200 -> qty200 avg150;
+			// T3 sell100@180 -> close 100*(180-150)=3000 realized, qty100 remaining at avg150.
+			result.Quantity.AssertEqual(100m);
+			result.AveragePrice.AssertEqual(150m);
+			result.RealizedPnl.AssertEqual(3000m);
+
+			var persisted = await ReadPositionAsync(c, t, pid, sid, default);
+			persisted.HasValue.AssertTrue();
+			persisted.Value.Qty.AssertEqual(100m);
+			persisted.Value.Avg.AssertEqual(150m);
+			persisted.Value.Realized.AssertEqual(3000m);
 		});
 
 	[TestMethod]
@@ -853,57 +837,6 @@ public class PositionRecalculationTests : BaseTestClass
 	}
 
 	[TestMethod]
-	public async Task Live_RecordTradeIsIdempotentWithExternalTradeId()
-	{
-		var connectionString = SqlLegacyConnection.Resolve();
-
-		await using (var probe = await TryOpenLegacyAsync())
-		{
-			if (probe is null)
-			{
-				Inconclusive("StockSharpLegacy SQL Server is not reachable; skipping live idempotency-key test.");
-				return;
-			}
-		}
-
-		int portfolioId;
-		int securityId;
-
-		await using (var setup = new SqlConnection(connectionString))
-		{
-			await setup.OpenAsync();
-			await using var tx = (SqlTransaction)await setup.BeginTransactionAsync(IsolationLevel.ReadCommitted);
-			(portfolioId, securityId) = await InsertScopeAsync(setup, tx, default);
-			await tx.CommitAsync();
-		}
-
-		try
-		{
-			var gateway = new SqlLegacyOrderGateway(connectionString);
-			var submit = await gateway.SubmitOrderAsync(portfolioId, securityId, Sides.Buy, 100m, 150m, OrderTypes.Limit);
-			submit.IsValid.AssertTrue();
-
-			// F2: recording the SAME logical fill twice (same external_trade_id) - e.g. a client retry - must
-			// record it exactly once and apply it to the position exactly once (qty 100, NOT double-counted 200).
-			const long externalTradeId = 918_273_645L;
-			await gateway.RecordTradeAsync(submit.OrderId, 100m, 150m, externalTradeId);
-			await gateway.RecordTradeAsync(submit.OrderId, 100m, 150m, externalTradeId);
-
-			(await CountTradesAsync(connectionString, submit.OrderId)).AssertEqual(1);   // one trade row, not two
-
-			var position = await gateway.GetPositionAsync(portfolioId, securityId);
-			position.AssertNotNull();
-			position.Quantity.AssertEqual(100m);        // single apply -> 100, NOT 200
-			position.AveragePrice.AssertEqual(150m);
-			position.RealizedPnL.AssertEqual(0m);
-		}
-		finally
-		{
-			await CleanupScopeAsync(connectionString, portfolioId, securityId);
-		}
-	}
-
-	[TestMethod]
 	public async Task Live_RecordTradeWithoutKeyRecordsEachFill()
 	{
 		var connectionString = SqlLegacyConnection.Resolve();
@@ -953,68 +886,13 @@ public class PositionRecalculationTests : BaseTestClass
 		}
 	}
 
-	[TestMethod]
-	public async Task Live_ConcurrentDuplicateKeyAppliesOnce()
-	{
-		var connectionString = SqlLegacyConnection.Resolve();
-
-		await using (var probe = await TryOpenLegacyAsync())
-		{
-			if (probe is null)
-			{
-				Inconclusive("StockSharpLegacy SQL Server is not reachable; skipping live concurrent-duplicate-key test.");
-				return;
-			}
-		}
-
-		int portfolioId;
-		int securityId;
-
-		await using (var setup = new SqlConnection(connectionString))
-		{
-			await setup.OpenAsync();
-			await using var tx = (SqlTransaction)await setup.BeginTransactionAsync(IsolationLevel.ReadCommitted);
-			(portfolioId, securityId) = await InsertScopeAsync(setup, tx, default);
-			await tx.CommitAsync();
-		}
-
-		try
-		{
-			var gateway = new SqlLegacyOrderGateway(connectionString);
-			var submit = await gateway.SubmitOrderAsync(portfolioId, securityId, Sides.Buy, 100m, 150m, OrderTypes.Limit);
-			submit.IsValid.AssertTrue();
-
-			// F1 + F2 together: fire MANY concurrent recordings of the SAME logical fill (same
-			// external_trade_id) - the retry-storm the deadlock retry (F1) could otherwise turn into a
-			// double-count. The per-position application lock serializes them and the idempotency key (F2)
-			// makes recording exactly-once regardless of overlap or retry: exactly one trade row, applied once.
-			const long externalTradeId = 112_233_445L;
-			const int attempts = 8;
-
-			var tasks = new Task[attempts];
-			for (var i = 0; i < attempts; i++)
-				tasks[i] = gateway.RecordTradeAsync(submit.OrderId, 100m, 150m, externalTradeId);
-
-			await Task.WhenAll(tasks);
-
-			(await CountTradesAsync(connectionString, submit.OrderId)).AssertEqual(1);   // exactly one, despite 8 concurrent calls
-
-			var position = await gateway.GetPositionAsync(portfolioId, securityId);
-			position.AssertNotNull();
-			position.Quantity.AssertEqual(100m);        // applied once
-		}
-		finally
-		{
-			await CleanupScopeAsync(connectionString, portfolioId, securityId);
-		}
-	}
-
 	// ==================================================================================================
 	// MA-18 - deterministic integration coverage for every listed gateway failure mode / contract.
 	// These commit real rows through the public gateway API (the methods open their own connections and
 	// commit), so each sets up a committed scope, exercises the gateway, asserts, and always cleans up in
-	// a finally. Post-commit-retry idempotency (#2) is proven by Live_RecordTradeIsIdempotentWithExternalTradeId
-	// and public overload compatibility (#14) by Live_RecordTradeWithoutKeyRecordsEachFill above.
+	// a finally. Recompute idempotency is proven by Live_ApplyTradeIsIdempotent (the position is folded from
+	// the ENTIRE persisted trade set on every apply, so re-applying yields the same result), and public
+	// overload compatibility (#14) by Live_RecordTradeWithoutKeyRecordsEachFill above.
 	// ==================================================================================================
 
 	// #9 - a REJECTED order (recorded for audit) can never be filled: the M08 fillable guard rejects the
@@ -1086,130 +964,6 @@ public class PositionRecalculationTests : BaseTestClass
 			var position = await gateway.GetPositionAsync(portfolioId, securityId);
 			position.AssertNotNull();
 			position.Quantity.AssertEqual(60m);
-		}
-		finally
-		{
-			await CleanupScopeAsync(connectionString, portfolioId, securityId);
-		}
-	}
-
-	// #3 - replaying a trade idempotency key with a DIFFERENT payload is a conflict (thrown), never a
-	// silent second fill; the original fill is untouched.
-	[TestMethod]
-	public async Task Live_DuplicateTradeKeyMismatchThrowsConflict()
-	{
-		var connectionString = SqlLegacyConnection.Resolve();
-
-		if (!await LegacyReachableAsync())
-		{
-			Inconclusive("StockSharpLegacy SQL Server is not reachable; skipping live trade-key-mismatch test.");
-			return;
-		}
-
-		var (portfolioId, securityId) = await SetupCommittedScopeAsync(connectionString);
-
-		try
-		{
-			var gateway = new SqlLegacyOrderGateway(connectionString);
-			var submit = await gateway.SubmitOrderAsync(portfolioId, securityId, Sides.Buy, 200m, 150m, OrderTypes.Limit);
-			submit.IsValid.AssertTrue();
-
-			const long tradeKey = 555_000_1L;
-			await gateway.RecordTradeAsync(submit.OrderId, 100m, 150m, tradeKey);
-
-			// Same key, different quantity -> conflict.
-			await ThrowsExactlyAsync<SqlLegacyIdempotencyConflictException>(async ()
-				=> await gateway.RecordTradeAsync(submit.OrderId, 50m, 150m, tradeKey));
-
-			(await CountTradesAsync(connectionString, submit.OrderId)).AssertEqual(1);   // the mismatch never inserted
-			var position = await gateway.GetPositionAsync(portfolioId, securityId);
-			position.AssertNotNull();
-			position.Quantity.AssertEqual(100m);
-		}
-		finally
-		{
-			await CleanupScopeAsync(connectionString, portfolioId, securityId);
-		}
-	}
-
-	// #4 - the trade idempotency key is GLOBAL (filtered unique index). Reusing a key already recorded for
-	// one order against a DIFFERENT order (a different position) is a conflict, not a cross-position double.
-	[TestMethod]
-	public async Task Live_CrossPositionSameTradeKeyThrowsConflict()
-	{
-		var connectionString = SqlLegacyConnection.Resolve();
-
-		if (!await LegacyReachableAsync())
-		{
-			Inconclusive("StockSharpLegacy SQL Server is not reachable; skipping live cross-position trade-key test.");
-			return;
-		}
-
-		var (portfolioA, securityA) = await SetupCommittedScopeAsync(connectionString);
-		var (portfolioB, securityB) = await SetupCommittedScopeAsync(connectionString);
-
-		try
-		{
-			var gateway = new SqlLegacyOrderGateway(connectionString);
-
-			var submitA = await gateway.SubmitOrderAsync(portfolioA, securityA, Sides.Buy, 100m, 150m, OrderTypes.Limit);
-			var submitB = await gateway.SubmitOrderAsync(portfolioB, securityB, Sides.Buy, 100m, 150m, OrderTypes.Limit);
-			submitA.IsValid.AssertTrue();
-			submitB.IsValid.AssertTrue();
-
-			const long sharedKey = 777_000_2L;
-			await gateway.RecordTradeAsync(submitA.OrderId, 100m, 150m, sharedKey);
-
-			// Same key, different order -> conflict (existing.OrderId != submitB.OrderId).
-			await ThrowsExactlyAsync<SqlLegacyIdempotencyConflictException>(async ()
-				=> await gateway.RecordTradeAsync(submitB.OrderId, 100m, 150m, sharedKey));
-
-			// Scope A recorded exactly one fill; scope B recorded none.
-			(await CountTradesAsync(connectionString, submitA.OrderId)).AssertEqual(1);
-			(await CountTradesAsync(connectionString, submitB.OrderId)).AssertEqual(0);
-			(await gateway.GetPositionAsync(portfolioB, securityB)).AssertNull();
-		}
-		finally
-		{
-			await CleanupScopeAsync(connectionString, portfolioA, securityA);
-			await CleanupScopeAsync(connectionString, portfolioB, securityB);
-		}
-	}
-
-	// #5 - order-submit idempotency: replaying a submit key with the SAME payload returns the ORIGINAL
-	// outcome (one order); replaying it with a DIFFERENT payload is a conflict. Never a silent second order.
-	[TestMethod]
-	public async Task Live_DuplicateSubmitKeyBehavior()
-	{
-		var connectionString = SqlLegacyConnection.Resolve();
-
-		if (!await LegacyReachableAsync())
-		{
-			Inconclusive("StockSharpLegacy SQL Server is not reachable; skipping live submit-key test.");
-			return;
-		}
-
-		var (portfolioId, securityId) = await SetupCommittedScopeAsync(connectionString);
-
-		try
-		{
-			var gateway = new SqlLegacyOrderGateway(connectionString);
-			const long submitKey = 333_000_3L;
-
-			var first = await gateway.SubmitOrderAsync(portfolioId, securityId, Sides.Buy, 100m, 150m, OrderTypes.Limit, submitKey);
-			first.IsValid.AssertTrue();
-
-			// Same key + same payload -> returns the ORIGINAL order, no second row inserted.
-			var replay = await gateway.SubmitOrderAsync(portfolioId, securityId, Sides.Buy, 100m, 150m, OrderTypes.Limit, submitKey);
-			replay.OrderId.AssertEqual(first.OrderId);
-			replay.IsValid.AssertTrue();
-			(await CountOrdersAsync(connectionString, portfolioId)).AssertEqual(1);
-
-			// Same key + different payload (different qty) -> conflict.
-			await ThrowsExactlyAsync<SqlLegacyIdempotencyConflictException>(async ()
-				=> await gateway.SubmitOrderAsync(portfolioId, securityId, Sides.Buy, 200m, 150m, OrderTypes.Limit, submitKey));
-
-			(await CountOrdersAsync(connectionString, portfolioId)).AssertEqual(1);   // still exactly one order
 		}
 		finally
 		{
@@ -1403,10 +1157,11 @@ public class PositionRecalculationTests : BaseTestClass
 		}
 	}
 
-	// #11 - the schema's idempotent upgrade guards (CR-5 external_trade_id, MI-2 last_applied_trade_id) are
-	// re-runnable and non-destructive: re-executing them when the columns already exist is a clean no-op
-	// (no error, columns intact, seed rows untouched). Runs in a rolled-back transaction, so it changes
-	// nothing even if a column were somehow missing.
+	// #11/#29 - after the AAP-scoped revert the speculative upgrade columns (external_trade_id on Trades,
+	// last_applied_trade_id on Positions) are GONE and the schema is pure baseline DDL (AAP 0.2.1 / 0.4.1
+	// keep the schema unchanged). This proves (a) those columns are absent and (b) the baseline guarded DDL
+	// (IF OBJECT_ID table guard + IF NOT EXISTS index guard) is re-runnable and non-destructive: executing a
+	// representative guard when the object already exists is a clean no-op. Runs in a rolled-back transaction.
 	[TestMethod]
 	public async Task Live_SchemaGuardsAreIdempotentAndNonDestructive()
 	{
@@ -1426,24 +1181,29 @@ public class PositionRecalculationTests : BaseTestClass
 			var pfBefore = await ScalarIntAsync(connection, transaction, "SELECT COUNT(*) FROM dbo.Portfolios");
 			var secBefore = await ScalarIntAsync(connection, transaction, "SELECT COUNT(*) FROM dbo.Securities");
 
-			// The verbatim guarded upgrade statements from Database/001_Schema.sql. Executing them twice
-			// must not throw and must not alter data because the columns already exist.
-			const string tradeGuard =
-				"IF COL_LENGTH(N'dbo.Trades', N'external_trade_id') IS NULL " +
-				"ALTER TABLE dbo.Trades ADD external_trade_id BIGINT NULL;";
-			const string positionGuard =
-				"IF COL_LENGTH(N'dbo.Positions', N'last_applied_trade_id') IS NULL " +
-				"ALTER TABLE dbo.Positions ADD last_applied_trade_id BIGINT NOT NULL CONSTRAINT DF_Positions_last_applied_trade_id DEFAULT (0);";
+			// The speculative upgrade columns from the reverted over-engineering are ABSENT: the schema is pure
+			// baseline DDL, so COL_LENGTH returns NULL (coalesced to 0) for both.
+			(await ScalarIntAsync(connection, transaction, "SELECT ISNULL(COL_LENGTH(N'dbo.Trades', N'external_trade_id'), 0)")).AssertEqual(0);
+			(await ScalarIntAsync(connection, transaction, "SELECT ISNULL(COL_LENGTH(N'dbo.Positions', N'last_applied_trade_id'), 0)")).AssertEqual(0);
+
+			// Representative baseline guards from Database/001_Schema.sql. Executing them twice must not throw and
+			// must not alter data because the objects already exist (the IF guard short-circuits the DDL body).
+			const string tableGuard =
+				"IF OBJECT_ID(N'dbo.Trades', N'U') IS NULL " +
+				"CREATE TABLE dbo.Trades (trade_id BIGINT IDENTITY(1,1) PRIMARY KEY);";
+			const string indexGuard =
+				"IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_Trades_order' AND object_id = OBJECT_ID(N'dbo.Trades')) " +
+				"CREATE INDEX IX_Trades_order ON dbo.Trades(order_id);";
 
 			for (var i = 0; i < 2; i++)
 			{
-				await ExecAsync(connection, transaction, tradeGuard);
-				await ExecAsync(connection, transaction, positionGuard);
+				await ExecAsync(connection, transaction, tableGuard);
+				await ExecAsync(connection, transaction, indexGuard);
 			}
 
-			// Both upgrade columns are present after the schema has been applied.
-			(await ScalarIntAsync(connection, transaction, "SELECT ISNULL(COL_LENGTH(N'dbo.Trades', N'external_trade_id'), 0)") > 0).AssertTrue();
-			(await ScalarIntAsync(connection, transaction, "SELECT ISNULL(COL_LENGTH(N'dbo.Positions', N'last_applied_trade_id'), 0)") > 0).AssertTrue();
+			// The baseline tables still exist after the rerun.
+			(await ScalarIntAsync(connection, transaction, "SELECT ISNULL(OBJECT_ID(N'dbo.Trades', N'U'), 0)") != 0).AssertTrue();
+			(await ScalarIntAsync(connection, transaction, "SELECT ISNULL(OBJECT_ID(N'dbo.Positions', N'U'), 0)") != 0).AssertTrue();
 
 			// Non-destructive: seed row counts unchanged by the rerun.
 			(await ScalarIntAsync(connection, transaction, "SELECT COUNT(*) FROM dbo.RiskLimits")).AssertEqual(rlBefore);

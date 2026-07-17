@@ -34,10 +34,12 @@ set of rules, not two that quietly disagree.
   EF - raw `SqlCommand`) client. It holds no risk decisioning: it delegates
   every threshold / accept-reject / P&L decision to the C# services above, and
   its data access is plain parameterized `INSERT`/`SELECT`. The only non-CRUD
-  SQL it issues is `sp_getapplock` / `sp_releaseapplock` - SQL Server
-  application locks used purely for concurrency control (serializing
-  same-portfolio submissions and same-instrument fills), not for any business
-  decision. Plus `SqlLegacyConnection` for connection-string resolution and
+  SQL it issues is `sp_getapplock` - SQL Server application locks acquired in
+  Transaction-owner mode and released automatically when the owning transaction
+  commits or rolls back (there is no explicit `sp_releaseapplock` call) - used
+  purely for concurrency control (serializing same-portfolio submissions and
+  same-instrument fills), not for any business decision. Plus
+  `SqlLegacyConnection` for connection-string resolution and
   `SqlPosition`/`SqlOrderSubmitResult` DTOs.
 - `Samples/08_Misc/03_LegacySqlDemo` - a runnable walkthrough: submit a
   compliant order, submit one that gets rejected, record a fill, watch the
@@ -59,8 +61,13 @@ limit is written down once and consumed in two places:
   `StopTrading`, or `CancelOrders` (see `RiskMessageAdapter.ProcessRiskAsync`).
   It does not reject the specific order that tripped the rule; it's a
   circuit breaker, not a gate. Its action behaviour is unchanged by the
-  consolidation. Call `RiskManager.ApplyCanonicalLimits(RiskLimitSet)` to seed
-  its circuit-breaker rules from the shared definition.
+  consolidation. A production caller seeds it by calling
+  `RiskManager.ApplyCanonicalLimits(RiskLimitSet)` with the scoped row returned by
+  `PreTradeRiskService.LoadLimitsAsync(portfolioId, securityId)` - the *same*
+  scope-aware selection the gate enforces - creating one manager per exact
+  (portfolio, security) scope so a scoped DB row is represented correctly. In this
+  repository that non-test caller is the `03_LegacySqlDemo` sample; the manager is
+  not seeded automatically by any platform pipeline (see the note below).
 - **`Algo.Risk.PreTradeRiskService`** is a gate: it evaluates one order before
   it's accepted and rejects that order, specifically, if it fails. It is what
   `SqlLegacyOrderGateway.SubmitOrderAsync` calls, inside the same transaction
@@ -68,12 +75,17 @@ limit is written down once and consumed in two places:
 
 Anyone asking "does this order get risk-checked" still needs to know which
 path it's going through. Going through `SqlLegacyOrderGateway.SubmitOrderAsync`
-gets you the pre-trade gate. Going through a `Connector`/`RiskMessageAdapter`
-pipeline gets you the circuit breaker. A given order flows through one of those
-paths, not both - but whichever one runs, it is reading the *same* canonical
-`RiskLimitSet`, so the two patterns can no longer disagree about a threshold.
-The single place that used to be missing now exists: the limits live once on
-`RiskLimitSet`, and this document is the map of how each is enforced.
+gets you the pre-trade gate, which always loads and enforces the canonical row
+itself. The circuit breaker, by contrast, enforces the canonical thresholds only
+once a caller has seeded a `RiskManager` from `RiskLimitSet` (via
+`ApplyCanonicalLimits`); when it is seeded from the row `LoadLimitsAsync` returns,
+both patterns read the *same* canonical `RiskLimitSet` and can no longer disagree
+about a threshold. The consolidation guarantees the limits are *defined* once on
+`RiskLimitSet`; it does **not** silently auto-wire the circuit breaker into the
+`Connector`/`RiskMessageAdapter` pipeline - that integration is outside this
+refactor's scope (`Algo/Connector.cs` is not an in-scope file), so no automatic
+Connector/RiskMessageAdapter consumption is claimed. This document is the map of
+where each limit lives and how each pattern enforces it.
 
 ### Rule-by-rule coverage
 
@@ -148,13 +160,19 @@ point, and `SqlLegacyOrderGateway.RecordTradeAsync` invokes it exactly once per
 recorded trade, inside the same gateway-owned transaction that inserts the
 trade. `trg_Trades_PositionRecalc` and its calculation logic have been removed.
 
-Two distinct guarantees hold this together - and each is narrower than the
-earlier draft of this section implied, so be precise about which is which:
+Two distinct guarantees hold this together, plus one deliberate non-goal - be
+precise about which is which:
 
-- **The recompute is idempotent for a fixed trade set.** It recomputes the
-  position deterministically from the full persisted trade set for that
-  portfolio+security rather than folding a delta, so re-running it over the
-  *same* trades cannot double-apply. `PositionRecalculationService` also takes
+- **The recompute is a full persisted-trade replay, idempotent for a fixed trade
+  set.** Rather than folding the new trade as a delta onto the stored row,
+  `PositionRecalculationService` replays the *entire* persisted trade set for that
+  portfolio+security from flat, in chronological `(executed_date, trade_id)` order,
+  and overwrites the stored `(qty, avg_price, realized_pnl)` with the result. The
+  stored values are never read as a starting point. Re-running it over the *same*
+  trades therefore reproduces the same position and cannot double-apply, and a
+  later-arriving backdated trade (an earlier `executed_date` inserted after the
+  fact) is folded into its correct chronological position rather than stacked on
+  top of already-committed state. `PositionRecalculationService` also takes
   `UPDLOCK`/`HOLDLOCK` on the `Positions` row, which serializes standalone/direct
   callers and blocks a racing first insert of the position key.
 
@@ -168,23 +186,25 @@ earlier draft of this section implied, so be precise about which is which:
   bounded deadlock-retry wraps the unit of work as defense-in-depth for any
   residual contention.
 
-- **Recording is exactly-once only with a business key.** Idempotency of the
-  *recompute* does not by itself make *recording* idempotent: a retried
-  `RecordTradeAsync` that inserts a second trade row would legitimately fold that
-  extra row and double the position. To make a retry safe, pass
-  `RecordTradeAsync(..., externalTradeId)` - the external execution/trade id of
-  the logical fill. A filtered unique index (`UQ_Trades_external_trade_id`)
-  enforces uniqueness and the guarded insert no-ops on a duplicate key, so the
-  fill is recorded and applied at most once. When no key is supplied the original
-  behavior is preserved: every call records a distinct fill.
+- **Recording is at-least-once; the position stays correct regardless.** A
+  retried `RecordTradeAsync` inserts a *distinct* trade row - recording itself is
+  not de-duplicated, by design. Durable trade-row de-duplication (a business /
+  idempotency key persisted in the schema) is intentionally out of scope: the AAP
+  defines the position guarantee as a single-apply full-replay recompute, not
+  durable key-based dedup, and keeps the schema unchanged (AAP 0.2.1 / 0.4.1 /
+  0.6.4). Because the recompute always replays the full trade set, the *position*
+  is self-healing and never double-counts a given set of rows; what a duplicate
+  insert changes is the trade set itself. The sole executable consumer (the demo)
+  does not retry, and it resets its transactional rows each run so the three
+  outcomes stay reproducible.
 
-Live tests prove all three: `Live_ApplyTradeIsIdempotent` (same trade set →
-single-apply), `Live_HighContentionConcurrentFillsNeverDeadlockOrLoseFills`
-(many concurrent un-keyed fills → no 1205, no lost fill),
-`Live_RecordTradeIsIdempotentWithExternalTradeId` and
-`Live_ConcurrentDuplicateKeyAppliesOnce` (same key → one trade row, applied
-once), and `Live_RecordTradeWithoutKeyRecordsEachFill` (no key → each fill
-recorded), alongside the existing gateway end-to-end and concurrent-fill tests.
+Live tests prove these: `Live_ApplyTradeIsIdempotent` (same trade set →
+single-apply), `Live_RecomputeSeesAllPersistedTrades` (recompute folds the full
+persisted set), `Live_BackdatedTradeReconciles` (a backdated trade reconciles
+into its chronological position), `Live_HighContentionConcurrentFillsNeverDeadlockOrLoseFills`
+(many concurrent fills → no 1205, no lost fill), and
+`Live_RecordTradeWithoutKeyRecordsEachFill` (each call records a distinct fill),
+alongside the existing gateway end-to-end and concurrent-fill tests.
 
 `unrealized_pnl` on `Positions` is still not maintained here - it needs a live
 market price, which this path doesn't have. It's refreshed by the EOD
@@ -226,7 +246,7 @@ script records the same thing at the point of change):
 After `002_StoredProcedures.sql` and `003_Triggers.sql` run, no stored
 procedure exists and the only trigger is the audit cascade - verifiable with
 `sys.procedures` / `sys.triggers`. The DDL is SQL Server-specific in syntax
-(`sp_getapplock`, filtered unique indexes, `SYSUTCDATETIME()`,
+(`sp_getapplock`, filtered indexes, `SYSUTCDATETIME()`,
 `DROP ... IF EXISTS`, `IDENTITY`), but it is deliberately migration-friendly:
 it is plain relational storage - tables, keys, constraints, and indexes - with
 no business logic, so a future PostgreSQL/Aurora migration is a mechanical DDL

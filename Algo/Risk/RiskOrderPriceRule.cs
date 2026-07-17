@@ -57,13 +57,21 @@ public class RiskOrderPriceRule : RiskRule
 			case MessageTypes.OrderRegister:
 			{
 				var orderReg = (OrderRegisterMessage)message;
-				return orderReg.Price >= Price;
+				// Compare the DECIMAL(18,4)-normalized price against the ceiling so this stream rule is at
+				// least as strict as the gate at the fourth-decimal boundary (review finding CR-27): a raw
+				// 499.99996 that the gate would round up to 500.0000 (and reject at a 500 ceiling) must not
+				// slip through here as 499.99996 < 500. Out-of-range magnitudes saturate and are treated as
+				// a breach rather than throwing mid-stream.
+				return RiskLimitSet.NormalizeMoneySaturating(orderReg.Price) >= Price;
 			}
 
 			case MessageTypes.OrderReplace:
 			{
 				var orderReplace = (OrderReplaceMessage)message;
-				return orderReplace.Price > 0 && orderReplace.Price >= Price;
+				// Same DECIMAL(18,4) normalization as the register branch (CR-27). A price that rounds to
+				// zero or below at the persisted scale carries no usable price and cannot breach the ceiling.
+				var price = RiskLimitSet.NormalizeMoneySaturating(orderReplace.Price);
+				return price > 0 && price >= Price;
 			}
 
 			default:

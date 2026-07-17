@@ -90,6 +90,15 @@ public class PreTradeRiskService
 		// The checks that read state only run when their ceiling is enforced, so defaulting is always safe.
 		state ??= new PreTradeState();
 
+		// Fail closed on a malformed configuration BEFORE any accept/reject decision (review findings
+		// CR-7 / CR-12). A negative ceiling, a negative commission rate, or a half-specified frequency
+		// pair is a configuration error the gate must never act on: Validate() throws so the caller
+		// surfaces the misconfiguration instead of the check being silently disabled (the old fail-open
+		// behaviour where a negative value was treated as "not enforced"). This is the SAME authoritative
+		// validator the circuit-breaker factory (RiskManager.CreateRules) calls, so both patterns reject
+		// an invalid configuration identically. A null/0 ceiling is still the AAP-mandated "not enforced".
+		limits?.Validate();
+
 		// Number-formatting helpers reproduce SQL Server's CONVERT(VARCHAR, DECIMAL) output
 		// byte-for-byte: a DECIMAL(18,4) always renders with four fractional digits and a
 		// DECIMAL(37,8) product with eight, using invariant culture (no thousands separators).
@@ -156,11 +165,13 @@ public class PreTradeRiskService
 		// until execution, so cost is estimated with RiskLimitSet.CommissionRate against the order
 		// price (or, for market orders, the security's last traded price). Rounded to four decimals
 		// away from zero to mirror the DECIMAL(18,4) SQL variable before comparing and formatting.
-		// A negative configured rate is clamped to zero so a malformed rate cannot manufacture a
-		// spurious reject (M04); the SQL seed never stores a negative rate.
+		// The configured rate is used directly, mirroring the legacy proc: a NEGATIVE rate is NOT
+		// silently clamped to zero (which would disable commission enforcement) but is rejected up
+		// front by RiskLimitSet.Validate() as a configuration error (review finding CR-7), so the
+		// value that reaches this line is always a validated, non-negative rate.
 		if (limits.EffectiveMaxCommissionTotal is decimal mct)
 		{
-			var rate = limits.CommissionRate < 0m ? 0m : limits.CommissionRate;
+			var rate = limits.CommissionRate;
 			var estPrice = price ?? state.LastTradePrice;
 			var existingNotional = state.ExistingTradesNotional ?? 0m;
 			var estCommission = Math.Round(existingNotional * rate + volume * (estPrice ?? 0m) * rate, 4, MidpointRounding.AwayFromZero);
@@ -204,29 +215,166 @@ public class PreTradeRiskService
 		if (normalizedVolume <= 0)
 			return PreTradeRiskResult.Reject("Invalid qty");
 
-		// Coerce the price to DECIMAL(18,4) too (a null price is a market order and stays null).
+		// Coerce the price to DECIMAL(18,4) too (a null price is a market order and stays null). A non-null
+		// price that rounds to zero or below at the persisted scale (for example a sub-tick 0.00004 that
+		// becomes 0.0000) is not a usable price and is rejected as "Invalid price" - the same
+		// normalize-then-validate the gateway performs before persistence (review finding CR-13), so a
+		// garbage sub-scale price can never be coerced to 0.0000 and then silently accepted because a
+		// 0.0000 price never trips the >= ceiling comparison.
 		if (price is decimal rawPrice)
-			normalizedPrice = NormalizeMoney(rawPrice, nameof(price));
+		{
+			var np = NormalizeMoney(rawPrice, nameof(price));
+			normalizedPrice = np;
+
+			if (np <= 0m)
+				return PreTradeRiskResult.Reject("Invalid price");
+		}
 
 		return null;
 	}
 
-	// DECIMAL(18,4) domain guard shared by the pre-trade checks. The StockSharpLegacy money columns
-	// (qty, price, and the derived notionals) are all DECIMAL(18,4); this rounds an incoming value to
-	// that scale (away from zero, matching SQL Server's arithmetic-rounding of an assignment) and fails
-	// deterministically when the magnitude cannot be represented, which is the C# analogue of the SQL
-	// arithmetic-overflow error. Making the coercion explicit is what gives the gate byte-for-byte parity
-	// with the persisted values (C02) and keeps every product overflow-safe (M04/M08).
-	private const decimal _moneyMax = 99_999_999_999_999.9999m;
+	// DECIMAL(18,4) domain guard shared by the pre-trade checks and the stream circuit-breaker rules,
+	// delegating to the single canonical RiskLimitSet.NormalizeMoney so the gate, persistence, and the
+	// stream rules coerce to the same scale (review finding CR-27). The StockSharpLegacy money columns
+	// (qty, price, and the derived notionals) are all DECIMAL(18,4); rounding away from zero matches SQL
+	// Server's arithmetic-rounding of an assignment and an out-of-range magnitude fails deterministically,
+	// which is what gives the gate byte-for-byte parity with the persisted values (C02) and keeps every
+	// product overflow-safe (M04/M08).
+	private static decimal NormalizeMoney(decimal value, string name) => RiskLimitSet.NormalizeMoney(value, name);
 
-	private static decimal NormalizeMoney(decimal value, string name)
+	/// <summary>
+	/// Loads the most-specific canonical <see cref="RiskLimitSet"/> for a (portfolio, security) scope on a
+	/// caller-supplied connection and transaction, applying the SAME selection and effective-date cutoff the
+	/// per-order gate uses, and validating the row before returning it. This is the scope-aware canonical
+	/// limit provider a production caller uses to seed a per-scope circuit breaker: the row returned here is
+	/// the exact definition <see cref="ValidateAsync(SqlConnection, SqlTransaction, int, int, Sides, decimal, decimal?, OrderTypes, CancellationToken)"/>
+	/// enforces, so feeding it to <see cref="RiskManager.ApplyCanonicalLimits(RiskLimitSet)"/> makes the
+	/// per-order gate and the portfolio-wide circuit breaker consume one identical source (review finding CR-1).
+	/// </summary>
+	/// <remarks>
+	/// The candidate query bounds the result to the rows that can apply (portfolio+security, portfolio-only,
+	/// security-only) and applies the CR-32 effective-date cutoff against the database clock
+	/// (<c>effective_date &lt;= SYSUTCDATETIME()</c>) so a future-effective row is never even loaded; the
+	/// canonical <see cref="RiskLimitSet.SelectMostSpecific(IEnumerable{RiskLimitSet}, int, int, DateTime?)"/>
+	/// then applies the precedence ordering (portfolio+security &gt; portfolio &gt; security, most-recent
+	/// effective_date wins). Because the SQL clause already excluded future rows against the database clock,
+	/// no additional application-side cutoff is passed to the selector (passing one would risk excluding a
+	/// just-persisted row under application/DB clock skew). The selected row is validated via
+	/// <see cref="RiskLimitSet.Validate"/> so a malformed configuration fails closed here identically to the
+	/// gate and the circuit-breaker factory (CR-7 / CR-12). Because the row is scoped and self-selecting,
+	/// seeding one <see cref="RiskManager"/> per exact scope from it (rather than sharing a single manager)
+	/// is what lets the circuit breaker represent a scoped DB row correctly (review finding CR-1).
+	/// </remarks>
+	/// <param name="connection">The open connection owned by the caller.</param>
+	/// <param name="transaction">The transaction owned by the caller that the read enlists in.</param>
+	/// <param name="portfolioId">The portfolio identifier (must be positive).</param>
+	/// <param name="securityId">The security identifier (must be positive).</param>
+	/// <param name="cancellationToken">The cancellation token.</param>
+	/// <returns>The most-specific effective limit set for the scope, or <see langword="null"/> when no row applies.</returns>
+	/// <exception cref="ArgumentNullException"><paramref name="connection"/> or <paramref name="transaction"/> is null.</exception>
+	/// <exception cref="ArgumentOutOfRangeException"><paramref name="portfolioId"/> or <paramref name="securityId"/> is not positive.</exception>
+	/// <exception cref="ArgumentException">The selected row is a malformed configuration (see <see cref="RiskLimitSet.Validate"/>).</exception>
+	public async Task<RiskLimitSet> LoadLimitsAsync(SqlConnection connection, SqlTransaction transaction, int portfolioId, int securityId, CancellationToken cancellationToken = default)
 	{
-		var rounded = Math.Round(value, 4, MidpointRounding.AwayFromZero);
+		if (connection is null)
+			throw new ArgumentNullException(nameof(connection));
 
-		if (rounded > _moneyMax || rounded < -_moneyMax)
-			throw new OverflowException($"{name} value {value} is outside the DECIMAL(18,4) range supported by the StockSharpLegacy schema.");
+		if (transaction is null)
+			throw new ArgumentNullException(nameof(transaction));
 
-		return rounded;
+		if (portfolioId <= 0)
+			throw new ArgumentOutOfRangeException(nameof(portfolioId), portfolioId, "Portfolio id must be positive.");
+
+		if (securityId <= 0)
+			throw new ArgumentOutOfRangeException(nameof(securityId), securityId, "Security id must be positive.");
+
+		// Load every candidate RiskLimits row in scope on the caller's connection+transaction, then defer
+		// to the canonical selector so the load path and the unit tests share ONE ordering
+		// (portfolio+security > portfolio > security, most-recent effective_date wins). The WHERE clause
+		// bounds the result to at most the rows that can apply, reproducing the proc's TOP(1) ... ORDER BY,
+		// and applies the CR-32 effective-date cutoff against the database clock (SYSUTCDATETIME) so a
+		// future-effective row is never even loaded. This is the authoritative server-side counterpart to
+		// the injectable cutoff on RiskLimitSet.SelectMostSpecific: using the database clock keeps it
+		// immune to application/container clock skew, exactly as the frequency-window cutoff already does.
+		var candidates = new List<RiskLimitSet>();
+
+		await using (var limitsCommand = new SqlCommand(
+			"""
+			SELECT portfolio_id, security_id, max_order_price, max_order_qty, max_order_value,
+			       max_position_size, max_daily_volume, max_order_freq_count, max_order_freq_window_sec,
+			       max_commission_total, commission_rate, is_active, effective_date
+			FROM dbo.RiskLimits
+			WHERE is_active = 1
+			  AND (portfolio_id = @p OR portfolio_id IS NULL)
+			  AND (security_id = @s OR security_id IS NULL)
+			  AND effective_date <= SYSUTCDATETIME()
+			""", connection, transaction)
+		{
+			CommandType = CommandType.Text,
+		})
+		{
+			limitsCommand.Parameters.Add(IntParam("@p", portfolioId));
+			limitsCommand.Parameters.Add(IntParam("@s", securityId));
+
+			await using var reader = await limitsCommand.ExecuteReaderAsync(cancellationToken);
+
+			while (await reader.ReadAsync(cancellationToken))
+			{
+				candidates.Add(new RiskLimitSet
+				{
+					PortfolioId = ReadNullableInt(reader, 0),
+					SecurityId = ReadNullableInt(reader, 1),
+					MaxOrderPrice = ReadNullableDecimal(reader, 2),
+					MaxOrderQty = ReadNullableDecimal(reader, 3),
+					MaxOrderValue = ReadNullableDecimal(reader, 4),
+					MaxPositionSize = ReadNullableDecimal(reader, 5),
+					MaxDailyVolume = ReadNullableDecimal(reader, 6),
+					MaxOrderFreqCount = ReadNullableInt(reader, 7),
+					MaxOrderFreqWindowSeconds = ReadNullableInt(reader, 8),
+					MaxCommissionTotal = ReadNullableDecimal(reader, 9),
+					CommissionRate = reader.GetDecimal(10),
+					IsActive = reader.GetBoolean(11),
+					EffectiveDate = reader.GetDateTime(12),
+				});
+			}
+		}
+
+		// The SQL WHERE clause already excluded future-effective rows against the database clock, so the
+		// candidates are all effective as of "now" and the canonical selector needs no additional cutoff
+		// on this path (passing one would risk excluding a just-persisted row on application/DB clock skew);
+		// the injectable SelectMostSpecific cutoff is exercised by the pure unit tests instead (CR-32).
+		var limits = RiskLimitSet.SelectMostSpecific(candidates, portfolioId, securityId);
+
+		// Fail closed on a malformed row BEFORE returning it (review findings CR-7 / CR-12): this is the SAME
+		// authoritative validator the circuit-breaker factory (RiskManager.CreateRules) calls, so every
+		// consumer of this scope rejects an invalid configuration identically instead of silently disabling a check.
+		limits?.Validate();
+
+		return limits;
+	}
+
+	/// <summary>
+	/// Convenience overload of <see cref="LoadLimitsAsync(SqlConnection, SqlTransaction, int, int, CancellationToken)"/>
+	/// that opens its own short-lived connection and read-only transaction. Intended for a production caller
+	/// (for example application initialization seeding a per-scope <see cref="RiskManager"/> circuit breaker
+	/// from the canonical source) that does not already hold a connection.
+	/// </summary>
+	/// <param name="portfolioId">The portfolio identifier (must be positive).</param>
+	/// <param name="securityId">The security identifier (must be positive).</param>
+	/// <param name="cancellationToken">The cancellation token.</param>
+	/// <returns>The most-specific effective limit set for the scope, or <see langword="null"/> when no row applies.</returns>
+	public async Task<RiskLimitSet> LoadLimitsAsync(int portfolioId, int securityId, CancellationToken cancellationToken = default)
+	{
+		await using var connection = CreateConnection();
+		await connection.OpenAsync(cancellationToken);
+		await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(IsolationLevel.ReadCommitted, cancellationToken);
+
+		var limits = await LoadLimitsAsync(connection, transaction, portfolioId, securityId, cancellationToken);
+
+		// Read-only path: commit to release the read locks cleanly (no rows were written).
+		await transaction.CommitAsync(cancellationToken);
+
+		return limits;
 	}
 
 	/// <summary>
@@ -285,53 +433,12 @@ public class PreTradeRiskService
 		if (preamble is not null)
 			return preamble;
 
-		// Load every candidate RiskLimits row in scope on the caller's connection+transaction, then defer
-		// to the canonical selector so the load path and the unit tests share ONE ordering
-		// (portfolio+security > portfolio > security, most-recent effective_date wins). The WHERE clause
-		// bounds the result to at most the rows that can apply, reproducing the proc's TOP(1) ... ORDER BY.
-		var candidates = new List<RiskLimitSet>();
-
-		await using (var limitsCommand = new SqlCommand(
-			"""
-			SELECT portfolio_id, security_id, max_order_price, max_order_qty, max_order_value,
-			       max_position_size, max_daily_volume, max_order_freq_count, max_order_freq_window_sec,
-			       max_commission_total, commission_rate, is_active, effective_date
-			FROM dbo.RiskLimits
-			WHERE is_active = 1
-			  AND (portfolio_id = @p OR portfolio_id IS NULL)
-			  AND (security_id = @s OR security_id IS NULL)
-			""", connection, transaction)
-		{
-			CommandType = CommandType.Text,
-		})
-		{
-			limitsCommand.Parameters.Add(IntParam("@p", portfolioId));
-			limitsCommand.Parameters.Add(IntParam("@s", securityId));
-
-			await using var reader = await limitsCommand.ExecuteReaderAsync(cancellationToken);
-
-			while (await reader.ReadAsync(cancellationToken))
-			{
-				candidates.Add(new RiskLimitSet
-				{
-					PortfolioId = ReadNullableInt(reader, 0),
-					SecurityId = ReadNullableInt(reader, 1),
-					MaxOrderPrice = ReadNullableDecimal(reader, 2),
-					MaxOrderQty = ReadNullableDecimal(reader, 3),
-					MaxOrderValue = ReadNullableDecimal(reader, 4),
-					MaxPositionSize = ReadNullableDecimal(reader, 5),
-					MaxDailyVolume = ReadNullableDecimal(reader, 6),
-					MaxOrderFreqCount = ReadNullableInt(reader, 7),
-					MaxOrderFreqWindowSeconds = ReadNullableInt(reader, 8),
-					MaxCommissionTotal = ReadNullableDecimal(reader, 9),
-					CommissionRate = reader.GetDecimal(10),
-					IsActive = reader.GetBoolean(11),
-					EffectiveDate = reader.GetDateTime(12),
-				});
-			}
-		}
-
-		var limits = RiskLimitSet.SelectMostSpecific(candidates, portfolioId, securityId);
+		// Resolve the most-specific canonical limit set for this (portfolio, security) scope through the
+		// shared, scope-aware loader. LoadLimitsAsync is the SAME selection a production caller uses to seed
+		// a per-scope RiskManager circuit breaker (review finding CR-1), so the per-order gate and the
+		// portfolio-wide circuit breaker enforce one identical canonical definition. The loader also fails
+		// closed on a malformed row (CR-7 / CR-12) via RiskLimitSet.Validate before any state read below.
+		var limits = await LoadLimitsAsync(connection, transaction, portfolioId, securityId, cancellationToken);
 
 		// Nothing to enforce => skip every state read and accept (Evaluate still runs the side/quantity
 		// preamble), exactly like the SQL all-NULL short-circuit and the canonical "unlimited" convention.

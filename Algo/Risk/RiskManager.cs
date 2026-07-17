@@ -11,13 +11,18 @@ namespace StockSharp.Algo.Risk;
 /// <c>dbo.usp_ValidatePreTradeRisk</c>), which rejects one order before it is accepted. The two
 /// enforcement patterns are deliberately kept separate and are intentionally NOT merged (AAP §0.6).
 /// They are, however, no longer defined independently: the risk decisioning that used to live in
-/// T-SQL stored procedures has been consolidated into C#, and both patterns now resolve their
-/// thresholds from the same canonical <see cref="RiskLimitSet"/>, so every limit is defined exactly
-/// once. Call <see cref="ApplyCanonicalLimits(RiskLimitSet, RiskActions)"/> (or the
+/// T-SQL stored procedures has been consolidated into C#, and both patterns resolve their thresholds
+/// from the same canonical <see cref="RiskLimitSet"/>, so every limit is defined exactly once. Call
+/// <see cref="ApplyCanonicalLimits(RiskLimitSet, RiskActions)"/> (or the
 /// <see cref="ApplyCanonicalLimits(RiskLimitSet)"/> convenience overload) to seed this manager's
-/// circuit-breaker rules from that shared definition; both overloads are exposed through
-/// <see cref="IRiskManager"/> so production code can drive the canonical configuration through the same
-/// abstraction the platform already resolves (there is no test-only back door). The two limits that were
+/// circuit-breaker rules from that shared definition. A production caller obtains that scoped definition
+/// from <see cref="PreTradeRiskService.LoadLimitsAsync(int, int, System.Threading.CancellationToken)"/> -
+/// the SAME scope-aware selection the per-order gate enforces - and seeds one manager per exact
+/// (portfolio, security) scope, so the circuit breaker represents a scoped DB row correctly rather than
+/// collapsing all scopes into one shared manager. In this repository that non-test caller is the
+/// <c>03_LegacySqlDemo</c> sample; the platform's <see cref="RiskMessageAdapter"/> and the wider Connector
+/// pipeline do NOT auto-seed a manager from the database (that wiring is outside this refactor's scope), so
+/// no claim of automatic Connector/RiskMessageAdapter consumption is made here. The two limits that were
 /// historically SQL-only - order notional value and daily traded volume - now have first-class rule
 /// classes here (<see cref="RiskOrderValueRule"/> and <see cref="RiskDailyVolumeRule"/>). The
 /// circuit-breaker action behaviour itself is unchanged.
@@ -123,29 +128,31 @@ public class RiskManager : BaseLogReceiver, IRiskManager
 	/// not emit for order fills - so seeding it would produce a ceiling that can never trip.
 	/// </para>
 	/// <para>
-	/// <b>Frequency validation.</b> A malformed frequency pair (see
-	/// <see cref="RiskLimitSet.IsFrequencyMalformed"/> - exactly one of count/window specified) is a
-	/// configuration error and throws, rather than being silently dropped.
+	/// <b>Configuration validation.</b> The limit set is validated up front via
+	/// <see cref="RiskLimitSet.Validate"/>: a negative ceiling or commission rate, or a malformed
+	/// frequency pair (see <see cref="RiskLimitSet.IsFrequencyMalformed"/> - exactly one of
+	/// count/window specified), is a configuration error and throws, rather than being silently
+	/// dropped. This is the same validator the pre-trade gate applies, so both patterns fail closed alike.
 	/// </para>
 	/// </remarks>
 	/// <param name="limits">
 	/// The canonical limit set to build rules from (for example, the row chosen by
-	/// <see cref="RiskLimitSet.SelectMostSpecific(IEnumerable{RiskLimitSet}, int, int)"/>). Cannot be null.
+	/// <see cref="RiskLimitSet.SelectMostSpecific(IEnumerable{RiskLimitSet}, int, int, DateTime?)"/>). Cannot be null.
 	/// </param>
 	/// <param name="action">The circuit-breaker action assigned to every generated rule.</param>
 	/// <returns>The ordered list of freshly-created rules; never null (possibly empty when nothing is enforced).</returns>
 	/// <exception cref="ArgumentNullException"><paramref name="limits"/> is <see langword="null"/>.</exception>
-	/// <exception cref="ArgumentException">The frequency pair is malformed (<see cref="RiskLimitSet.IsFrequencyMalformed"/>).</exception>
+	/// <exception cref="ArgumentException"><paramref name="limits"/> is a malformed configuration - a negative ceiling or commission rate, or a half-specified frequency pair (see <see cref="RiskLimitSet.Validate"/>).</exception>
 	public static IList<IRiskRule> CreateRules(RiskLimitSet limits, RiskActions action)
 	{
 		if (limits is null)
 			throw new ArgumentNullException(nameof(limits));
 
-		if (limits.IsFrequencyMalformed)
-			throw new ArgumentException(
-				$"Malformed order-frequency limit: exactly one of count ({limits.MaxOrderFreqCount?.ToString() ?? "null"}) " +
-				$"and window-seconds ({limits.MaxOrderFreqWindowSeconds?.ToString() ?? "null"}) is set. " +
-				"Specify both (to enforce) or neither (to disable).", nameof(limits));
+		// Fail closed on a malformed configuration through the SAME authoritative validator the pre-trade
+		// gate uses (review finding CR-12), so the circuit-breaker factory and the gate reject an invalid
+		// configuration identically: a negative ceiling or commission rate, or a half-specified frequency
+		// pair, throws here instead of silently building a rule set that omits (and thus disables) the check.
+		limits.Validate();
 
 		var rules = new List<IRiskRule>();
 
@@ -200,7 +207,7 @@ public class RiskManager : BaseLogReceiver, IRiskManager
 	/// </summary>
 	/// <param name="limits">The canonical limit set to seed from. Cannot be null.</param>
 	/// <exception cref="ArgumentNullException"><paramref name="limits"/> is <see langword="null"/>.</exception>
-	/// <exception cref="ArgumentException">The frequency pair is malformed (<see cref="RiskLimitSet.IsFrequencyMalformed"/>).</exception>
+	/// <exception cref="ArgumentException"><paramref name="limits"/> is a malformed configuration - a negative ceiling or commission rate, or a half-specified frequency pair (see <see cref="RiskLimitSet.Validate"/>).</exception>
 	public void ApplyCanonicalLimits(RiskLimitSet limits)
 		=> ApplyCanonicalLimits(limits, RiskActions.ClosePositions);
 
@@ -222,15 +229,16 @@ public class RiskManager : BaseLogReceiver, IRiskManager
 	/// </remarks>
 	/// <param name="limits">
 	/// The canonical limit set to seed from (for example, the row chosen by
-	/// <see cref="RiskLimitSet.SelectMostSpecific(IEnumerable{RiskLimitSet}, int, int)"/>). Cannot be null.
+	/// <see cref="RiskLimitSet.SelectMostSpecific(IEnumerable{RiskLimitSet}, int, int, DateTime?)"/>). Cannot be null.
 	/// </param>
 	/// <param name="action">The circuit-breaker action assigned to every generated rule.</param>
 	/// <exception cref="ArgumentNullException"><paramref name="limits"/> is <see langword="null"/>.</exception>
-	/// <exception cref="ArgumentException">The frequency pair is malformed (<see cref="RiskLimitSet.IsFrequencyMalformed"/>).</exception>
+	/// <exception cref="ArgumentException"><paramref name="limits"/> is a malformed configuration - a negative ceiling or commission rate, or a half-specified frequency pair (see <see cref="RiskLimitSet.Validate"/>).</exception>
 	public void ApplyCanonicalLimits(RiskLimitSet limits, RiskActions action)
 	{
 		// Build the complete replacement set BEFORE touching the live manager. If CreateRules throws
-		// (null limits or a malformed frequency pair) the existing configuration is left untouched.
+		// (null limits, or a malformed configuration rejected by RiskLimitSet.Validate - a negative ceiling
+		// or rate, or a half-specified frequency pair) the existing configuration is left untouched.
 		var newCanonical = CreateRules(limits, action);
 
 		lock (_rulesLock)
@@ -248,11 +256,49 @@ public class RiskManager : BaseLogReceiver, IRiskManager
 		}
 	}
 
+	// The rule types CreateRules emits for a canonical RiskLimitSet. Persistence (Save/Load) serializes
+	// each rule by value and does not preserve the reference identity ApplyCanonicalLimits tracks in
+	// _canonicalRules, so after a Load or Clone the provenance of a canonical-generated rule is otherwise
+	// lost. Recognizing these types lets Load reconstruct that provenance (review finding CR-2) so a
+	// subsequent ApplyCanonicalLimits replaces the reloaded canonical rules by stable (type) identity
+	// instead of leaving stale instances behind and appending duplicates.
+	private static readonly HashSet<Type> _canonicalRuleTypes =
+	[
+		typeof(RiskOrderPriceRule),
+		typeof(RiskOrderVolumeRule),
+		typeof(RiskOrderValueRule),
+		typeof(RiskPositionSizeRule),
+		typeof(RiskDailyVolumeRule),
+		typeof(RiskOrderFreqRule),
+		typeof(RiskOrderCommissionRule),
+	];
+
+	private static bool IsCanonicalRuleType(IRiskRule rule) => _canonicalRuleTypes.Contains(rule.GetType());
+
 	/// <inheritdoc />
+	/// <remarks>
+	/// Rules are cleared and reloaded under the same <c>_rulesLock</c> that <see cref="ProcessRules(Message)"/>
+	/// and <see cref="ApplyCanonicalLimits(RiskLimitSet, RiskActions)"/> use, so a concurrent processor never
+	/// observes a half-loaded rule set (review finding CR-2 - the previous implementation mutated
+	/// <see cref="Rules"/> outside the lock). Because serialization does not preserve the reference identity
+	/// <see cref="ApplyCanonicalLimits(RiskLimitSet, RiskActions)"/> tracks, the canonical provenance is
+	/// reconstructed from the reloaded rules by stable (type) identity so a subsequent apply replaces the
+	/// reloaded canonical rules cleanly instead of preserving stale instances and appending duplicates.
+	/// </remarks>
 	public override void Load(SettingsStorage storage)
 	{
-		Rules.Clear();
-		Rules.AddRange(storage.GetValue<SettingsStorage[]>(nameof(Rules)).Select(s => s.LoadEntire<IRiskRule>()));
+		var loaded = storage.GetValue<SettingsStorage[]>(nameof(Rules)).Select(s => s.LoadEntire<IRiskRule>()).ToArray();
+
+		lock (_rulesLock)
+		{
+			_rules.Clear();
+			_rules.AddRange(loaded);
+
+			// Reconstruct canonical provenance so load/clone-then-reapply does not accumulate stale or
+			// duplicate canonical rules (CR-2). Any reloaded rule whose type is one CreateRules emits is
+			// treated as canonical-generated and will be replaced (not preserved) by the next apply.
+			_canonicalRules = [.. loaded.Where(IsCanonicalRuleType)];
+		}
 
 		base.Load(storage);
 	}

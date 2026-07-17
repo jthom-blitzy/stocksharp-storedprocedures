@@ -1,44 +1,22 @@
-================================================================================
-Screenshot 01 - Clean build (net10.0 Release: Algo + Tests + Demo)
-================================================================================
-0 errors across all three projects; raw logs: QA/logs/01..03_build_*.log
-
-Provenance
-  Branch          : blitzy-e686e219-30ce-45cc-8608-8ea778391629
-  Evidence commit : EVIDENCE_COMMIT_PENDING   (stamped here at the Phase-10 provenance commit; see QA/README.md)
-  Build/run TFM   : net10.0  (StockSharpTargets=net10.0; net6.0 is NOT a configured build target in this workspace)
-  Captured (UTC)  : 2026-07-17T20:18:37Z
-  Source of truth : the raw machine logs / TRX under QA/logs/ (this file quotes them verbatim)
-  Capture mode    : headless CI Linux container - no desktop/window-manager/video device; per AAP 0.6.7
-                    the "screenshot" ships as this captioned text plus a faithful terminal-styled PNG
-                    rendering of the same bytes (no photographic claim, no branding).
---------------------------------------------------------------------------------
-
-$ dotnet --version
-10.0.302
-
-$ dotnet build Algo/Algo.csproj -c Release --framework net10.0 --no-incremental
+  Determining projects to restore...
+  All projects are up-to-date for restore.
+  Localization.Generator -> /tmp/blitzy/stocksharp-storedprocedures/blitzy-e686e219-30ce-45cc-8608-8ea778391629_28a5ac/Localization.Generator/bin/Release/netstandard2.0/StockSharp.Localization.Generator.dll
+  Localization -> /tmp/blitzy/stocksharp-storedprocedures/blitzy-e686e219-30ce-45cc-8608-8ea778391629_28a5ac/Localization/bin/Release/net10.0/StockSharp.Localization.dll
+  Messages -> /tmp/blitzy/stocksharp-storedprocedures/blitzy-e686e219-30ce-45cc-8608-8ea778391629_28a5ac/Messages/bin/Release/net10.0/StockSharp.Messages.dll
+  Configuration -> /tmp/blitzy/stocksharp-storedprocedures/blitzy-e686e219-30ce-45cc-8608-8ea778391629_28a5ac/Configuration/bin/Release/net10.0/StockSharp.Configuration.dll
+  BusinessEntities -> /tmp/blitzy/stocksharp-storedprocedures/blitzy-e686e219-30ce-45cc-8608-8ea778391629_28a5ac/BusinessEntities/bin/Release/net10.0/StockSharp.BusinessEntities.dll
+  Reporting -> /tmp/blitzy/stocksharp-storedprocedures/blitzy-e686e219-30ce-45cc-8608-8ea778391629_28a5ac/Reporting/bin/Release/net10.0/StockSharp.Reporting.dll
+  Charting.Interfaces -> /tmp/blitzy/stocksharp-storedprocedures/blitzy-e686e219-30ce-45cc-8608-8ea778391629_28a5ac/Charting.Interfaces/bin/Release/net10.0/StockSharp.Charting.Interfaces.dll
 /tmp/blitzy/stocksharp-storedprocedures/blitzy-e686e219-30ce-45cc-8608-8ea778391629_28a5ac/Algo/TraderHelper.cs(1196,6): warning CS0618: 'CompressionHelper.Uncompress<TCompressStream>(byte[], int?, int?, int)' is obsolete: 'Blocking sync-over-async wrapper. Use UncompressAsync instead.' [/tmp/blitzy/stocksharp-storedprocedures/blitzy-e686e219-30ce-45cc-8608-8ea778391629_28a5ac/Algo/Algo.csproj::TargetFramework=net10.0]
 /tmp/blitzy/stocksharp-storedprocedures/blitzy-e686e219-30ce-45cc-8608-8ea778391629_28a5ac/Algo/Storages/Csv/CsvEntityList.cs(157,11): warning CS0618: 'CompressionHelper.Compress<TCompressStream>(byte[], int?, int?, CompressionLevel, int)' is obsolete: 'Blocking sync-over-async wrapper. Use CompressAsync instead.' [/tmp/blitzy/stocksharp-storedprocedures/blitzy-e686e219-30ce-45cc-8608-8ea778391629_28a5ac/Algo/Algo.csproj::TargetFramework=net10.0]
-    2 Warning(s)
-    0 Error(s)
+  Algo -> /tmp/blitzy/stocksharp-storedprocedures/blitzy-e686e219-30ce-45cc-8608-8ea778391629_28a5ac/Algo/bin/Release/net10.0/StockSharp.Algo.dll
+  03_Misc.LegacySqlDemo -> /tmp/blitzy/stocksharp-storedprocedures/blitzy-e686e219-30ce-45cc-8608-8ea778391629_28a5ac/Samples/08_Misc/03_LegacySqlDemo/bin/Release/net10.0/StockSharp.Samples.Misc.LegacySqlDemo.dll
 
-Time Elapsed 00:00:12.61
+Build succeeded.
 
-$ dotnet build Tests/Tests.csproj -c Release --framework net10.0 --no-incremental
-    48 Warning(s)
-    0 Error(s)
-
-Time Elapsed 00:00:31.08
-
-$ dotnet build Samples/08_Misc/03_LegacySqlDemo/03_Misc.LegacySqlDemo.csproj -c Release --framework net10.0 --no-incremental
 /tmp/blitzy/stocksharp-storedprocedures/blitzy-e686e219-30ce-45cc-8608-8ea778391629_28a5ac/Algo/TraderHelper.cs(1196,6): warning CS0618: 'CompressionHelper.Uncompress<TCompressStream>(byte[], int?, int?, int)' is obsolete: 'Blocking sync-over-async wrapper. Use UncompressAsync instead.' [/tmp/blitzy/stocksharp-storedprocedures/blitzy-e686e219-30ce-45cc-8608-8ea778391629_28a5ac/Algo/Algo.csproj::TargetFramework=net10.0]
 /tmp/blitzy/stocksharp-storedprocedures/blitzy-e686e219-30ce-45cc-8608-8ea778391629_28a5ac/Algo/Storages/Csv/CsvEntityList.cs(157,11): warning CS0618: 'CompressionHelper.Compress<TCompressStream>(byte[], int?, int?, CompressionLevel, int)' is obsolete: 'Blocking sync-over-async wrapper. Use CompressAsync instead.' [/tmp/blitzy/stocksharp-storedprocedures/blitzy-e686e219-30ce-45cc-8608-8ea778391629_28a5ac/Algo/Algo.csproj::TargetFramework=net10.0]
     2 Warning(s)
     0 Error(s)
 
 Time Elapsed 00:00:10.71
-
-# All three projects: 0 Error(s). Warnings are pre-existing CS0618 in out-of-scope files
-# (Algo/TraderHelper.cs, Algo/Storages/Csv/CsvEntityList.cs, and unrelated Tests fixtures);
-# zero warnings originate in any file this refactor modified.

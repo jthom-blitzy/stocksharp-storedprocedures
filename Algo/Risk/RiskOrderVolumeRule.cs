@@ -58,13 +58,18 @@ public class RiskOrderVolumeRule : RiskRule
 			case MessageTypes.OrderRegister:
 			{
 				var orderReg = (OrderRegisterMessage)message;
-				return orderReg.Volume >= Volume;
+				// Compare the DECIMAL(18,4)-normalized quantity against the ceiling so this stream rule is at
+				// least as strict as the gate at the fourth-decimal boundary (review finding CR-27). An
+				// out-of-range magnitude saturates and is treated as a breach rather than throwing mid-stream.
+				return RiskLimitSet.NormalizeMoneySaturating(orderReg.Volume) >= Volume;
 			}
 
 			case MessageTypes.OrderReplace:
 			{
 				var orderReplace = (OrderReplaceMessage)message;
-				return orderReplace.Volume > 0 && orderReplace.Volume >= Volume;
+				// Same DECIMAL(18,4) normalization as the register branch (CR-27).
+				var volume = RiskLimitSet.NormalizeMoneySaturating(orderReplace.Volume);
+				return volume > 0 && volume >= Volume;
 			}
 
 			default:

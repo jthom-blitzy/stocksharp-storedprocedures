@@ -175,6 +175,54 @@ public class PreTradeRiskServiceTests : BaseTestClass
 		accepted.RejectReason.AssertNull();
 	}
 
+	// ---- CR-13 : a Limit price that rounds to <= 0 at DECIMAL(18,4) is rejected ------------------
+	// The gateway coerces the price to the persisted scale BEFORE the positive-price check, and the gate's
+	// preamble does the same, so a sub-tick 0.00004 (which stores as 0.0000) can never be accepted just
+	// because a 0.0000 price never trips the "price >= limit" ceiling comparison.
+	[TestMethod]
+	public void SubScalePriceRejected()
+	{
+		// Below half a tick: rounds to 0.0000 and is rejected as "Invalid price" in the preamble.
+		var subScale = PreTradeRiskService.Evaluate(SeedLimits(), new PreTradeState(), Sides.Buy, volume: 10m, price: 0.00004m);
+		subScale.IsValid.AssertFalse();
+		subScale.RejectReason.AssertEqual("Invalid price");
+
+		// At/above half a tick: rounds up to 0.0001 (> 0) and survives; price 0.0001 < 500 -> accept.
+		var justAbove = PreTradeRiskService.Evaluate(SeedLimits(), new PreTradeState(), Sides.Buy, volume: 10m, price: 0.00005m);
+		justAbove.IsValid.AssertTrue();
+		justAbove.RejectReason.AssertNull();
+
+		// An explicit zero or negative price is likewise rejected in the preamble (not silently coerced).
+		PreTradeRiskService.Evaluate(SeedLimits(), new PreTradeState(), Sides.Buy, 10m, 0m).RejectReason.AssertEqual("Invalid price");
+		PreTradeRiskService.Evaluate(SeedLimits(), new PreTradeState(), Sides.Buy, 10m, -5m).RejectReason.AssertEqual("Invalid price");
+
+		// A market order (null price) is unaffected by the price preamble and passes on the seed limits.
+		PreTradeRiskService.Evaluate(SeedLimits(), new PreTradeState(), Sides.Buy, volume: 10m, price: null).IsValid.AssertTrue();
+	}
+
+	// ---- CR-7 / CR-12 : the gate FAILS CLOSED on a malformed configuration ----------------------
+	// A negative ceiling, a negative commission rate, or a half-specified frequency pair is a configuration
+	// error the gate must never act on: Evaluate throws via RiskLimitSet.Validate rather than silently
+	// disabling the check (the old fail-open behaviour). This is the SAME validator RiskManager.CreateRules
+	// uses, so the per-order gate and the portfolio circuit-breaker factory reject invalid config identically.
+	[TestMethod]
+	public void EvaluateFailsClosedOnMalformedConfig()
+	{
+		var state = new PreTradeState();
+
+		ThrowsExactly<ArgumentException>(() => PreTradeRiskService.Evaluate(new RiskLimitSet { MaxOrderPrice = -1m }, state, Sides.Buy, 10m, 100m));
+		ThrowsExactly<ArgumentException>(() => PreTradeRiskService.Evaluate(new RiskLimitSet { MaxCommissionTotal = 5000m, CommissionRate = -0.0001m }, state, Sides.Buy, 10m, 100m));
+		ThrowsExactly<ArgumentException>(() => PreTradeRiskService.Evaluate(new RiskLimitSet { MaxOrderFreqCount = 5 }, state, Sides.Buy, 10m, 100m));
+		ThrowsExactly<ArgumentException>(() => PreTradeRiskService.Evaluate(new RiskLimitSet { MaxOrderFreqWindowSeconds = 60 }, state, Sides.Buy, 10m, 100m));
+
+		// A malformed configuration fails closed even when the ORDER itself is also invalid: the
+		// configuration error is surfaced (thrown) rather than masked by a business reject.
+		ThrowsExactly<ArgumentException>(() => PreTradeRiskService.Evaluate(new RiskLimitSet { MaxOrderPrice = -1m }, state, Sides.Buy, -5m, 100m));
+
+		// A valid null/0-only (unlimited) or positive configuration does NOT throw.
+		PreTradeRiskService.Evaluate(new RiskLimitSet { PortfolioId = 1, MaxOrderPrice = 0m }, state, Sides.Buy, 10m, 100m).IsValid.AssertTrue();
+	}
+
 	// ---- Task 5 : check 1 (order price ceiling) -------------------------------------------------
 
 	[TestMethod]
@@ -386,6 +434,35 @@ public class PreTradeRiskServiceTests : BaseTestClass
 		RiskLimitSet.SelectMostSpecific(new[] { otherScope }, 1, 2).AssertNull();
 	}
 
+	// ---- CR-32 : SelectMostSpecific excludes future-effective rows when a UTC cutoff is supplied --
+
+	[TestMethod]
+	public void SelectMostSpecific_ExcludesFutureEffective()
+	{
+		var now = new DateTime(2026, 7, 17, 0, 0, 0, DateTimeKind.Utc);
+
+		// Two rows of the SAME (portfolio+security) specificity. A stricter row is effective in the past; a
+		// looser row is scheduled to take effect TOMORROW. Without a cutoff the future row (more recent
+		// EffectiveDate) wins the tie-break; WITH the cutoff it is excluded so the current stricter row wins.
+		var current = new RiskLimitSet { PortfolioId = 1, SecurityId = 2, IsActive = true, MaxOrderPrice = 500m, EffectiveDate = now.AddDays(-30) };
+		var future = new RiskLimitSet { PortfolioId = 1, SecurityId = 2, IsActive = true, MaxOrderPrice = 999999m, EffectiveDate = now.AddDays(1) };
+
+		// No cutoff (legacy behaviour, callers that already time-filter): the future, most-recent row wins.
+		RiskLimitSet.SelectMostSpecific(new[] { current, future }, 1, 2).MaxOrderPrice.Value.AssertEqual(999999m);
+
+		// With the cutoff: the future row is excluded, the current stricter row is selected.
+		var selected = RiskLimitSet.SelectMostSpecific(new[] { current, future }, 1, 2, now);
+		selected.AssertNotNull();
+		selected.MaxOrderPrice.Value.AssertEqual(500m);
+
+		// A row effective exactly AT the cutoff instant is still eligible (<= is inclusive).
+		var atCutoff = new RiskLimitSet { PortfolioId = 1, SecurityId = 2, IsActive = true, MaxOrderPrice = 250m, EffectiveDate = now };
+		RiskLimitSet.SelectMostSpecific(new[] { current, atCutoff }, 1, 2, now).MaxOrderPrice.Value.AssertEqual(250m);
+
+		// When every candidate is in the future, nothing applies as of the cutoff.
+		RiskLimitSet.SelectMostSpecific(new[] { future }, 1, 2, now).AssertNull();
+	}
+
 	// ---- Task 14 : Buy/Sell signed-delta handling in the position check -------------------------
 
 	[TestMethod]
@@ -480,15 +557,23 @@ public class PreTradeRiskServiceTests : BaseTestClass
 	// Inserts one RiskLimits row for the scope. A null argument persists SQL NULL, i.e. "not enforced".
 	private static async Task InsertLimitsAsync(SqlConnection c, SqlTransaction t, int portfolioId, int securityId, CancellationToken ct,
 		decimal? price = null, decimal? qty = null, decimal? value = null, decimal? position = null,
-		decimal? daily = null, int? freqCount = null, int? freqWindow = null, decimal? commission = null, decimal rate = 0.0005m)
+		decimal? daily = null, int? freqCount = null, int? freqWindow = null, decimal? commission = null, decimal rate = 0.0005m,
+		DateTime? effectiveDate = null)
 	{
+		// effective_date defaults to one second in the PAST (via the DB clock) so a seeded row is
+		// unambiguously already in force for the CR-32 "effective_date <= SYSUTCDATETIME()" cutoff. Using a
+		// bare SYSUTCDATETIME() here would store the value rounded up to the DATETIME2(3) column scale, which
+		// can land a fraction of a millisecond AFTER an immediately-following SELECT's clock and spuriously
+		// exclude the just-inserted row - a same-transaction insert-then-query artifact that never occurs in
+		// production (rows are seeded long before orders arrive). Pass an explicit value to seed a genuinely
+		// past- or future-effective row for the cutoff tests.
 		await using var cmd = new SqlCommand(
 			"""
 			INSERT INTO dbo.RiskLimits
 			  (portfolio_id, security_id, max_order_price, max_order_qty, max_order_value, max_position_size,
 			   max_daily_volume, max_order_freq_count, max_order_freq_window_sec, max_commission_total,
 			   commission_rate, is_active, effective_date)
-			VALUES (@p, @s, @price, @qty, @value, @pos, @daily, @fc, @fw, @comm, @rate, 1, SYSUTCDATETIME())
+			VALUES (@p, @s, @price, @qty, @value, @pos, @daily, @fc, @fw, @comm, @rate, 1, ISNULL(@effective, DATEADD(SECOND, -1, SYSUTCDATETIME())))
 			""", c, t);
 
 		cmd.Parameters.Add(NInt("@p", portfolioId));
@@ -502,6 +587,7 @@ public class PreTradeRiskServiceTests : BaseTestClass
 		cmd.Parameters.Add(NInt("@fw", freqWindow));
 		cmd.Parameters.Add(Money("@comm", commission));
 		cmd.Parameters.Add(new SqlParameter("@rate", SqlDbType.Decimal) { Precision = 9, Scale = 6, Value = rate });
+		cmd.Parameters.Add(new SqlParameter("@effective", SqlDbType.DateTime2) { Value = (object)effectiveDate ?? DBNull.Value });
 
 		await cmd.ExecuteNonQueryAsync(ct);
 	}
@@ -639,6 +725,65 @@ public class PreTradeRiskServiceTests : BaseTestClass
 		});
 
 	[TestMethod]
+	public Task Live_FutureEffectiveRowExcluded()
+		=> RunWithFreshScopeAsync(async (svc, c, t, pid, sid) =>
+		{
+			// CR-32: a stricter row effective in the past and a looser row scheduled a year in the future,
+			// same scope. The gate's "effective_date <= SYSUTCDATETIME()" cutoff must exclude the future row
+			// so the CURRENT stricter ceiling (price 500) applies: an order priced 600 is REJECTED. Without
+			// the cutoff the future, most-recent looser row (price 999999) would be selected and 600 accepted.
+			await InsertLimitsAsync(c, t, pid, sid, default, price: 500m, effectiveDate: DateTime.UtcNow.AddDays(-30));
+			await InsertLimitsAsync(c, t, pid, sid, default, price: 999999m, effectiveDate: DateTime.UtcNow.AddDays(365));
+
+			var rejected = await svc.ValidateAsync(c, t, pid, sid, Sides.Buy, 1m, 600m, OrderTypes.Limit);
+			rejected.IsValid.AssertFalse();
+			rejected.RejectReason.AssertEqual("Order price 600.0000 meets/exceeds limit 500.0000");
+
+			// Sanity: a sub-500 price is still ACCEPTED, confirming the past (current) row is the one in force
+			// and the future looser row is genuinely excluded rather than simply never matched.
+			var ok = await svc.ValidateAsync(c, t, pid, sid, Sides.Buy, 1m, 499m, OrderTypes.Limit);
+			ok.IsValid.AssertTrue();
+			ok.RejectReason.AssertNull();
+		});
+
+	[TestMethod]
+	public Task Live_CanonicalWiringIsScopeIsolated()
+		=> RunWithFreshScopeAsync(async (svc, c, t, pidA, sidA) =>
+		{
+			// CR-1: the scope-aware provider (PreTradeRiskService.LoadLimitsAsync) selects the row for a
+			// specific (portfolio, security), and seeding ONE RiskManager per exact scope from it keeps
+			// scopes isolated. A single shared, scope-blind manager could not represent two different scoped
+			// rows at once (the finding's "CreateRules discards scope"), so the correct wiring is per-scope.
+			var (pidB, sidB) = await InsertScopeAsync(c, t, default);
+
+			// Two scopes, two DIFFERENT canonical price ceilings on the same shared RiskLimitSet type.
+			await InsertLimitsAsync(c, t, pidA, sidA, default, price: 500m);
+			await InsertLimitsAsync(c, t, pidB, sidB, default, price: 999m);
+
+			// The provider returns each scope's OWN row (scope-aware selection, not a global default).
+			var limitsA = await svc.LoadLimitsAsync(c, t, pidA, sidA);
+			var limitsB = await svc.LoadLimitsAsync(c, t, pidB, sidB);
+			limitsA.AssertNotNull();
+			limitsB.AssertNotNull();
+			limitsA.EffectiveMaxOrderPrice.Value.AssertEqual(500m);
+			limitsB.EffectiveMaxOrderPrice.Value.AssertEqual(999m);
+
+			// One circuit breaker per exact scope, each seeded from that scope's canonical row: isolated.
+			var managerA = new RiskManager();
+			var managerB = new RiskManager();
+			managerA.ApplyCanonicalLimits(limitsA);
+			managerB.ApplyCanonicalLimits(limitsB);
+			managerA.Rules.OfType<RiskOrderPriceRule>().Single().Price.AssertEqual(500m);
+			managerB.Rules.OfType<RiskOrderPriceRule>().Single().Price.AssertEqual(999m);
+
+			// Both enforcement patterns for a scope read the SAME canonical source: the per-order gate for
+			// scope A (ceiling 500) REJECTS a 600 price while scope B (ceiling 999) ACCEPTS it - matching the
+			// per-scope managers seeded above, proving one canonical definition drives both patterns.
+			(await svc.ValidateAsync(c, t, pidA, sidA, Sides.Buy, 10m, 600m, OrderTypes.Limit)).IsValid.AssertFalse();
+			(await svc.ValidateAsync(c, t, pidB, sidB, Sides.Buy, 10m, 600m, OrderTypes.Limit)).IsValid.AssertTrue();
+		});
+
+	[TestMethod]
 	public Task Live_FrequencyRollingCount()
 		=> RunWithFreshScopeAsync(async (svc, c, t, pid, sid) =>
 		{
@@ -716,18 +861,19 @@ public class PreTradeRiskServiceTests : BaseTestClass
 		});
 
 	[TestMethod]
-	public Task Live_MalformedFrequencyPairIsNotEnforced()
+	public Task Live_MalformedFrequencyPairFailsClosed()
 		=> RunWithFreshScopeAsync(async (svc, c, t, pid, sid) =>
 		{
-			// A count without a window is a malformed pair -> frequency is disabled, never an always-reject.
+			// CR-12: a count WITHOUT a window is a malformed pair. Previously the gate silently DISABLED the
+			// frequency check (fail open) while the manager factory THREW - an inconsistency the review flagged.
+			// The gate now fails CLOSED through the same authoritative RiskLimitSet.Validate, so ValidateAsync
+			// throws rather than accepting an order under an un-evaluable frequency configuration. This is the
+			// live counterpart of the pure EvaluateFailsClosedOnMalformedConfig / factory
+			// ManagerCreateRulesNegativeConfigFailsClosed assertions.
 			await InsertLimitsAsync(c, t, pid, sid, default, freqCount: 5, freqWindow: null);
 
-			for (var i = 0; i < 10; i++)
-				await InsertOrderAsync(c, t, pid, sid, 'B', 10m, 100m, "ACCEPTED", default);
-
-			var r = await svc.ValidateAsync(c, t, pid, sid, Sides.Buy, 10m, 100m, OrderTypes.Limit);
-			r.IsValid.AssertTrue();
-			r.RejectReason.AssertNull();
+			await ThrowsExactlyAsync<ArgumentException>(async ()
+				=> await svc.ValidateAsync(c, t, pid, sid, Sides.Buy, 10m, 100m, OrderTypes.Limit));
 		});
 
 	[TestMethod]

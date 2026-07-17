@@ -1,0 +1,5 @@
+Test run for /tmp/blitzy/stocksharp-storedprocedures/blitzy-e686e219-30ce-45cc-8608-8ea778391629_28a5ac/Tests/bin/Release/net10.0/StockSharp.Tests.dll (.NETCoreApp,Version=v10.0)
+A total of 1 test files matched the specified pattern.
+Results File: /tmp/blitzy/stocksharp-storedprocedures/blitzy-e686e219-30ce-45cc-8608-8ea778391629_28a5ac/QA/logs/test_targeted_net10.0.trx
+
+Passed!  - Failed:     0, Passed:   196, Skipped:     0, Total:   196, Duration: 7 s - StockSharp.Tests.dll (net10.0)

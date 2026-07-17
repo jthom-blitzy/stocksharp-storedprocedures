@@ -1,208 +1,49 @@
 ================================================================================
-TRANSCRIPT — Recording 01: End-to-end Docker + scripts + demo
+TRANSCRIPT - Recording 01: End-to-end Docker + scripts + demo
 ================================================================================
+Substitution for 01_end_to_end_docker_scripts_demo.mp4 (screen-only, target < 5:00) - AAP 0.6.7 (no video device).
 
-Substitution for: 01_end_to_end_docker_scripts_demo.mp4 (screen-only, target < 5:00)
-Reason: no video-capture environment available — see AAP §0.6.7.
-Branch: blitzy-e686e219-30ce-45cc-8608-8ea778391629
-Commit: 78ec6ebefb583a72c36476b12255ddc68b511d64
-Companion frames: 01_end_to_end_docker_scripts_demo_01.png … 01_end_to_end_docker_scripts_demo_03.png
+Provenance
+  Branch          : blitzy-e686e219-30ce-45cc-8608-8ea778391629
+  Evidence commit : EVIDENCE_COMMIT_PENDING   (stamped here at the Phase-10 provenance commit; see QA/README.md)
+  Build/run TFM   : net10.0  (StockSharpTargets=net10.0; net6.0 is NOT a configured build target in this workspace)
+  Captured (UTC)  : 2026-07-17T20:18:37Z
+  Source of truth : the raw machine logs / TRX under QA/logs/ (this file quotes them verbatim)
+  Capture mode    : headless CI Linux container - no desktop/window-manager/video device; per AAP 0.6.7
+                    the "screenshot" ships as this captioned text plus a faithful terminal-styled PNG
+                    rendering of the same bytes (no photographic claim, no branding).
+--------------------------------------------------------------------------------
 
-This is a screen-only "recording". A headless CI Linux container has no desktop, window
-manager, or video-capture device, so — per the MANDATORY substitution rule in AAP §0.6.7 —
-the recording ships as this captioned transcript plus the numbered PNG frames listed above.
-Each frame is a faithful terminal-styled text rendering of the real, unaltered command output
-captured for this run (no photographic/screenshot claim, no branding). Read back at scene
-speed the take is screen-only and runs under five minutes — the caption track runs from [00:00]
-to [~04:40]. The frame cross-references (→ frame _01 / _02 / _03) tie each caption to the PNG
-that depicts it.
+Companion frames (5): 01_end_to_end_docker_scripts_demo_01.png ... 01_end_to_end_docker_scripts_demo_05.png
+Each frame is a faithful terminal-styled rendering of the real, unaltered command output / file
+content named in QA/logs/ (for logs) or the repository (for code). No photographic/screenshot claim.
 
 WHAT THIS RECORDING PROVES
-The SQL→C# risk-consolidation refactor is demonstrated end-to-end against a LIVE SQL Server. It
-preserves the three observable outcomes; behavior is preserved except for two intentional,
-documented changes (the order-frequency rule adopts the stricter rolling count, AAP §0.6.1, and a
-non-positive ceiling now means "not enforced" under the NULL/0 convention, AAP §0.3.1 / MA-16):
-(1) the SQL Server 2022 container comes up healthy;
-(2) the four scripts apply in run order 001 → 002 → 003 → 004, after which SQL Server is pure
-data storage — zero stored procedures and a single best-effort audit trigger, with no risk
-thresholds, no accept/reject decisions, and no P&L math left in SQL; (3) the console demo
-reproduces the THREE observable outcomes — an order ACCEPTED within limits, an order REJECTED
-by the seeded max_order_price ceiling, and a recorded trade that RECOMPUTES the position. After
-the refactor the pre-trade decision is made by the C# PreTradeRiskService (the seven canonical
-checks) and the position recompute is done exactly once by the C# PositionRecalculationService —
-not by dbo.usp_ValidatePreTradeRisk / dbo.usp_RecalculatePositionOnTrade / trg_Trades_PositionRecalc,
-which are gone.
+The SQL->C# risk-consolidation refactor runs end-to-end against a LIVE SQL Server 2022. Behavior is
+preserved except for two intentional, documented changes (order-frequency adopts the stricter rolling
+count, AAP 0.6.1; a non-positive ceiling means "not enforced" under the NULL/0 convention, AAP 0.3.1):
+(1) the container comes up healthy ('Recovery is complete');
+(2) scripts 001->004 apply in run order (exit=0 each), after which SQL is pure storage - 0 stored
+    procedures, 1 audit-only trigger, no thresholds / accept-reject / P&L math in SQL;
+(3) a clean net10.0 Release build (0 errors); (4) the focused suite is green (196/196, live SQL);
+(5) the console demo reproduces the THREE outcomes - order ACCEPTED within limits, order REJECTED by
+    the seeded max_order_price ceiling, and a recorded trade that RECOMPUTES the position in C#.
 
---------------------------------------------------------------------------------
-ENVIRONMENT  (commands verbatim from Database/README.md)
---------------------------------------------------------------------------------
-Stand up the SQL Server 2022 container on the LOOPBACK interface only (host port 127.0.0.1:14330 →
-container 1433), with a per-run secret (review finding MA-13, CWE-668):
+CAPTION TRACK  (screen-only; runs under five minutes: [00:00] -> [~04:40])
+  [00:00]  (-> frame _01)
+          Container is Up and SQL Server logged 'Recovery is complete' (QA/logs/07_docker_recovery.log).
+  [00:50]  (-> frame _02)
+          Apply Database/001_Schema..004_SeedData in order; each returns exit=0 (QA/logs/08_apply_scripts_net10.0.log).
+  [02:00]  (-> frame _03)
+          dotnet build -c Release -f net10.0 -> Build succeeded, 0 Error(s) (QA/logs/01_build_algo_net10.0_release.log).
+  [02:55]  (-> frame _04)
+          Targeted suite: Passed! Failed 0 / Passed 196 / Skipped 0 (QA/logs/04_test_targeted_net10.0.log + .trx).
+  [03:45]  (-> frame _05)
+          Demo prints the three outcomes and seeds the circuit breaker (8 rules) from the same canonical RiskLimitSet.
 
-    # Per-run secret - not committed, not shown in evidence.
-    export MSSQL_SA_PASSWORD="$(openssl rand -base64 24)Aa1!"
-
-    docker run -d --name stocksharp-legacy-sql \
-      -e "ACCEPT_EULA=Y" -e "MSSQL_SA_PASSWORD=$MSSQL_SA_PASSWORD" \
-      -p 127.0.0.1:14330:1433 \
-      mcr.microsoft.com/mssql/server:2022-latest
-
-The 127.0.0.1: prefix publishes the port on loopback only; verify with
-`docker port stocksharp-legacy-sql` (must print 127.0.0.1:14330, not 0.0.0.0:14330).
-
-Wait for initialization to finish (health check):
-
-    docker logs stocksharp-legacy-sql | grep "Recovery is complete"
-
-Apply the DDL/CRUD scripts in run order 001 → 002 → 003 → 004 (secret passed via SQLCMDPASSWORD so
-it never lands on the command line / process list):
-
-    docker cp Database stocksharp-legacy-sql:/tmp/Database
-    for f in 001_Schema.sql 002_StoredProcedures.sql 003_Triggers.sql 004_SeedData.sql; do
-      docker exec -e "SQLCMDPASSWORD=$MSSQL_SA_PASSWORD" stocksharp-legacy-sql \
-        /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -C -i "/tmp/Database/$f"
-    done
-
-Connection string the C# side resolves (fallback; override via the
-STOCKSHARP_LEGACY_SQL_CONNECTION environment variable):
-
-    Server=localhost,14330;Database=StockSharpLegacy;User Id=sa;Password=<sa-password>;TrustServerCertificate=True;
-
-Run the console demo:
-
-    dotnet run --project Samples/08_Misc/03_LegacySqlDemo
-
-Credential/exposure note (MA-13): the SA password is a per-run secret generated above, never a
-committed literal, and is not pasted into logs, screenshots, or this transcript. The container is
-bound to 127.0.0.1 so the SA endpoint is not reachable from other hosts. For the application/demo,
-prefer a least-privilege login scoped to the StockSharpLegacy tables (see Database/README.md)
-rather than SA, and for any non-disposable target supply the connection string through
-STOCKSHARP_LEGACY_SQL_CONNECTION (backed by a secret manager) instead.
-
-Seeded DEMO limits (Database/004_SeedData.sql) — the portfolio-wide RiskLimits row used throughout:
-
-    max_order_price           = 500.00
-    max_order_qty             = 10000
-    max_order_value           = 1000000.00
-    max_position_size         = 100000
-    max_daily_volume          = 250000
-    max_order_freq_count      = 5
-    max_order_freq_window_sec = 60
-    max_commission_total      = 5000.00
-    commission_rate           = 0.0005
-
-Reference data after seeding: the DEMO portfolio (currency USD) plus the AAPL and MSFT securities
-on NASDAQ.
-
---------------------------------------------------------------------------------
-TIMELINE / CAPTION TRACK  (screen-only, < 5:00)
---------------------------------------------------------------------------------
-
-[00:00]  Repo root shown; goal stated.                                   → frame _01
-         The take opens at the repository root of stocksharp-storedprocedures. Goal, stated on
-         screen: prove the SQL→C# risk consolidation end-to-end against a live SQL Server — bring
-         up the database, apply the four scripts, and reproduce the three observable demo outcomes
-         with the trading-risk business logic now in C#.
-
-[~00:20]  SQL Server 2022 container comes up healthy.                    → frame _01
-         The `docker run …` command above launches mcr.microsoft.com/mssql/server:2022-latest as
-         container `stocksharp-legacy-sql`, publishing host port 14330 → 1433. Polling
-         `docker logs stocksharp-legacy-sql | grep "Recovery is complete"` returns:
-
-             Recovery is complete. This is an informational message only. No user action is required.
-
-         The container is healthy and accepting connections on localhost,14330.
-
-[~01:00]  Apply the four scripts in run order 001 → 002 → 003 → 004.     → frame _02
-         `docker cp Database stocksharp-legacy-sql:/tmp/Database` copies the scripts into the
-         container, then the apply loop runs each of 001_Schema.sql → 002_StoredProcedures.sql →
-         003_Triggers.sql → 004_SeedData.sql, in that order, cleanly ("Changed database context to
-         'StockSharpLegacy'." for each). After the refactor, 002_StoredProcedures.sql and
-         003_Triggers.sql contain only plain DDL/CRUD — NO risk thresholds, NO accept/reject
-         decisions, NO P&L math: 002 merely DROPs the relocated procedures (the
-         usp_ValidatePreTradeRisk / usp_RecalculatePositionOnTrade logic now lives in the C#
-         services, and usp_SubmitOrder was removed entirely), and 003 DROPs the old
-         trg_Trades_PositionRecalc and (re)creates only the best-effort audit trigger
-         trg_Orders_StatusAudit. Catalog introspection confirms the consolidated state:
-
-             stored_procedures = 0
-             user_triggers     = 1   (trg_Orders_StatusAudit — best-effort audit cascade, a
-                                       trigger-derived transition log, not a tamper-proof
-                                       append-only guarantee)
-
-         with the seed intact (1 DEMO portfolio, 2 securities, 1 RiskLimits row).
-
-[~02:00]  `dotnet run --project Samples/08_Misc/03_LegacySqlDemo` starts. → frame _03
-         The demo resolves its connection (STOCKSHARP_LEGACY_SQL_CONNECTION, or the fallback above),
-         ensures the portfolio/security rows exist, and prints their SQL-side identifiers:
-
-             Portfolio 'DEMO' = portfolio_id 1
-             Security 'AAPL@NASDAQ' = security_id 1
-
-[~02:30]  Outcome 1 — ACCEPTED (within every configured limit).          → frame _03
-         Console output:
-
-             Submitting BUY 100 @ 150.00 (within limits)...
-               -> order_id=1 is_valid=True reject_reason=(none)
-
-         The accept decision is produced by the C# PreTradeRiskService: the gateway calls it to run
-         the seven canonical pre-trade checks (all pass — price 150 < 500, qty 100 < 10000, notional
-         15,000 < 1,000,000, and so on), and then performs a plain parameterized INSERT into
-         dbo.Orders with status ACCEPTED. No stored procedure is involved.
-
-[~03:15]  Outcome 2 — REJECTED by the price ceiling.                     → frame _03
-         Console output:
-
-             Submitting BUY 10 @ 999.00 (price exceeds the seeded max_order_price limit)...
-               -> order_id=2 is_valid=False reject_reason=Order price 999.0000 meets/exceeds limit 500.0000
-                  Note: this rejection comes from the C# PreTradeRiskService (the per-order pre-trade
-                  gate), which reads the applicable RiskLimits row and enforces it in C#. The C#
-                  RiskManager (Algo/Risk) is the portfolio-wide circuit breaker - a distinct
-                  enforcement pattern that now shares the same canonical RiskLimitSet thresholds.
-
-         The rejection is produced by PreTradeRiskService evaluating the canonical
-         RiskLimitSet.MaxOrderPrice with reject-when-`>=` semantics: 999.0000 ≥ 500.0000, so the
-         order is rejected. Note the reject reason is rendered with four fractional digits
-         (999.0000 / 500.0000) because the gate mirrors the DECIMAL(18,4) money columns exactly. The
-         rejected order is STILL recorded in dbo.Orders (status REJECTED, with the reject_reason), so
-         there is an audit trail of what was blocked and why — it is not dropped.
-
-[~04:00]  Outcome 3 — a recorded trade recomputes the position.          → frame _03
-         Console output:
-
-             Recording a trade: 100 @ 150.00 against order #1...
-               -> position after C# recompute: qty=100.0000 avg_price=150.0000 realized_pnl=0.0000
-
-         gateway.RecordTradeAsync performs a plain INSERT into dbo.Trades and then invokes
-         PositionRecalculationService EXACTLY ONCE, inside the same transaction, to recompute
-         dbo.Positions using average-cost + realized-P&L math. There is no AFTER-INSERT trigger
-         driving the recompute any more, so the historical double-count hazard (AAP §0.6.4 — the
-         trigger and a standalone reconciliation job both applying the same trade) is eliminated: the
-         service is the single, idempotent entry point, invoked once per recorded trade. For the
-         first fill (BUY 100 @ 150) the resulting long position is qty=100.0000 at avg_price=150.0000
-         with realized_pnl=0.0000.
-
-[~04:40]  Closing caption.                                               → frame _03
-         All three observable outcomes were reproduced end-to-end against a live SQL Server: accept,
-         reject-by-price, and trade-triggers-position-recompute. The pre-trade decision ran in C#
-         (PreTradeRiskService) and the position recompute ran exactly once in C#
-         (PositionRecalculationService); SQL Server held only pure DDL + CRUD (0 stored procedures,
-         1 best-effort audit trigger). The three observable outcomes are preserved; the only
-         behavioral changes are the two documented, intentional ones (rolling-count frequency,
-         AAP §0.6.1; non-positive ceiling = not enforced, AAP §0.3.1 / MA-16).
-
---------------------------------------------------------------------------------
-FOOTER
---------------------------------------------------------------------------------
-This transcript, together with the three PNG frames
-(01_end_to_end_docker_scripts_demo_01.png … 01_end_to_end_docker_scripts_demo_03.png), is the
-AAP §0.6.7 documented substitution for the screen-only recording
-01_end_to_end_docker_scripts_demo.mp4 (no video-capture environment exists in this headless
-container). The substitution is indexed in QA/README.md alongside the other QA evidence artifacts.
-
-The database-assigned identifiers (portfolio_id, security_id, and the order_id values) are
-IDENTITY-assigned and increment from run to run; the fresh run captured here shows
-portfolio_id = 1, security_id = 1 (AAPL), and order_id = 1 (accepted) then order_id = 2
-(rejected). What never varies is the behavior: the three outcomes are reproduced on every run,
-with the risk decision made by PreTradeRiskService and the position recompute performed exactly
-once by PositionRecalculationService, and with SQL Server reduced to pure DDL + CRUD.
+FRAME INDEX  (5 frames)
+  01_end_to_end_docker_scripts_demo_01.png
+  01_end_to_end_docker_scripts_demo_02.png
+  01_end_to_end_docker_scripts_demo_03.png
+  01_end_to_end_docker_scripts_demo_04.png
+  01_end_to_end_docker_scripts_demo_05.png

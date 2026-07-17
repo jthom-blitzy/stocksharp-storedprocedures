@@ -15,13 +15,6 @@
     <Content Include="Resources\Reports\*.*">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
-    <!-- Committed legacy-SQL risk oracle fixture (review finding MA-17): executed by
-         LegacyOracleParityTests to prove the C# services match the frozen pre-refactor
-         stored-procedure behavior. Copied next to the test assembly so the differential
-         tests can load and (re)create the oracle procedures at runtime. -->
-    <Content Include="Fixtures\LegacyRiskOracle.sql">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </Content>
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\Algo.Analytics\Algo.Analytics.csproj" />

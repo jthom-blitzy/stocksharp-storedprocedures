@@ -309,9 +309,16 @@ public class CommissionTests
 	// gate evaluates the commission check in isolation.
 	private static async Task InsertCommissionLimitAsync(SqlConnection c, SqlTransaction t, int portfolioId, int securityId, decimal maxCommission, decimal rate, CancellationToken ct)
 	{
+		// Past-date effective_date by one second (review finding CR-32 test-helper pattern): the column is
+		// DATETIME2(3), so assigning a raw SYSUTCDATETIME() can round the stored value UP to the next
+		// millisecond, which the gate's "effective_date <= SYSUTCDATETIME()" cutoff - evaluated an instant
+		// later in the same transaction - can then exclude, making the limit row invisible and the gate
+		// spuriously accept. Seeding one second in the past keeps the just-inserted row unambiguously
+		// eligible and removes that rounding race. (Production seeds effective_date via 004_SeedData.sql at
+		// DB setup, so this affects tests only.)
 		await using var cmd = new SqlCommand(
 			"INSERT INTO dbo.RiskLimits (portfolio_id, security_id, max_commission_total, commission_rate, is_active, effective_date) " +
-			"VALUES (@p, @s, @comm, @rate, 1, SYSUTCDATETIME())", c, t);
+			"VALUES (@p, @s, @comm, @rate, 1, DATEADD(SECOND, -1, SYSUTCDATETIME()))", c, t);
 		cmd.Parameters.Add(NInt("@p", portfolioId));
 		cmd.Parameters.Add(NInt("@s", securityId));
 		cmd.Parameters.Add(MoneyParam("@comm", maxCommission));

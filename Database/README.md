@@ -15,10 +15,8 @@ Run order: `001_Schema.sql` -> `002_StoredProcedures.sql` -> `003_Triggers.sql` 
 Each script is safe to re-run and non-destructive: `001` creates every object
 only if it is missing - there are **no `DROP TABLE` statements**, so re-running
 it neither raises the parent-before-child foreign-key drop error (SQL Msg 3726)
-that the old drop-and-recreate form hit on a rerun nor discards existing data,
-and it also upgrades an older database in place (it adds `Trades.external_trade_id`
-and its filtered unique index when they are absent - review findings MA-11,
-CR-5); `002` is a no-logic script that just `DROP`s the relocated procedures if
+that the old drop-and-recreate form hit on a rerun nor discards existing data;
+`002` is a no-logic script that just `DROP`s the relocated procedures if
 they exist (so it transitions an already-provisioned database to the consolidated
 state and is a harmless no-op on a fresh one); `003` uses `CREATE OR ALTER` for
 the audit trigger and drops the removed recalc trigger if present; `004` checks
@@ -63,13 +61,38 @@ done
 **Least-privilege application login.** SA is for provisioning only. For the
 application/demo, create a dedicated login scoped to the `StockSharpLegacy`
 tables rather than reusing SA, so a leaked application credential cannot
-administer the server (the app performs no DDL at runtime, only DML):
+administer the server (the app performs no DDL at runtime, only DML). The
+steady-state runtime privileges are `SELECT, INSERT, UPDATE`: at runtime
+`SqlLegacyOrderGateway` only reads, inserts (orders, trades, positions) and
+updates (order status and position rows) - it never issues a `DELETE`, so the
+runtime principal needs no delete rights:
 
 ```sql
 CREATE LOGIN stocksharp_app WITH PASSWORD = '<application-secret>';
 USE StockSharpLegacy;
 CREATE USER stocksharp_app FOR LOGIN stocksharp_app;
 GRANT SELECT, INSERT, UPDATE ON SCHEMA::dbo TO stocksharp_app;
+```
+
+The one operation that needs `DELETE` is **not** part of steady-state runtime:
+it is the demo's repeatable-reset step (`ResetDemoTransactionalStateAsync` in
+`Samples/08_Misc/03_LegacySqlDemo/Program.cs`), a dev/maintenance action that
+clears the `DEMO` portfolio's disposable transactional rows (`Orders`, `Trades`,
+`Positions`, `OrderStatusHistory`) so the walkthrough reproduces the same three
+outcomes on every run. Because it is a maintenance concern rather than a runtime
+one, run the reset under the **provisioning** login (SA) - which already has the
+rights - **or**, if you prefer to run the whole demo as `stocksharp_app`, add a
+narrowly scoped disposable `DELETE` on exactly those four transactional tables
+(never a schema-wide `DELETE`), which a production runtime principal would *not*
+be granted:
+
+```sql
+-- Dev convenience only, for running the demo's built-in reset as stocksharp_app.
+-- A production runtime principal would NOT be granted these.
+GRANT DELETE ON dbo.OrderStatusHistory TO stocksharp_app;
+GRANT DELETE ON dbo.Trades             TO stocksharp_app;
+GRANT DELETE ON dbo.Positions          TO stocksharp_app;
+GRANT DELETE ON dbo.Orders             TO stocksharp_app;
 ```
 
 Or point any SQL Server client (SSMS, Azure Data Studio, `sqlcmd` from the host) at `127.0.0.1,14330` with the credentials above.

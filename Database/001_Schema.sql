@@ -12,15 +12,11 @@
 
 	Run order: 001 -> 002 -> 003 -> 004 (optional seed data).
 
-	Idempotent / non-destructive (review findings MA-11, CR-5). Every object is
+	Idempotent / non-destructive (review finding MA-11). Every object is
 	created only if it is missing - there are no DROP TABLE statements - so this
 	script is safe to re-run against an already-provisioned database: it neither
 	hits the parent-before-child foreign-key drop error (SQL Msg 3726) that the
 	old drop-and-recreate form raised on a rerun, nor discards any existing data.
-	It also UPGRADES an older database in place: in particular it adds
-	dbo.Trades.external_trade_id and its filtered unique index when a database
-	predates that idempotency key, so the keyed SqlLegacyOrderGateway.RecordTradeAsync
-	path works after an in-place upgrade and not only on a freshly created instance.
 	(002/003 are likewise rerunnable via DROP ... IF EXISTS / CREATE OR ALTER, and
 	004 guards every seed insert with an existence check.)
 */
@@ -34,9 +30,8 @@ GO
 USE StockSharpLegacy;
 GO
 
--- filtered indexes (IX_RiskLimits_portfolio/_security below, and the Trades
--- idempotency-key index) require these, and sqlcmd/some drivers don't default
--- them the way SSMS does
+-- the filtered indexes below (IX_RiskLimits_portfolio/_security) require these,
+-- and sqlcmd/some drivers don't default them the way SSMS does
 SET ANSI_NULLS ON;
 SET QUOTED_IDENTIFIER ON;
 GO
@@ -195,19 +190,9 @@ GO
 -- ============================================================================
 -- Trades
 --
--- external_trade_id is an optional business idempotency key (the external
--- execution/trade id of a logical fill). It was added so trade recording can be
--- made exactly-once under client and deadlock retries: when a caller supplies it,
--- SqlLegacyOrderGateway.RecordTradeAsync records the fill at most once and a retry
--- cannot double-count the position (QA finding F2; AAP 0.6.4). This is still pure
--- storage - the column plus the filtered unique index UQ_Trades_external_trade_id
--- enforce uniqueness only; no business decisioning or P&L math lives in this schema.
---
--- CR-5 upgrade path: because this script no longer drops and recreates the table,
--- the CREATE below only runs on a brand-new database. The guarded ALTER further
--- down adds external_trade_id (and then the guarded index adds its unique index)
--- to a pre-existing database that predates the key, so an in-place upgrade gets
--- the column and index too - not only a freshly created instance.
+-- Plain storage of executed fills. No business decisioning or P&L math lives in
+-- this schema; the C# PositionRecalculationService performs the position and
+-- realized-P&L recompute from the persisted trade set.
 -- ============================================================================
 IF OBJECT_ID(N'dbo.Trades', N'U') IS NULL
 BEGIN
@@ -219,25 +204,12 @@ BEGIN
 		price			DECIMAL(18,4)			NOT NULL,
 		executed_date	DATETIME2(3)			NOT NULL CONSTRAINT DF_Trades_executed_date DEFAULT (SYSUTCDATETIME()),
 
-		-- optional business idempotency key; NULL (the default) means "no key" and is
-		-- exempt from UQ_Trades_external_trade_id, so unlimited un-keyed fills are allowed
-		external_trade_id BIGINT				NULL,
-
 		CONSTRAINT PK_Trades PRIMARY KEY CLUSTERED (trade_id),
 		CONSTRAINT FK_Trades_Orders FOREIGN KEY (order_id) REFERENCES dbo.Orders (order_id),
 		CONSTRAINT CK_Trades_qty CHECK (qty > 0),
 		CONSTRAINT CK_Trades_price CHECK (price > 0)
 	);
 END
-GO
-
--- CR-5: guarded, repeatable, non-destructive upgrade. Adds the idempotency key to a
--- database created before external_trade_id existed (the create-if-missing block above
--- is skipped for an existing table, so an in-place upgrade would otherwise never receive
--- the column and the keyed RecordTradeAsync path would fail at runtime). No-op once the
--- column is present, so this is safe to re-run.
-IF COL_LENGTH(N'dbo.Trades', N'external_trade_id') IS NULL
-	ALTER TABLE dbo.Trades ADD external_trade_id BIGINT NULL;
 GO
 
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_Trades_order' AND object_id = OBJECT_ID(N'dbo.Trades'))
@@ -248,19 +220,6 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_Trades_executed_date'
 	CREATE NONCLUSTERED INDEX IX_Trades_executed_date ON dbo.Trades (executed_date);
 GO
 
--- Enforces at-most-one trade per business idempotency key. Filtered on IS NOT NULL so
--- NULL (un-keyed) fills are unlimited while any non-null external_trade_id is unique -
--- this is what lets RecordTradeAsync no-op on a duplicate and makes trade recording
--- idempotent under client/deadlock retries (QA finding F2 / AAP 0.6.4). The partial-
--- unique-index form (CREATE UNIQUE INDEX ... WHERE ...) is also supported by
--- PostgreSQL/Aurora, which keeps a future migration straightforward. The filtered index
--- requires SET ANSI_NULLS/QUOTED_IDENTIFIER ON (set at the top of this script). Guarded so
--- it is created on both a fresh instance and an in-place upgrade (after the ALTER above),
--- and skipped when it already exists (CR-5 / MA-11 rerun-safe).
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'UQ_Trades_external_trade_id' AND object_id = OBJECT_ID(N'dbo.Trades'))
-	CREATE UNIQUE NONCLUSTERED INDEX UQ_Trades_external_trade_id ON dbo.Trades (external_trade_id) WHERE external_trade_id IS NOT NULL;
-GO
-
 -- ============================================================================
 -- Positions
 --
@@ -269,10 +228,6 @@ GO
 -- needs a live market price, which the service does not have. It's refreshed separately
 -- by the EOD mark-to-market batch (outside the scope of this brief). Treat this
 -- column as stale/EOD-only, not real-time.
---
--- last_applied_trade_id is the recompute checkpoint (review finding MI-2): the highest
--- trade_id already folded into the row, letting the recompute process only newer trades
--- rather than replaying the full history on every fill. See the column comment below.
 -- ============================================================================
 IF OBJECT_ID(N'dbo.Positions', N'U') IS NULL
 BEGIN
@@ -287,30 +242,12 @@ BEGIN
 		unrealized_pnl	DECIMAL(18,4)			NOT NULL CONSTRAINT DF_Positions_unrealized_pnl DEFAULT (0),
 		updated_date	DATETIME2(3)			NOT NULL CONSTRAINT DF_Positions_updated_date DEFAULT (SYSUTCDATETIME()),
 
-		-- MI-2 recompute checkpoint: the highest dbo.Trades.trade_id already folded into this
-		-- row. PositionRecalculationService.ApplyTradeAsync reads it under the position lock and
-		-- folds only trades with a greater trade_id (bounded, incremental, idempotent recompute)
-		-- instead of replaying the full history on every fill. 0 means "nothing applied yet",
-		-- which triggers a self-healing full replay from flat. Still pure storage - no decisioning.
-		last_applied_trade_id BIGINT			NOT NULL CONSTRAINT DF_Positions_last_applied_trade_id DEFAULT (0),
-
 		CONSTRAINT PK_Positions PRIMARY KEY CLUSTERED (position_id),
 		CONSTRAINT FK_Positions_Portfolios FOREIGN KEY (portfolio_id) REFERENCES dbo.Portfolios (portfolio_id),
 		CONSTRAINT FK_Positions_Securities FOREIGN KEY (security_id) REFERENCES dbo.Securities (security_id),
 		CONSTRAINT UQ_Positions_portfolio_security UNIQUE (portfolio_id, security_id)
 	);
 END
-GO
-
--- MI-2 / CR-5 guarded, repeatable, non-destructive upgrade. Adds the recompute checkpoint
--- column to a database created before last_applied_trade_id existed (the create-if-missing
--- block above is skipped for an existing table, so an in-place upgrade would otherwise never
--- receive the column and ApplyTradeAsync's SELECT would fail at runtime). The DEFAULT (0)
--- backfills every existing row with "nothing applied yet", so the first recompute after the
--- upgrade folds the full history from flat once (self-healing) and then runs incrementally.
--- No-op once the column is present, so this is safe to re-run.
-IF COL_LENGTH(N'dbo.Positions', N'last_applied_trade_id') IS NULL
-	ALTER TABLE dbo.Positions ADD last_applied_trade_id BIGINT NOT NULL CONSTRAINT DF_Positions_last_applied_trade_id DEFAULT (0);
 GO
 
 -- ============================================================================

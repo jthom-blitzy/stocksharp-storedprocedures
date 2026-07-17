@@ -1,40 +1,33 @@
-================================================================
- 05 - LEGACY_LAYER.md before/after (real git diff)
-================================================================
-Branch  : blitzy-e686e219-30ce-45cc-8608-8ea778391629
-Commit  : 78ec6ebefb583a72c36476b12255ddc68b511d64
-Captured: 2026-07-17
-Command : git diff --stat 37dc57c96836 -- LEGACY_LAYER.md   (+ before/after table excerpts)
-----------------------------------------------------------------
-REAL DIFFSTAT (vs pre-agent baseline 37dc57c96836):
-  LEGACY_LAYER.md | 333 ++++++++++++++++++++++++++++++++++++++++----------------
- 1 file changed, 240 insertions(+), 93 deletions(-)
+================================================================================
+Screenshot 05 - LEGACY_LAYER.md consolidated coverage table
+================================================================================
+single canonical threshold per rule, shared by the circuit breaker and the pre-trade gate
 
-BEFORE - old 2-column split table (C# rule vs SQL proc), logic duplicated:
-  | Check | C# (`Algo/Risk`) | SQL (`usp_ValidatePreTradeRisk`) | Notes |
-  |---|---|---|---|
-  | Order price ceiling | `RiskOrderPriceRule` | `max_order_price` | Same semantics: rejects when `price >= limit`. |
-  | Order qty ceiling | `RiskOrderVolumeRule` | `max_order_qty` | Same semantics. |
-  | Order notional value (qty × price) | - | `max_order_value` | **SQL-only.** No C# rule checks this at all. |
-  | Order frequency | `RiskOrderFreqRule` | `max_order_freq_count` / `_window_sec` | Same config shape, **different...
-  | Resulting position size | `RiskPositionSizeRule` | `max_position_size` | C# checks the *current* position from ...
-  | Cumulative commission | `RiskCommissionRule` / `RiskOrderCommissionRule` | `max_commission_total` | SQL estimat...
-  | Daily traded volume | - | `max_daily_volume` | **SQL-only.** |
-  | Position lifetime, P&L limit, slippage | `RiskPositionTimeRule`, `RiskPnLRule`, `RiskSlippageRule` | - | **C#-o...
+Provenance
+  Branch          : blitzy-e686e219-30ce-45cc-8608-8ea778391629
+  Evidence commit : EVIDENCE_COMMIT_PENDING   (stamped here at the Phase-10 provenance commit; see QA/README.md)
+  Build/run TFM   : net10.0  (StockSharpTargets=net10.0; net6.0 is NOT a configured build target in this workspace)
+  Captured (UTC)  : 2026-07-17T20:18:37Z
+  Source of truth : the raw machine logs / TRX under QA/logs/ (this file quotes them verbatim)
+  Capture mode    : headless CI Linux container - no desktop/window-manager/video device; per AAP 0.6.7
+                    the "screenshot" ships as this captioned text plus a faithful terminal-styled PNG
+                    rendering of the same bytes (no photographic claim, no branding).
+--------------------------------------------------------------------------------
 
-AFTER - consolidated table (canonical limit / circuit breaker / pre-trade
-        gate / status), single source of truth:
-  | Check | Canonical limit (`RiskLimitSet`) | Circuit breaker (`Algo/Risk`, stream) | Pre-trade gate (`PreTradeRis...
-  |---|---|---|---|---|
-  | Order price ceiling | `MaxOrderPrice` | `RiskOrderPriceRule` | check 1 | **Merged.** Both reject when `price >=...
-  | Order qty ceiling | `MaxOrderQty` | `RiskOrderVolumeRule` | check 2 | **Merged.** Both reject when `qty >= limi...
-  | Order notional value (qty × price) | `MaxOrderValue` | `RiskOrderValueRule` *(new)* | check 3 | **Was SQL-only....
-  | Order frequency | `MaxOrderFreqCount` / `MaxOrderFreqWindowSeconds` | `RiskOrderFreqRule` | check 4 | **Reconci...
-  | Resulting position size | `MaxPositionSize` | `RiskPositionSizeRule` | check 5 | **Preserved-distinct.** The ru...
-  | Cumulative commission | `MaxCommissionTotal` (+ `CommissionRate`) | `RiskCommissionRule` / `RiskOrderCommission...
-  | Daily traded volume | `MaxDailyVolume` | `RiskDailyVolumeRule` *(new)* | check 7 | **Was SQL-only.** Now a firs...
-  | Position lifetime, P&L limit, slippage | (rule-owned) | `RiskPositionTimeRule`, `RiskPnLRule`, `RiskSlippageRul...
+# LEGACY_LAYER.md - rule-by-rule coverage table (consolidated state).
+# BEFORE this refactor: risk thresholds + P&L math lived in T-SQL (usp_ValidatePreTradeRisk,
+# usp_RecalculatePositionOnTrade) AND partly in C#; the table below is the AFTER state - every
+# rule now has one canonical RiskLimitSet threshold consumed by BOTH the circuit breaker and the gate.
 
-----------------------------------------------------------------
-RESULT: 1 file changed, 240 insertions(+), 93 deletions(-). The two-column
-C#-vs-SQL split becomes a consolidated canonical/breaker/gate/status table.
+| Check | Canonical limit (`RiskLimitSet`) | Circuit breaker (`Algo/Risk`, stream) | Pre-trade gate (`PreTradeRiskService`, per-order) | Status |
+|---|---|---|---|---|
+| Order price ceiling | `MaxOrderPrice` | `RiskOrderPriceRule` | check 1 | **Merged.** Both reject when `price >= limit`. |
+| Order qty ceiling | `MaxOrderQty` | `RiskOrderVolumeRule` | check 2 | **Merged.** Both reject when `qty >= limit`. |
+| Order notional value (qty × price) | `MaxOrderValue` | `RiskOrderValueRule` *(new)* | check 3 | **Was SQL-only.** Now a first-class C# rule; both reject when `qty*price >= limit`. |
+| Order frequency | `MaxOrderFreqCount` / `MaxOrderFreqWindowSeconds` | `RiskOrderFreqRule` | check 4 | **Reconciled to the stricter algorithm** - rolling count, see below. |
+| Resulting position size | `MaxPositionSize` | `RiskPositionSizeRule` | check 5 | **Preserved-distinct.** The rule checks the *current* position from a `PositionChangeMessage`; the gate checks the *hypothetical post-fill* position, because it runs pre-trade. |
+| Cumulative commission | `MaxCommissionTotal` (+ `CommissionRate`) | `RiskCommissionRule` / `RiskOrderCommissionRule` / `RiskTransactionCommissionRule` | check 6 | **Preserved-distinct.** The rules track the *actual* commission post-fill, but not all from the same message: `RiskCommissionRule` reads a `PositionChangeMessage` (the `PositionChangeTypes.Commission` value), while `RiskOrderCommissionRule` and `RiskTransactionCommissionRule` read `ExecutionMessage.Commission`. The gate instead *estimates* commission pre-fill from historical traded notional × rate. Same threshold, different basis (and different message source) - so they do not agree by construction. |
+| Daily traded volume | `MaxDailyVolume` | `RiskDailyVolumeRule` *(new)* | check 7 | **Was SQL-only.** Now a first-class C# rule (an in-stream running total, partitioned by portfolio+security and rolled over on the UTC day); the gate reads the persisted accepted/filled/part-filled volume for the current UTC day. Preserved-distinct evaluation contexts sharing the one threshold. |
+| Position lifetime, P&L limit, slippage | (rule-owned) | `RiskPositionTimeRule`, `RiskPnLRule`, `RiskSlippageRule` | - | **Circuit-breaker-only.** These need live state the pre-trade gate doesn't have; unchanged. |
+
+The frequency check is the one worth calling out specifically. It used to be

@@ -5,16 +5,21 @@ using System.Threading.Tasks;
 
 using Microsoft.Data.SqlClient;
 
+using StockSharp.Algo.Risk;
 using StockSharp.Algo.Storages.Sql;
 using StockSharp.BusinessEntities;
 using StockSharp.Messages;
 
 /// <summary>
 /// End-to-end walkthrough of the StockSharpLegacy SQL layer under /Database and Algo/Storages/Sql:
-/// submit a compliant order, submit a non-compliant one, record a fill, and show the position that
-/// the C# PositionRecalculationService recomputes. After the SQL -&gt; C# consolidation the gateway runs
-/// the pre-trade checks in PreTradeRiskService and the position math in PositionRecalculationService;
-/// the database is pure storage. See LEGACY_LAYER.md at the repo root for the full writeup.
+/// seed the portfolio-wide RiskManager circuit breaker from the canonical RiskLimitSet, submit a
+/// compliant order, submit a non-compliant one, record a fill, and show the position that the C#
+/// PositionRecalculationService recomputes. After the SQL -&gt; C# consolidation the gateway runs the
+/// pre-trade checks in PreTradeRiskService and the position math in PositionRecalculationService, and
+/// this program seeds a RiskManager from the SAME canonical RiskLimitSet the gate uses (via
+/// PreTradeRiskService.LoadLimitsAsync + RiskManager.ApplyCanonicalLimits) so both enforcement patterns
+/// consume one definition; the database is pure storage. See LEGACY_LAYER.md at the repo root for the
+/// full writeup.
 ///
 /// Requires a running SQL Server with the StockSharpLegacy database - see
 /// Database/README.md for the one-line Docker command, or set
@@ -61,6 +66,30 @@ class Program
 		await ResetDemoTransactionalStateAsync(connectionString, portfolioId);
 		Console.WriteLine();
 
+		// --- consolidate: seed the portfolio-wide circuit breaker from the SAME canonical source the
+		//     per-order gate uses (review findings CR-1 / CR-20) ---
+		// The gateway's per-order pre-trade gate loads the applicable RiskLimits row and enforces it order
+		// by order. Here we resolve that SAME scoped row through PreTradeRiskService.LoadLimitsAsync and seed
+		// a RiskManager (Algo/Risk) - the portfolio-wide circuit breaker - from it via ApplyCanonicalLimits.
+		// This is a real, non-test caller applying the canonical RiskLimitSet to a production RiskManager,
+		// scoped to this exact (portfolio, security): the two enforcement patterns stay architecturally
+		// distinct but now demonstrably consume ONE canonical definition, satisfying the "define once, enforce
+		// in both patterns" objective. NOTE: this demo IS that production caller - the platform's
+		// Connector/RiskMessageAdapter do NOT auto-seed a manager from the database, and wiring them is
+		// outside this refactor's scope (Algo/Connector.cs is not an in-scope file), so no such claim is made.
+		var riskService = new PreTradeRiskService(connectionString);
+		var canonicalLimits = await riskService.LoadLimitsAsync(portfolioId, securityId);
+
+		var circuitBreaker = new RiskManager();
+		if (canonicalLimits is not null)
+			circuitBreaker.ApplyCanonicalLimits(canonicalLimits, RiskActions.ClosePositions);
+
+		var priceCeiling = canonicalLimits?.EffectiveMaxOrderPrice?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "(not enforced)";
+		Console.WriteLine($"Seeded the portfolio-wide RiskManager circuit breaker from the canonical RiskLimitSet for " +
+			$"portfolio_id {portfolioId} / security_id {securityId}: {circuitBreaker.Rules.Count} rule(s), max_order_price ceiling = {priceCeiling}.");
+		Console.WriteLine("     The per-order gate (below) and this circuit breaker now read the same canonical thresholds.");
+		Console.WriteLine();
+
 		// --- order #1: within every configured RiskLimits ceiling -> ACCEPTED ---
 		Console.WriteLine("Submitting BUY 100 @ 150.00 (within limits)...");
 		var order1 = await gateway.SubmitOrderAsync(portfolioId, securityId, Sides.Buy, 100m, 150.00m, OrderTypes.Limit);
@@ -74,7 +103,7 @@ class Program
 		Console.WriteLine("     Note: this rejection comes from the C# PreTradeRiskService (the per-order pre-trade");
 		Console.WriteLine("     gate), which reads the applicable RiskLimits row and enforces it in C#. The C#");
 		Console.WriteLine("     RiskManager (Algo/Risk) is the portfolio-wide circuit breaker - a distinct");
-		Console.WriteLine("     enforcement pattern that now shares the same canonical RiskLimitSet thresholds.");
+		Console.WriteLine("     enforcement pattern we seeded above from this very same canonical RiskLimitSet.");
 		Console.WriteLine();
 
 		if (!order1.IsValid)
@@ -98,16 +127,16 @@ class Program
 	/// DEMO/AAPL/MSFT rows the AAP requires still exist. Deletes are ordered child-before-parent to respect
 	/// the foreign keys (OrderStatusHistory and Trades both reference Orders; Positions reference the
 	/// portfolio/security only) and run inside a single transaction so the reset is all-or-nothing.
-	/// QUOTED_IDENTIFIER/ANSI_NULLS are set ON because dbo.Trades carries a filtered unique index (on
-	/// external_trade_id) whose DML requires those session options.
+	/// This reset is a dev/maintenance step, not steady-state runtime: it needs <c>DELETE</c> on the four
+	/// disposable transactional tables, which is a privilege beyond the <c>SELECT, INSERT, UPDATE</c> the
+	/// gateway uses at runtime. Run it under the provisioning login, or grant that narrowly scoped
+	/// disposable <c>DELETE</c> to the application login - see the credential note in Database/README.md.
 	/// </summary>
 	/// <param name="connectionString">Connection string for the StockSharpLegacy database.</param>
 	/// <param name="portfolioId">The portfolio whose transactional rows should be cleared.</param>
 	static async Task ResetDemoTransactionalStateAsync(string connectionString, int portfolioId)
 	{
 		const string sql = @"
-SET QUOTED_IDENTIFIER ON;
-SET ANSI_NULLS ON;
 DELETE FROM dbo.OrderStatusHistory WHERE order_id IN (SELECT order_id FROM dbo.Orders WHERE portfolio_id = @portfolioId);
 DELETE FROM dbo.Trades            WHERE order_id IN (SELECT order_id FROM dbo.Orders WHERE portfolio_id = @portfolioId);
 DELETE FROM dbo.Positions         WHERE portfolio_id = @portfolioId;
