@@ -1,8 +1,12 @@
 namespace StockSharp.Tests;
 
+using System.Data;
+using System.Text;
+
 using StockSharp.Algo.Risk;
 using StockSharp.Algo.Storages.Sql;
 
+using Microsoft.Data.SqlClient;
 using Npgsql;
 using NpgsqlTypes;
 
@@ -19,41 +23,56 @@ using NpgsqlTypes;
 /// attributed to the correct risk axis (logic consolidation vs engine migration):
 /// </para>
 /// <list type="number">
-///   <item><description><b>Stage 1 - Characterization (golden baseline, engine-independent, always runs).</b>
-///     The pure <see cref="PositionRecalculationService.Recalculate"/> must reproduce, for every shared
-///     case, the golden <c>(qty, avg_price, realized_pnl)</c>. Those golden values ARE the behaviour of the
-///     retired SQL Server <c>usp_RecalculatePositionOnTrade</c>, captured as engine-independent numbers
-///     before the procedure was retired (AAP G1). Because <c>Recalculate</c> is pure <see cref="decimal"/>
-///     arithmetic with no database dependency, this baseline is identical whether the row is later
-///     persisted by SQL Server or PostgreSQL, which is exactly why it can stand in for a live SQL Server
-///     characterization run now that the procedure no longer exists.</description></item>
-///   <item><description><b>Stage 2 - Consolidated C# logic parity (engine held constant, always runs).</b>
-///     The same cases are checked against the average-cost ALGEBRAIC INVARIANTS (signed-quantity
-///     conservation, realize-P&amp;L-only-on-a-close, and the average-price rule per branch), independently
-///     of the golden numbers. Holding the engine constant (no database) isolates a logic-consolidation bug
-///     (SQL to C#) from an engine-migration bug. This is the C#-parity step of AAP 0.6.3; a live
-///     C#-against-SQL-Server run is not possible because the consolidated service was migrated to the
-///     Npgsql provider (AAP G2) and the SQL procedure was retired (AAP G1), so the engine-independent
-///     invariants are that step's faithful, executable stand-in.</description></item>
-///   <item><description><b>Stage 3 - PostgreSQL engine parity (MANDATORY, live).</b> The same cases are
-///     driven end to end through <see cref="PositionRecalculationService.ApplyAsync"/> against a live
-///     PostgreSQL database, reading the persisted <c>positions</c> row back and asserting the golden values.
-///     Passing Stage 2 but failing Stage 3 points to a dialect / engine issue, not logic. This stage is
-///     MANDATORY: see <see cref="OpenMandatoryAsync"/>. When the connection environment variable is SET but
-///     the database is unreachable the test FAILS (never Inconclusive), so a required milestone run cannot
-///     appear green without actually exercising PostgreSQL; it reports Inconclusive ONLY when no database is
-///     configured at all (the variable is unset) - an ordinary local run that did not opt in.</description></item>
-///   <item><description><b>Stage 4 - the ordering is the diagnostic instrument.</b> Stages 1-3 deliberately
-///     consume the IDENTICAL shared case table, so the first stage that fails localises the fault to the
-///     axis that stage introduces (numbers, then logic, then engine).
-///     <see cref="Stage4_StagedOrdering_IsTheDiagnosticInstrument"/> makes that contract executable.</description></item>
+///   <item><description><b>Stage 1 - Original SQL Server procedure (golden baseline, live SQL Server).</b>
+///     For every shared case <see cref="Stage1_OriginalSqlServerProcedure_GoldenBaseline"/> executes the
+///     ORIGINAL, retired <c>dbo.usp_RecalculatePositionOnTrade</c> on a live SQL Server (materialized from
+///     the embedded <c>OriginalCharacterizationSetup.sql</c> resource), seeding the existing position in a
+///     transaction, running the procedure and reading the persisted <c>dbo.Positions</c> row back, then
+///     rolling back. Those live procedure outputs ARE the golden <c>(qty, avg_price, realized_pnl)</c>, so
+///     the stage authentically validates the shared <see cref="_cases"/> constants against the behaviour the
+///     refactor consolidated out of SQL (AAP G1), rather than trusting hand-written numbers.</description></item>
+///   <item><description><b>Stage 2 - Consolidated C# logic on SQL Server state (engine held constant).</b>
+///     <see cref="Stage2_ConsolidatedLogic_OnSqlServerState_MatchesGolden"/> seeds the SAME existing
+///     position on SQL Server, reads that state back FROM SQL Server, and feeds it to the REAL, pure
+///     <see cref="PositionRecalculationService.Recalculate"/>. The engine is held at SQL Server, so a
+///     divergence here isolates a logic-consolidation bug (SQL to C#) from an engine-migration bug. This is
+///     the authentic C#-parity step of AAP 0.6.3, made possible because the recalculation logic was
+///     extracted as a pure <see cref="decimal"/> function with no provider dependency, so it can run against
+///     state read from EITHER engine.</description></item>
+///   <item><description><b>Stage 3 - PostgreSQL engine parity (live).</b>
+///     <see cref="Stage3_PostgreSqlEngineParity_AllCasesViaApplyAsync"/> drives the same cases end to end
+///     through <see cref="PositionRecalculationService.ApplyAsync"/> against a live PostgreSQL database,
+///     reading the persisted <c>positions</c> row back and asserting the golden values. Passing Stage 2 but
+///     failing Stage 3 points to a dialect / engine issue, not logic.</description></item>
+///   <item><description><b>Stage 4 - the ordering is the diagnostic instrument.</b>
+///     <see cref="Stage4_StagedOrdering_AttributionMatrix"/> runs all three engines per shared case in one
+///     pass and asserts the axes pairwise: Stage 1 (SQL procedure) == Stage 2 (C# on SQL Server state) is
+///     the LOGIC axis; Stage 2 == Stage 3 (C# on PostgreSQL) is the ENGINE axis. The first axis that
+///     diverges names the regression's cause, which is precisely the risk-axis disambiguation the staged
+///     sequence exists to provide.</description></item>
 /// </list>
+/// <para>
+/// Both live engines are gated by MANDATORY guards: when the relevant connection environment variable is SET
+/// but the database is unreachable the staged test FAILS (never Inconclusive), so a required milestone run
+/// cannot appear green without actually exercising the engine; it reports Inconclusive ONLY when the variable
+/// is unset (an ordinary local run that did not opt in). SQL Server (Stages 1/2/4) is gated by
+/// <see cref="OpenSqlServerAsync"/> on <c>STOCKSHARP_LEGACY_MSSQL_CONNECTION</c>; PostgreSQL (Stages 3/4 and
+/// the gateway integration tests) by <see cref="OpenMandatoryAsync"/> on <c>STOCKSHARP_LEGACY_SQL_CONNECTION</c>.
+/// </para>
+/// <para>
+/// Alongside the staged matrix, three always-run pure backbone tests keep the logic covered without any
+/// database: <see cref="PureLogic_RecalculateMatchesGoldenConstants"/> (the pure function reproduces the
+/// shared constants), <see cref="PureLogic_AverageCostInvariants"/> (the average-cost algebraic invariants),
+/// and <see cref="CaseTable_CoversAllBranches"/> (the shared case table still covers both signs across every
+/// branch, so no stage can silently degrade into a weaker check).
+/// </para>
 /// <para>
 /// Every money / quantity / price fixture is a <see cref="decimal"/> literal (the <c>m</c> suffix) so the
 /// schema's <c>NUMERIC(18,4)</c> scale is preserved and a comparison can never silently loosen (AAP 0.6.4).
 /// </para>
 /// </remarks>
 [TestClass]
+[DoNotParallelize] // Staged Stages 1/2/4 seed and roll back transactions against the shared SQL Server (dbo.*) and PostgreSQL engines; parallel execution deadlocks on those shared tables, so this class runs serially (repo convention, cf. StorageNotParallelizeTests / ExportTests / PreTradeRiskParityTests).
 public class PositionRecalculationTests : BaseTestClass
 {
 	// ========================================================================================================
@@ -90,17 +109,21 @@ public class PositionRecalculationTests : BaseTestClass
 	];
 
 	// ========================================================================================================
-	// Stage 1 - Characterization: pure Recalculate matches the golden baseline (engine-independent).
+	// Pure backbone (always runs, no database): the pure Recalculate reproduces the shared constants. The
+	// AUTHENTIC golden baseline that validates those constants against the live retired SQL Server procedure
+	// is Stage1_OriginalSqlServerProcedure_GoldenBaseline below.
 	// ========================================================================================================
 
 	/// <summary>
-	/// Stage 1 (characterization). For every shared case the pure, database-free
+	/// Pure backbone (always runs). For every shared case the pure, database-free
 	/// <see cref="PositionRecalculationService.Recalculate"/> must reproduce the golden
-	/// <c>(qty, avg_price, realized_pnl)</c> captured from the retired SQL Server procedure. Always runs
-	/// (no database), so it is the engine-constant golden baseline the later stages are compared against.
+	/// <c>(qty, avg_price, realized_pnl)</c> constants. Those constants are themselves validated against the
+	/// live, retired SQL Server procedure by <see cref="Stage1_OriginalSqlServerProcedure_GoldenBaseline"/>;
+	/// this fast, engine-independent test keeps the consolidated arithmetic covered on an ordinary local run
+	/// that has not opted into a database (analogous to the pure phases of the pre-trade parity suite).
 	/// </summary>
 	[TestMethod]
-	public void Stage1_Characterization_PureRecalculateMatchesGoldenBaseline()
+	public void PureLogic_RecalculateMatchesGoldenConstants()
 	{
 		foreach (var c in _cases)
 		{
@@ -114,18 +137,20 @@ public class PositionRecalculationTests : BaseTestClass
 	}
 
 	// ========================================================================================================
-	// Stage 2 - Consolidated C# logic parity: average-cost algebraic invariants (engine held constant).
+	// Pure backbone (always runs, no database): the average-cost algebraic invariants. The AUTHENTIC
+	// consolidated-logic parity step (C# on state read from a live SQL Server) is
+	// Stage2_ConsolidatedLogic_OnSqlServerState_MatchesGolden below.
 	// ========================================================================================================
 
 	/// <summary>
-	/// Stage 2 (logic parity). For every shared case the consolidated C# result must satisfy the average-cost
-	/// ALGEBRAIC INVARIANTS independently of the golden numbers: signed-quantity conservation,
+	/// Pure backbone (always runs). For every shared case the consolidated C# result must satisfy the
+	/// average-cost ALGEBRAIC INVARIANTS independently of the golden numbers: signed-quantity conservation,
 	/// realize-P&amp;L-only-on-a-close (with the closed-portion formula), and the per-branch average-price
-	/// rules. Holding the engine constant (no database) isolates a SQL-to-C# logic-consolidation bug from an
-	/// engine-migration bug. Always runs.
+	/// rules. This engine-independent check documents WHY each golden number is correct; the authentic
+	/// engine-held-constant parity run is <see cref="Stage2_ConsolidatedLogic_OnSqlServerState_MatchesGolden"/>.
 	/// </summary>
 	[TestMethod]
-	public void Stage2_ConsolidatedLogicParity_AverageCostInvariants()
+	public void PureLogic_AverageCostInvariants()
 	{
 		foreach (var c in _cases)
 		{
@@ -351,44 +376,13 @@ public class PositionRecalculationTests : BaseTestClass
 
 		foreach (var c in _cases)
 		{
-			var suffix = Guid.NewGuid().ToString("N");
-			var portfolioId = 0;
-			var securityId = 0;
+			// The real ApplyAsync runs end to end on PostgreSQL and returns the persisted row.
+			var (qty, avgPrice, realizedPnl) = await RecalcViaApplyOnPostgresAsync(cn, c);
 
-			try
-			{
-				portfolioId = await InsertPortfolioAsync(cn, "pf_stage3_" + c.Name + "_" + suffix);
-				securityId = await InsertSecurityAsync(cn, "sec_" + suffix);
-				var orderId = await InsertOrderAsync(cn, portfolioId, securityId, c.Side, c.TradeQty, c.TradePrice, "ACCEPTED");
-
-				// Seed the EXISTING position only when it is non-flat: an all-zero case exercises the UPSERT
-				// INSERT path, a non-flat case the UPSERT UPDATE path, so both DB paths are covered.
-				if (c.ExistingQty != 0m || c.ExistingAvgPrice != 0m || c.ExistingRealizedPnl != 0m)
-				{
-					await InsertPositionAsync(cn, portfolioId, securityId,
-						qty: c.ExistingQty, avgPrice: c.ExistingAvgPrice, realizedPnl: c.ExistingRealizedPnl, unrealizedPnl: 0m);
-				}
-
-				var svc = new PositionRecalculationService();
-				await using (var txn = await cn.BeginTransactionAsync(CancellationToken))
-				{
-					// The gateway owns the transaction in production; here the test plays that role - begin,
-					// ApplyAsync on (connection, transaction), commit once.
-					await svc.ApplyAsync(cn, txn, orderId, NextTradeId(), c.TradeQty, c.TradePrice, CancellationToken);
-					await txn.CommitAsync(CancellationToken);
-				}
-
-				var position = await ReadPositionAsync(cn, portfolioId, securityId);
-
-				// NUMERIC(18,4) columns -> decimal, so parity is exact and no >= comparison downstream loosens.
-				position.Qty.AssertEqual(c.ExpectedQty);
-				position.AvgPrice.AssertEqual(c.ExpectedAvgPrice);
-				position.RealizedPnl.AssertEqual(c.ExpectedRealizedPnl);
-			}
-			finally
-			{
-				await CleanupAsync(cn, portfolioId, securityId);
-			}
+			// NUMERIC(18,4) columns -> decimal, so parity is exact and no >= comparison downstream loosens.
+			qty.AssertEqual(c.ExpectedQty);
+			avgPrice.AssertEqual(c.ExpectedAvgPrice);
+			realizedPnl.AssertEqual(c.ExpectedRealizedPnl);
 		}
 	}
 
@@ -667,17 +661,16 @@ public class PositionRecalculationTests : BaseTestClass
 	// ========================================================================================================
 
 	/// <summary>
-	/// Stage 4 (meta-test). Makes the staged-testing contract executable: Stages 1-3 must consume the ONE
-	/// shared <see cref="_cases"/> table, and that table must cover BOTH signs across every average-cost
+	/// Pure backbone (always runs). Guards the shared-case-table coverage contract that the staged matrix
+	/// depends on: the ONE shared <see cref="_cases"/> table must cover BOTH signs across every average-cost
 	/// branch (open-from-flat, same-sign accumulation, partial close, exact close, flip) plus realized-P&amp;L
-	/// carry and accumulation. Because the three stages iterate the identical field, the first stage that
-	/// fails localises a regression to the axis it introduces - numbers (Stage 1), consolidated logic
-	/// (Stage 2), then the PostgreSQL engine (Stage 3) - which is precisely the risk-axis disambiguation the
-	/// staged sequence exists to provide. A future edit that shrank the table or dropped a branch would trip
-	/// this guard rather than silently degrade a stage into a weaker check.
+	/// carry and accumulation. Because Stages 1-4 all iterate this identical table, a future edit that shrank
+	/// it or dropped a branch would trip this guard rather than silently degrade a stage into a weaker check.
+	/// The executable Stage 1 -> 2 -> 3 attribution itself lives in
+	/// <see cref="Stage4_StagedOrdering_AttributionMatrix"/>.
 	/// </summary>
 	[TestMethod]
-	public void Stage4_StagedOrdering_IsTheDiagnosticInstrument()
+	public void CaseTable_CoversAllBranches()
 	{
 		// The shared table is the single source of truth the three executable stages all iterate.
 		_cases.Length.AssertEqual(12);
@@ -711,6 +704,387 @@ public class PositionRecalculationTests : BaseTestClass
 		// an accumulation onto an existing balance (on a close).
 		_cases.Any(c => c.Name == "realized_carried_on_add" && c.ExistingRealizedPnl == c.ExpectedRealizedPnl).AssertTrue();
 		_cases.Any(c => c.Name == "realized_accumulated_on_close" && c.ExpectedRealizedPnl > c.ExistingRealizedPnl).AssertTrue();
+	}
+
+	// ========================================================================================================
+	// Staged four-step validation (AAP 0.6.3) - authentic, dual-engine. Stages 1/2/4 exercise a live SQL
+	// Server (the original retired procedure and state reads); Stage 3 the live PostgreSQL engine. The
+	// shared _cases table is consumed identically so the first stage that diverges names the failing axis.
+	// ========================================================================================================
+
+	/// <summary>
+	/// Stage 1 (golden baseline, live SQL Server). For every shared case, executes the ORIGINAL retired
+	/// <c>dbo.usp_RecalculatePositionOnTrade</c> on a live SQL Server: seeds the existing position in a
+	/// transaction, runs the procedure with the case's trade, reads the persisted <c>dbo.Positions</c> row
+	/// back, then rolls back. The procedure's live output IS the golden <c>(qty, avg_price, realized_pnl)</c>,
+	/// so this stage authentically validates the shared <see cref="_cases"/> constants against the behaviour
+	/// the refactor consolidated out of SQL (AAP G1) rather than trusting hand-written numbers. MANDATORY when
+	/// <c>STOCKSHARP_LEGACY_MSSQL_CONNECTION</c> is set (see <see cref="OpenSqlServerAsync"/>).
+	/// </summary>
+	[TestMethod]
+	public async Task Stage1_OriginalSqlServerProcedure_GoldenBaseline()
+	{
+		await using var sqlServer = await OpenSqlServerAsync();
+
+		foreach (var c in _cases)
+		{
+			var golden = await SqlProcRecalcAsync(sqlServer, c);
+			AssertRecalcEqual(golden, c, "Stage 1 (original SQL Server procedure)");
+		}
+	}
+
+	/// <summary>
+	/// Stage 2 (consolidated C# logic on SQL Server state, engine held constant). For every shared case,
+	/// seeds the SAME existing position on SQL Server, reads that state back FROM SQL Server, and feeds it to
+	/// the REAL, pure <see cref="PositionRecalculationService.Recalculate"/>. Because the engine is held at
+	/// SQL Server, a divergence here isolates a SQL-to-C# LOGIC-consolidation bug from an engine-migration
+	/// bug. The result must equal the golden constants (themselves validated live by Stage 1). MANDATORY when
+	/// <c>STOCKSHARP_LEGACY_MSSQL_CONNECTION</c> is set.
+	/// </summary>
+	[TestMethod]
+	public async Task Stage2_ConsolidatedLogic_OnSqlServerState_MatchesGolden()
+	{
+		await using var sqlServer = await OpenSqlServerAsync();
+
+		foreach (var c in _cases)
+		{
+			var result = await RecalcOnSqlServerStateAsync(sqlServer, c);
+			AssertRecalcEqual(result, c, "Stage 2 (consolidated C# on SQL Server state)");
+		}
+	}
+
+	/// <summary>
+	/// Stage 4 (the ordering is the diagnostic instrument). Runs all three engines for every shared case in
+	/// one pass and asserts the axes pairwise: Stage 1 (SQL Server procedure) == Stage 2 (consolidated C# on
+	/// SQL Server state) is the LOGIC axis (engine held at SQL Server); Stage 2 == Stage 3 (consolidated C# on
+	/// PostgreSQL) is the ENGINE axis (logic held constant). The first axis that diverges names the
+	/// regression's cause, which is exactly the risk-axis disambiguation the staged sequence provides. Requires
+	/// BOTH engines configured (SQL Server via <c>STOCKSHARP_LEGACY_MSSQL_CONNECTION</c>, PostgreSQL via
+	/// <c>STOCKSHARP_LEGACY_SQL_CONNECTION</c>).
+	/// </summary>
+	[TestMethod]
+	public async Task Stage4_StagedOrdering_AttributionMatrix()
+	{
+		await using var sqlServer = await OpenSqlServerAsync();
+		await using var postgres = await OpenMandatoryAsync();
+
+		if (postgres is null)
+			return;
+
+		foreach (var c in _cases)
+		{
+			var step1 = await SqlProcRecalcAsync(sqlServer, c);           // original SQL logic on SQL Server
+			var step2 = await RecalcOnSqlServerStateAsync(sqlServer, c);  // consolidated C# on SQL Server state
+			var step3 = await RecalcViaApplyOnPostgresAsync(postgres, c); // consolidated C# on PostgreSQL
+
+			// Every engine must match the case's documented golden expectation ...
+			AssertRecalcEqual(step1, c, "Step 1 (SQL Server procedure)");
+			AssertRecalcEqual(step2, c, "Step 2 (Recalculate on SQL Server state)");
+			AssertRecalcEqual(step3, c, "Step 3 (ApplyAsync on PostgreSQL)");
+
+			// ... and the axes must agree pairwise so any regression is attributable to a named axis.
+			if (step1 != step2)
+				Fail($"LOGIC-axis regression on case '{c.Name}': Step 1 (proc)={FormatTriple(step1)} but Step 2 (Recalculate)={FormatTriple(step2)} - the ENGINE was held at SQL Server, so the consolidated C# LOGIC diverged from the retired procedure.");
+			if (step2 != step3)
+				Fail($"ENGINE-axis regression on case '{c.Name}': Step 2 (SQL Server state)={FormatTriple(step2)} but Step 3 (PostgreSQL)={FormatTriple(step3)} - the LOGIC was held constant, so the SQL Server -> PostgreSQL migration changed the result.");
+		}
+	}
+
+	// ========================================================================================================
+	// Staged-engine helpers: SQL Server golden baseline / state read (Stages 1/2/4), PostgreSQL apply
+	// (Stages 3/4), the mandatory SQL Server guard, and the idempotent embedded-schema materializer.
+	// ========================================================================================================
+
+	/// <summary>Fails with a case- and engine-named message when the recomputed triple diverges from the
+	/// shared case's golden <c>(qty, avg_price, realized_pnl)</c>; NUMERIC(18,4) -> decimal so parity is exact.</summary>
+	private void AssertRecalcEqual((decimal Qty, decimal AvgPrice, decimal RealizedPnl) actual, RecalcCase c, string engine)
+	{
+		if (actual.Qty != c.ExpectedQty || actual.AvgPrice != c.ExpectedAvgPrice || actual.RealizedPnl != c.ExpectedRealizedPnl)
+			Fail($"{engine}: case '{c.Name}' expected (qty={c.ExpectedQty}, avg={c.ExpectedAvgPrice}, rpnl={c.ExpectedRealizedPnl}) but got {FormatTriple(actual)}.");
+	}
+
+	/// <summary>Renders a recalculation triple for diagnostic failure messages.</summary>
+	private static string FormatTriple((decimal Qty, decimal AvgPrice, decimal RealizedPnl) t)
+		=> $"(qty={t.Qty}, avg={t.AvgPrice}, rpnl={t.RealizedPnl})";
+
+	/// <summary>
+	/// STAGE 1 per-case: seeds the scenario (portfolio, security, ACCEPTED order and, when non-flat, the
+	/// existing position) in a transaction, executes the ORIGINAL <c>dbo.usp_RecalculatePositionOnTrade</c>,
+	/// reads the persisted <c>dbo.Positions</c> row back, then rolls back. Returns the live golden triple.
+	/// </summary>
+	private async Task<(decimal Qty, decimal AvgPrice, decimal RealizedPnl)> SqlProcRecalcAsync(SqlConnection connection, RecalcCase c)
+	{
+		await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(CancellationToken);
+		var suffix = Guid.NewGuid().ToString("N");
+		var portfolioId = await SqlSeedPortfolioAsync(connection, transaction, "RECALC_" + c.Name + "_" + suffix);
+		var securityId = await SqlSeedSecurityAsync(connection, transaction, "SEC_" + suffix);
+		var orderId = await SqlSeedOrderReturningIdAsync(connection, transaction, portfolioId, securityId, c.Side, c.TradeQty, c.TradePrice, "ACCEPTED");
+
+		// Seed the EXISTING position only when non-flat (UPSERT UPDATE path); a flat case exercises the proc's INSERT path.
+		if (c.ExistingQty != 0m || c.ExistingAvgPrice != 0m || c.ExistingRealizedPnl != 0m)
+			await SqlSeedPositionAsync(connection, transaction, portfolioId, securityId, c.ExistingQty, c.ExistingAvgPrice, c.ExistingRealizedPnl);
+
+		await using (var command = new SqlCommand(
+			"EXEC dbo.usp_RecalculatePositionOnTrade @order_id = @order_id, @trade_qty = @trade_qty, @trade_price = @trade_price",
+			connection, transaction))
+		{
+			command.Parameters.Add(SqlP("@order_id", SqlDbType.BigInt, orderId));
+			command.Parameters.Add(SqlDec("@trade_qty", c.TradeQty));
+			command.Parameters.Add(SqlDec("@trade_price", c.TradePrice));
+			await command.ExecuteNonQueryAsync(CancellationToken);
+		}
+
+		var (qty, avgPrice, realizedPnl, _) = await ReadSqlServerPositionAsync(connection, transaction, portfolioId, securityId);
+		await transaction.RollbackAsync(CancellationToken);
+		return (qty, avgPrice, realizedPnl);
+	}
+
+	/// <summary>
+	/// STAGE 2 per-case: seeds the SAME existing position on SQL Server, reads that state back FROM SQL Server
+	/// (defaulting to flat when absent, exactly as the procedure does), then runs the REAL, pure
+	/// <see cref="PositionRecalculationService.Recalculate"/> on that SQL-Server-read state. Rolls back.
+	/// Holding the engine at SQL Server isolates the consolidated-logic axis.
+	/// </summary>
+	private async Task<(decimal Qty, decimal AvgPrice, decimal RealizedPnl)> RecalcOnSqlServerStateAsync(SqlConnection connection, RecalcCase c)
+	{
+		await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(CancellationToken);
+		var suffix = Guid.NewGuid().ToString("N");
+		var portfolioId = await SqlSeedPortfolioAsync(connection, transaction, "RECALC2_" + c.Name + "_" + suffix);
+		var securityId = await SqlSeedSecurityAsync(connection, transaction, "SEC_" + suffix);
+
+		if (c.ExistingQty != 0m || c.ExistingAvgPrice != 0m || c.ExistingRealizedPnl != 0m)
+			await SqlSeedPositionAsync(connection, transaction, portfolioId, securityId, c.ExistingQty, c.ExistingAvgPrice, c.ExistingRealizedPnl);
+
+		// Read existing state back FROM SQL SERVER (engine held constant), then apply the consolidated C# logic.
+		var (existingQty, existingAvgPrice, existingRealizedPnl, _) = await ReadSqlServerPositionAsync(connection, transaction, portfolioId, securityId);
+		var result = PositionRecalculationService.Recalculate(
+			existingQty, existingAvgPrice, existingRealizedPnl, c.Side, c.TradeQty, c.TradePrice);
+
+		await transaction.RollbackAsync(CancellationToken);
+		return result;
+	}
+
+	/// <summary>
+	/// STAGE 3/4 per-case (PostgreSQL): seeds the scenario, drives the REAL
+	/// <see cref="PositionRecalculationService.ApplyAsync"/> end to end inside one committed transaction, reads
+	/// the persisted <c>positions</c> row back, and tears the scenario down. A non-flat case exercises the
+	/// UPSERT UPDATE path, an all-flat case the UPSERT INSERT path.
+	/// </summary>
+	private async Task<(decimal Qty, decimal AvgPrice, decimal RealizedPnl)> RecalcViaApplyOnPostgresAsync(NpgsqlConnection cn, RecalcCase c)
+	{
+		var suffix = Guid.NewGuid().ToString("N");
+		var portfolioId = 0;
+		var securityId = 0;
+
+		try
+		{
+			portfolioId = await InsertPortfolioAsync(cn, "pf_stage3_" + c.Name + "_" + suffix);
+			securityId = await InsertSecurityAsync(cn, "sec_" + suffix);
+			var orderId = await InsertOrderAsync(cn, portfolioId, securityId, c.Side, c.TradeQty, c.TradePrice, "ACCEPTED");
+
+			// Seed the EXISTING position only when it is non-flat: an all-zero case exercises the UPSERT
+			// INSERT path, a non-flat case the UPSERT UPDATE path, so both DB paths are covered.
+			if (c.ExistingQty != 0m || c.ExistingAvgPrice != 0m || c.ExistingRealizedPnl != 0m)
+			{
+				await InsertPositionAsync(cn, portfolioId, securityId,
+					qty: c.ExistingQty, avgPrice: c.ExistingAvgPrice, realizedPnl: c.ExistingRealizedPnl, unrealizedPnl: 0m);
+			}
+
+			var svc = new PositionRecalculationService();
+			await using (var txn = await cn.BeginTransactionAsync(CancellationToken))
+			{
+				// The gateway owns the transaction in production; here the test plays that role - begin,
+				// ApplyAsync on (connection, transaction), commit once.
+				await svc.ApplyAsync(cn, txn, orderId, NextTradeId(), c.TradeQty, c.TradePrice, CancellationToken);
+				await txn.CommitAsync(CancellationToken);
+			}
+
+			var position = await ReadPositionAsync(cn, portfolioId, securityId);
+			return (position.Qty, position.AvgPrice, position.RealizedPnl);
+		}
+		finally
+		{
+			await CleanupAsync(cn, portfolioId, securityId);
+		}
+	}
+
+	/// <summary>Reads the persisted <c>dbo.Positions</c> row (qty, avg_price, realized_pnl) for the
+	/// (portfolio, security), returning <c>(0,0,0,false)</c> when no row exists - matching the procedure's
+	/// own default-to-flat behaviour.</summary>
+	private async Task<(decimal Qty, decimal AvgPrice, decimal RealizedPnl, bool Exists)> ReadSqlServerPositionAsync(SqlConnection connection, SqlTransaction transaction, int portfolioId, int securityId)
+	{
+		await using var command = new SqlCommand(
+			"SELECT qty, avg_price, realized_pnl FROM dbo.Positions WHERE portfolio_id = @portfolio_id AND security_id = @security_id",
+			connection, transaction);
+		command.Parameters.Add(SqlP("@portfolio_id", SqlDbType.Int, portfolioId));
+		command.Parameters.Add(SqlP("@security_id", SqlDbType.Int, securityId));
+
+		await using var reader = await command.ExecuteReaderAsync(CancellationToken);
+		if (!await reader.ReadAsync(CancellationToken))
+			return (0m, 0m, 0m, false);
+
+		return (reader.GetDecimal(0), reader.GetDecimal(1), reader.GetDecimal(2), true);
+	}
+
+	/// <summary>Inserts a SQL Server portfolio and returns its generated id.</summary>
+	private async Task<int> SqlSeedPortfolioAsync(SqlConnection connection, SqlTransaction transaction, string name)
+	{
+		await using var command = new SqlCommand(
+			"INSERT INTO dbo.Portfolios (name) OUTPUT INSERTED.portfolio_id VALUES (@name)", connection, transaction);
+		command.Parameters.Add(SqlP("@name", SqlDbType.NVarChar, name));
+		return (int)await command.ExecuteScalarAsync(CancellationToken);
+	}
+
+	/// <summary>Inserts a SQL Server security (board left NULL) and returns its generated id.</summary>
+	private async Task<int> SqlSeedSecurityAsync(SqlConnection connection, SqlTransaction transaction, string code)
+	{
+		await using var command = new SqlCommand(
+			"INSERT INTO dbo.Securities (security_code) OUTPUT INSERTED.security_id VALUES (@code)", connection, transaction);
+		command.Parameters.Add(SqlP("@code", SqlDbType.NVarChar, code));
+		return (int)await command.ExecuteScalarAsync(CancellationToken);
+	}
+
+	/// <summary>Inserts a SQL Server order and returns its generated <c>order_id</c> (the procedure looks up
+	/// side/portfolio/security from it).</summary>
+	private async Task<long> SqlSeedOrderReturningIdAsync(SqlConnection connection, SqlTransaction transaction, int portfolioId, int securityId, string side, decimal qty, decimal price, string status)
+	{
+		await using var command = new SqlCommand(
+			"INSERT INTO dbo.Orders (portfolio_id, security_id, side, qty, price, order_type, status) " +
+			"OUTPUT INSERTED.order_id VALUES (@portfolio_id, @security_id, @side, @qty, @price, 'LIMIT', @status)", connection, transaction);
+		command.Parameters.Add(SqlP("@portfolio_id", SqlDbType.Int, portfolioId));
+		command.Parameters.Add(SqlP("@security_id", SqlDbType.Int, securityId));
+		command.Parameters.Add(SqlP("@side", SqlDbType.VarChar, side));
+		command.Parameters.Add(SqlDec("@qty", qty));
+		command.Parameters.Add(SqlDec("@price", price));
+		command.Parameters.Add(SqlP("@status", SqlDbType.VarChar, status));
+		return (long)await command.ExecuteScalarAsync(CancellationToken);
+	}
+
+	/// <summary>Seeds an existing SQL Server position row (unrealized_pnl defaulted to 0).</summary>
+	private async Task SqlSeedPositionAsync(SqlConnection connection, SqlTransaction transaction, int portfolioId, int securityId, decimal qty, decimal avgPrice, decimal realizedPnl)
+	{
+		await using var command = new SqlCommand(
+			"INSERT INTO dbo.Positions (portfolio_id, security_id, qty, avg_price, realized_pnl, unrealized_pnl) " +
+			"VALUES (@portfolio_id, @security_id, @qty, @avg_price, @realized_pnl, 0)", connection, transaction);
+		command.Parameters.Add(SqlP("@portfolio_id", SqlDbType.Int, portfolioId));
+		command.Parameters.Add(SqlP("@security_id", SqlDbType.Int, securityId));
+		command.Parameters.Add(SqlDec("@qty", qty));
+		command.Parameters.Add(SqlDec("@avg_price", avgPrice));
+		command.Parameters.Add(SqlDec("@realized_pnl", realizedPnl));
+		await command.ExecuteNonQueryAsync(CancellationToken);
+	}
+
+	/// <summary>Builds a SQL Server parameter, mapping a null value to <see cref="DBNull"/>.</summary>
+	private static SqlParameter SqlP(string name, SqlDbType type, object value)
+		=> new(name, type) { Value = value ?? DBNull.Value };
+
+	/// <summary>Builds a decimal SQL Server parameter with explicit NUMERIC precision/scale (default 18,4) so
+	/// the value is never truncated to scale 0 (a Microsoft.Data.SqlClient default that would loosen parity).</summary>
+	private static SqlParameter SqlDec(string name, object value, byte precision = 18, byte scale = 4)
+		=> new(name, SqlDbType.Decimal) { Precision = precision, Scale = scale, Value = value ?? DBNull.Value };
+
+	/// <summary>
+	/// Opens the live SQL Server connection the Stage 1/2/4 golden baseline requires and ensures the embedded
+	/// characterization schema + retired procedures exist on it. Reports <c>Inconclusive</c> ONLY when
+	/// <c>STOCKSHARP_LEGACY_MSSQL_CONNECTION</c> is unset (no SQL Server opted in for this run); FAILS when the
+	/// variable IS set but SQL Server cannot be opened, so a configured golden-baseline milestone is always
+	/// actually exercised (never silently skipped).
+	/// </summary>
+	private async Task<SqlConnection> OpenSqlServerAsync()
+	{
+		var connectionString = Environment.GetEnvironmentVariable("STOCKSHARP_LEGACY_MSSQL_CONNECTION");
+		if (connectionString.IsEmpty())
+		{
+			Inconclusive("No SQL Server connection configured (STOCKSHARP_LEGACY_MSSQL_CONNECTION unset) - skipping staged SQL Server golden baseline.");
+			return null; // unreachable (Inconclusive throws); required for definite assignment.
+		}
+
+		SqlConnection connection = null;
+		try
+		{
+			connection = new SqlConnection(connectionString);
+			await connection.OpenAsync(CancellationToken);
+		}
+		catch (Exception ex)
+		{
+			if (connection is not null)
+				await connection.DisposeAsync();
+
+			Fail($"STOCKSHARP_LEGACY_MSSQL_CONNECTION is configured but SQL Server is not reachable: {ex.Message}");
+			return null; // unreachable (Fail throws); required for definite assignment.
+		}
+
+		await EnsureSqlServerSchemaAsync(connection);
+		return connection;
+	}
+
+	// Guards a one-time, idempotent materialization of the embedded golden schema per test-run process.
+	private static readonly SemaphoreSlim _sqlServerSchemaGate = new(1, 1);
+	private static bool _sqlServerSchemaEnsured;
+
+	/// <summary>
+	/// Materializes the ORIGINAL SQL Server characterization schema and the two retired procedures on the
+	/// given connection by executing the embedded <c>OriginalCharacterizationSetup.sql</c> resource. The
+	/// script is idempotent (guarded CREATEs / CREATE OR ALTER), so re-runs are safe; a static flag avoids
+	/// redundant executions within a single process. Runs each GO-delimited batch on the SAME connection.
+	/// </summary>
+	private async Task EnsureSqlServerSchemaAsync(SqlConnection connection)
+	{
+		if (_sqlServerSchemaEnsured)
+			return;
+
+		await _sqlServerSchemaGate.WaitAsync(CancellationToken);
+		try
+		{
+			if (_sqlServerSchemaEnsured)
+				return;
+
+			var assembly = typeof(PositionRecalculationTests).Assembly;
+			var resourceName = assembly.GetManifestResourceNames()
+				.Single(name => name.EndsWith("OriginalCharacterizationSetup.sql", StringComparison.Ordinal));
+
+			string script;
+			await using (var stream = assembly.GetManifestResourceStream(resourceName))
+			using (var reader = new StreamReader(stream))
+				script = await reader.ReadToEndAsync(CancellationToken);
+
+			foreach (var batch in SplitSqlBatches(script))
+			{
+				await using var command = new SqlCommand(batch, connection);
+				await command.ExecuteNonQueryAsync(CancellationToken);
+			}
+
+			_sqlServerSchemaEnsured = true;
+		}
+		finally
+		{
+			_sqlServerSchemaGate.Release();
+		}
+	}
+
+	/// <summary>Splits a T-SQL script on standalone <c>GO</c> batch separators (Microsoft.Data.SqlClient
+	/// cannot execute <c>GO</c>), yielding each non-empty batch in order.</summary>
+	private static IEnumerable<string> SplitSqlBatches(string script)
+	{
+		var batch = new StringBuilder();
+		foreach (var line in script.Split('\n'))
+		{
+			if (line.Trim().Equals("GO", StringComparison.OrdinalIgnoreCase))
+			{
+				var text = batch.ToString().Trim();
+				if (!text.IsEmpty())
+					yield return text;
+				batch.Clear();
+			}
+			else
+			{
+				batch.AppendLine(line);
+			}
+		}
+
+		var tail = batch.ToString().Trim();
+		if (!tail.IsEmpty())
+			yield return tail;
 	}
 
 	// ========================================================================================================

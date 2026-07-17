@@ -18,6 +18,12 @@
     </Content>
   </ItemGroup>
   <ItemGroup>
+    <!-- Golden SQL Server characterization schema + retired procedures, embedded so the staged
+         four-step parity tests (AAP 0.6.3) can materialize the ORIGINAL engine's logic on a live
+         SQL Server instance (steps 1-2) without shipping loose files. -->
+    <EmbeddedResource Include="Resources\LegacySqlServer\*.sql" />
+  </ItemGroup>
+  <ItemGroup>
     <ProjectReference Include="..\Algo.Analytics\Algo.Analytics.csproj" />
     <ProjectReference Include="..\Algo.Compilation\Algo.Compilation.csproj" />
     <ProjectReference Include="..\Algo.Export\Algo.Export.csproj" />

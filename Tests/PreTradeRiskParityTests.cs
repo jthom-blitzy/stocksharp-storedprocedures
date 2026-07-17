@@ -1,8 +1,12 @@
 namespace StockSharp.Tests;
 
+using System.Data;
+using System.Text;
+
 using StockSharp.Algo.Risk;
 using StockSharp.Algo.Storages.Sql;
 
+using Microsoft.Data.SqlClient;
 using Npgsql;
 using NpgsqlTypes;
 
@@ -46,6 +50,7 @@ using NpgsqlTypes;
 /// </para>
 /// </remarks>
 [TestClass]
+[DoNotParallelize] // Staged Steps 1/2/4 seed and roll back transactions against the shared SQL Server (dbo.*) and PostgreSQL engines; parallel execution deadlocks on those shared tables, so this class runs serially (repo convention, cf. StorageNotParallelizeTests / ExportTests).
 public class PreTradeRiskParityTests : BaseTestClass
 {
 	// ---------------------------------------------------------------------------------------------
@@ -636,32 +641,27 @@ public class PreTradeRiskParityTests : BaseTestClass
 	}
 
 	// =============================================================================================
-	// Phase G — Guarded PostgreSQL integration parity (staged step-3). These tests exercise the real,
-	// database-state-aware PreTradeRiskService.ValidateAsync against a LIVE PostgreSQL instance (the
-	// containerized step-3 run). They MUST NOT fail dotnet test when no database is available:
-	// TryOpenAsync reports Inconclusive (never fails) when STOCKSHARP_LEGACY_SQL_CONNECTION is unset or
-	// the configured database is unreachable, mirroring the repo's skip-when-unavailable convention.
+	// Phase G - PostgreSQL demo-scenario integration (staged STEP 3 via the real, database-state-aware
+	// PreTradeRiskService.ValidateAsync against a LIVE PostgreSQL instance). These reproduce two of the
+	// three observable demo outcomes (AAP 0.7.1) on the migrated engine. They use OpenPostgresAsync,
+	// which is MANDATORY-WHEN-CONFIGURED: it reports Inconclusive ONLY when STOCKSHARP_LEGACY_SQL_CONNECTION
+	// is unset, and FAILS when a database IS configured but unreachable (a configured engine MUST actually
+	// be exercised - the former skip-on-unreachable behaviour could mask a broken step-3 run).
 	//
-	// DOCUMENTED DECISION: the on-disk PreTradeRiskService.ValidateAsync requires the caller's in-flight
-	// NpgsqlTransaction as its second argument (it reads risklimits/positions/orders/trades ON that
-	// transaction so the validation shares the caller's snapshot) and throws if it is null. Each test
-	// therefore opens a transaction, seeds inside it, validates on the SAME transaction, and rolls back
-	// at the end — which both satisfies the required signature AND leaves the database pristine for
-	// re-runs (no residual rows), so no delete-by-unique-suffix cleanup query is needed. A unique suffix
-	// is still applied to the portfolio/security natural keys as belt-and-suspenders.
+	// Each test opens a transaction, seeds inside it, validates on the SAME transaction (the service reads
+	// risklimits/positions/orders/trades ON that transaction so validation shares the caller's snapshot),
+	// and rolls back, leaving the database pristine for re-runs.
 	// =============================================================================================
 
 	/// <summary>
 	/// Demo scenario (a): an order within EVERY configured limit is accepted. Seeds a fresh
 	/// portfolio + security + the DEMO risklimits row, then validates a small buy (qty 100 @ 150). With
-	/// no seeded orders/positions/trades all seven checks pass (price 150 &lt; 500, qty 100 &lt; 10000,
-	/// notional 15000 &lt; 1e6, frequency 1 &lt; 5, flat position 100 &lt; 100000, commission 7.5 &lt; 5000,
-	/// daily 100 &lt; 250000), so the gate accepts.
+	/// no seeded orders/positions/trades all seven checks pass, so the gate accepts.
 	/// </summary>
 	[TestMethod]
 	public async Task ValidateAsync_WithinLimits_Accepted()
 	{
-		await using var connection = await TryOpenAsync();
+		await using var connection = await OpenPostgresAsync();
 		await using var transaction = await connection.BeginTransactionAsync(CancellationToken);
 
 		var suffix = Guid.NewGuid().ToString("N");
@@ -681,15 +681,14 @@ public class PreTradeRiskParityTests : BaseTestClass
 
 	/// <summary>
 	/// Demo scenario (b): an order breaching the price ceiling is rejected with a reason. Price 999
-	/// meets/exceeds the seeded 500 ceiling, so the gate rejects at check 1 (the FIRST check, so no
-	/// other seed data is needed). The reject reason is asserted LOOSELY (Contains "price"), never by
-	/// full-string equality, because the DB-read NUMERIC(18,4) renders with trailing zeros (e.g.
-	/// "500.0000") via Ecng <c>.To&lt;string&gt;()</c>.
+	/// meets/exceeds the seeded 500 ceiling, so the gate rejects at check 1. The reject reason is asserted
+	/// LOOSELY (Contains "price"), never by full-string equality, because the DB-read NUMERIC(18,4) renders
+	/// with trailing zeros (e.g. "500.0000") via Ecng <c>.To&lt;string&gt;()</c>.
 	/// </summary>
 	[TestMethod]
 	public async Task ValidateAsync_PriceCeilingBreached_Rejected()
 	{
-		await using var connection = await TryOpenAsync();
+		await using var connection = await OpenPostgresAsync();
 		await using var transaction = await connection.BeginTransactionAsync(CancellationToken);
 
 		var suffix = Guid.NewGuid().ToString("N");
@@ -707,27 +706,321 @@ public class PreTradeRiskParityTests : BaseTestClass
 		await transaction.RollbackAsync(CancellationToken);
 	}
 
-	// --- Phase G helpers: skip-guard and self-contained raw-SQL seeding ---
+	// =============================================================================================
+	// Phase H - DUAL-ENGINE STAGED FOUR-STEP VALIDATION (AAP 0.6.3).
+	//
+	// Two independent change axes landed in one refactor: (A) LOGIC consolidation - the accept/reject
+	// decision moved out of the retired T-SQL procedure dbo.usp_ValidatePreTradeRisk into the canonical
+	// C# PreTradeRiskService.EvaluateGate; and (B) ENGINE migration - SQL Server -> PostgreSQL. A single
+	// test run cannot attribute a regression to the right axis, so the four steps hold one axis constant
+	// at a time (the ORDERING is the diagnostic instrument):
+	//
+	//   Step 1 - the GOLDEN baseline: execute the ORIGINAL dbo.usp_ValidatePreTradeRisk on a LIVE SQL
+	//            Server instance (materialized from the embedded characterization script) per vector.
+	//   Step 2 - the consolidated C# logic with the ENGINE held at SQL Server: read the SAME state from
+	//            SQL Server and run the REAL PreTradeRiskService.EvaluateGate; a mismatch vs Step 1
+	//            isolates a LOGIC regression (engine constant).
+	//   Step 3 - the consolidated C# logic on the MIGRATED engine: run the REAL, database-state-aware
+	//            PreTradeRiskService.ValidateAsync on PostgreSQL; passing Step 2 but failing Step 3
+	//            isolates an ENGINE/dialect regression (logic constant).
+	//   Step 4 - cross-compare all three per vector so any divergence is attributable to a named axis.
+	//
+	// This is authentic because EvaluateGate is the SAME pure decision core that ValidateAsync delegates
+	// to in production - Step 2 and Step 3 exercise identical LOGIC, differing ONLY by engine. Both
+	// engines must be reachable for Steps 1-2 (SQL Server) and Step 3 (PostgreSQL); when a required engine
+	// is not configured the step reports Inconclusive, and when it is configured but unreachable it FAILS.
+	// =============================================================================================
 
 	/// <summary>
-	/// Opens a PostgreSQL connection for the guarded step-3 tests, or signals skip. The environment
-	/// variable is checked FIRST so an unconfigured run skips immediately instead of blocking on the
-	/// localhost fallback's connect timeout. Reports <c>Inconclusive</c> (never fails) when no database
-	/// is configured OR the configured database is unreachable.
+	/// One parity vector: the effective limits to seed, the prospective order to submit, and the expected
+	/// decision. Every vector is engine-agnostic - the SAME instance drives the SQL Server proc (Step 1),
+	/// EvaluateGate on SQL Server state (Step 2), and ValidateAsync on PostgreSQL (Step 3). Only the
+	/// targeted check sets its limit(s); the rest stay NULL (unlimited) so each vector isolates one check.
+	/// Reject reasons are compared LOOSELY by <see cref="ExpectRejectCategory"/> (a stable leading phrase
+	/// emitted identically by both engines), never by exact string, because SQL Server renders NUMERIC with
+	/// trailing zeros while C# <c>decimal</c> keeps its own scale (documented Info-6 cosmetic difference).
 	/// </summary>
-	/// <returns>An open <see cref="NpgsqlConnection"/>; or <see langword="null"/> only on the (throwing) skip path.</returns>
-	private async Task<NpgsqlConnection> TryOpenAsync()
+	private sealed class GateVector
 	{
-		// Gate on the opt-in environment variable: Resolve() always yields a localhost fallback, so
-		// "is a database configured for THIS run" is decided by the variable, not by Resolve().
+		/// <summary>Stable identifier used in assertion failure messages.</summary>
+		public string Name { get; init; }
+		/// <summary>Human-readable name of the single check this vector isolates.</summary>
+		public string TargetCheck { get; init; }
+		public decimal? MaxOrderPrice { get; init; }
+		public decimal? MaxOrderQty { get; init; }
+		public decimal? MaxOrderValue { get; init; }
+		public decimal? MaxPositionSize { get; init; }
+		public decimal? MaxDailyVolume { get; init; }
+		public int? MaxOrderFreqCount { get; init; }
+		public int? MaxOrderFreqWindowSec { get; init; }
+		public decimal? MaxCommissionTotal { get; init; }
+		public decimal? CommissionRate { get; init; }
+		/// <summary>Number of PENDING orders to pre-seed for the portfolio (drives the frequency window).</summary>
+		public int SeedRecentOrderCount { get; init; }
+		/// <summary>Total qty of a single pre-seeded ACCEPTED order dated today (drives the daily-volume rollup); 0 = none.</summary>
+		public decimal SeedTodayAcceptedQty { get; init; }
+		/// <summary>Prospective order side, "B" or "S".</summary>
+		public string Side { get; init; } = "B";
+		/// <summary>Prospective order quantity.</summary>
+		public decimal Qty { get; init; }
+		/// <summary>Prospective order price, or <see langword="null"/> for a market order.</summary>
+		public decimal? Price { get; init; }
+		/// <summary>Expected accept (true) / reject (false) decision, identical on all three engines.</summary>
+		public bool ExpectValid { get; init; }
+		/// <summary>Stable leading phrase the reject reason must contain when <see cref="ExpectValid"/> is false.</summary>
+		public string ExpectRejectCategory { get; init; }
+	}
+
+	/// <summary>
+	/// The shared parity vector table: all seven checks at below / at / above their ceiling, plus one
+	/// within-ALL-limits accept. "At" and "above" reject (">=" meets-or-exceeds); "below" accepts. Positive
+	/// limits are used throughout so Step 1 == Step 2 == Step 3 (the 0-limit divergence is a SEPARATE test).
+	/// </summary>
+	private static IReadOnlyList<GateVector> ParityVectors { get; } = new[]
+	{
+		// 1. Order price ceiling (limit 500): 499 accepts, 500/501 reject.
+		new GateVector { Name = "price_below", TargetCheck = "order price", MaxOrderPrice = DemoMaxOrderPrice, Qty = 1m, Price = 499.00m, ExpectValid = true },
+		new GateVector { Name = "price_at",    TargetCheck = "order price", MaxOrderPrice = DemoMaxOrderPrice, Qty = 1m, Price = 500.00m, ExpectValid = false, ExpectRejectCategory = "Order price" },
+		new GateVector { Name = "price_above", TargetCheck = "order price", MaxOrderPrice = DemoMaxOrderPrice, Qty = 1m, Price = 501.00m, ExpectValid = false, ExpectRejectCategory = "Order price" },
+		// 2. Order qty ceiling (limit 10000): market orders (price null) at 9999 / 10000 / 10001.
+		new GateVector { Name = "qty_below", TargetCheck = "order qty", MaxOrderQty = DemoMaxOrderQty, Qty = 9999m,  Price = null, ExpectValid = true },
+		new GateVector { Name = "qty_at",    TargetCheck = "order qty", MaxOrderQty = DemoMaxOrderQty, Qty = 10000m, Price = null, ExpectValid = false, ExpectRejectCategory = "Order qty" },
+		new GateVector { Name = "qty_above", TargetCheck = "order qty", MaxOrderQty = DemoMaxOrderQty, Qty = 10001m, Price = null, ExpectValid = false, ExpectRejectCategory = "Order qty" },
+		// 3. Notional value ceiling (limit 1,000,000) at price 100: qty 9999/10000/10001 -> 999900/1000000/1000100.
+		new GateVector { Name = "value_below", TargetCheck = "order value", MaxOrderValue = DemoMaxOrderValue, Qty = 9999m,  Price = 100.00m, ExpectValid = true },
+		new GateVector { Name = "value_at",    TargetCheck = "order value", MaxOrderValue = DemoMaxOrderValue, Qty = 10000m, Price = 100.00m, ExpectValid = false, ExpectRejectCategory = "Order value" },
+		new GateVector { Name = "value_above", TargetCheck = "order value", MaxOrderValue = DemoMaxOrderValue, Qty = 10001m, Price = 100.00m, ExpectValid = false, ExpectRejectCategory = "Order value" },
+		// 4. Order frequency (limit 5 per 60s): seed 3/4/5 recent orders; gate adds the prospective (+1) -> 4/5/6.
+		new GateVector { Name = "freq_below", TargetCheck = "order frequency", MaxOrderFreqCount = DemoMaxOrderFreqCount, MaxOrderFreqWindowSec = DemoMaxOrderFreqWindowSec, SeedRecentOrderCount = 3, Qty = 1m, Price = null, ExpectValid = true },
+		new GateVector { Name = "freq_at",    TargetCheck = "order frequency", MaxOrderFreqCount = DemoMaxOrderFreqCount, MaxOrderFreqWindowSec = DemoMaxOrderFreqWindowSec, SeedRecentOrderCount = 4, Qty = 1m, Price = null, ExpectValid = false, ExpectRejectCategory = "Order frequency" },
+		new GateVector { Name = "freq_above", TargetCheck = "order frequency", MaxOrderFreqCount = DemoMaxOrderFreqCount, MaxOrderFreqWindowSec = DemoMaxOrderFreqWindowSec, SeedRecentOrderCount = 5, Qty = 1m, Price = null, ExpectValid = false, ExpectRejectCategory = "Order frequency" },
+		// 5. Resulting position size (limit 100000) from flat: market orders at 99999 / 100000 / 100001.
+		new GateVector { Name = "pos_below", TargetCheck = "resulting position", MaxPositionSize = DemoMaxPositionSize, Qty = 99999m,  Price = null, ExpectValid = true },
+		new GateVector { Name = "pos_at",    TargetCheck = "resulting position", MaxPositionSize = DemoMaxPositionSize, Qty = 100000m, Price = null, ExpectValid = false, ExpectRejectCategory = "Resulting position" },
+		new GateVector { Name = "pos_above", TargetCheck = "resulting position", MaxPositionSize = DemoMaxPositionSize, Qty = 100001m, Price = null, ExpectValid = false, ExpectRejectCategory = "Resulting position" },
+		// 6. Cumulative commission ESTIMATE (limit 5000) at rate 0.0005, price 1000: qty*price*rate = 4999.5/5000/5000.5.
+		new GateVector { Name = "comm_below", TargetCheck = "commission", MaxCommissionTotal = DemoMaxCommissionTotal, CommissionRate = DemoCommissionRate, Qty = 9999m,  Price = 1000.00m, ExpectValid = true },
+		new GateVector { Name = "comm_at",    TargetCheck = "commission", MaxCommissionTotal = DemoMaxCommissionTotal, CommissionRate = DemoCommissionRate, Qty = 10000m, Price = 1000.00m, ExpectValid = false, ExpectRejectCategory = "Estimated cumulative commission" },
+		new GateVector { Name = "comm_above", TargetCheck = "commission", MaxCommissionTotal = DemoMaxCommissionTotal, CommissionRate = DemoCommissionRate, Qty = 10001m, Price = 1000.00m, ExpectValid = false, ExpectRejectCategory = "Estimated cumulative commission" },
+		// 7. Daily traded volume (limit 250000): seed one ACCEPTED order qty 100000 today; prospective 149999/150000/150001 -> 249999/250000/250001.
+		new GateVector { Name = "daily_below", TargetCheck = "daily volume", MaxDailyVolume = DemoMaxDailyVolume, SeedTodayAcceptedQty = 100000m, Qty = 149999m, Price = null, ExpectValid = true },
+		new GateVector { Name = "daily_at",    TargetCheck = "daily volume", MaxDailyVolume = DemoMaxDailyVolume, SeedTodayAcceptedQty = 100000m, Qty = 150000m, Price = null, ExpectValid = false, ExpectRejectCategory = "Daily volume" },
+		new GateVector { Name = "daily_above", TargetCheck = "daily volume", MaxDailyVolume = DemoMaxDailyVolume, SeedTodayAcceptedQty = 100000m, Qty = 150001m, Price = null, ExpectValid = false, ExpectRejectCategory = "Daily volume" },
+		// 8. Within EVERY limit -> accept (all ceilings enabled at their demo values).
+		new GateVector { Name = "all_within", TargetCheck = "all limits", MaxOrderPrice = DemoMaxOrderPrice, MaxOrderQty = DemoMaxOrderQty, MaxOrderValue = DemoMaxOrderValue, MaxPositionSize = DemoMaxPositionSize, MaxDailyVolume = DemoMaxDailyVolume, MaxOrderFreqCount = DemoMaxOrderFreqCount, MaxOrderFreqWindowSec = DemoMaxOrderFreqWindowSec, MaxCommissionTotal = DemoMaxCommissionTotal, CommissionRate = DemoCommissionRate, Qty = 100m, Price = 150.00m, ExpectValid = true },
+	};
+
+	/// <summary>
+	/// STEP 1 (golden baseline): run the ORIGINAL <c>dbo.usp_ValidatePreTradeRisk</c> on a LIVE SQL Server
+	/// instance for every parity vector and assert it produces the documented decision. This captures the
+	/// behaviour of the retired procedure before any consolidation, establishing the reference every later
+	/// step is measured against.
+	/// </summary>
+	[TestMethod]
+	public async Task Step1_OriginalSqlServerProcedure_GoldenBaseline()
+	{
+		await using var connection = await OpenSqlServerAsync();
+		foreach (var vector in ParityVectors)
+		{
+			var (isValid, reason) = await SqlProcDecisionAsync(connection, vector);
+			AssertGateDecision(isValid, reason, vector, "Step 1 (original dbo.usp_ValidatePreTradeRisk on SQL Server)");
+		}
+	}
+
+	/// <summary>
+	/// STEP 2 (logic axis, engine held at SQL Server): read the SAME state from SQL Server and run the REAL
+	/// <see cref="PreTradeRiskService.EvaluateGate"/> - the pure decision core that production
+	/// <see cref="PreTradeRiskService.ValidateAsync"/> delegates to. Because the engine is unchanged from
+	/// Step 1, any divergence here is a LOGIC regression in the consolidated C# gate, not an engine effect.
+	/// </summary>
+	[TestMethod]
+	public async Task Step2_ConsolidatedGate_OnSqlServerState_MatchesGolden()
+	{
+		await using var connection = await OpenSqlServerAsync();
+		foreach (var vector in ParityVectors)
+		{
+			var result = await EvaluateGateOnSqlServerAsync(connection, vector);
+			AssertGateDecision(result.IsValid, result.RejectReason, vector, "Step 2 (PreTradeRiskService.EvaluateGate on SQL Server state)");
+		}
+	}
+
+	/// <summary>
+	/// STEP 3 (engine axis, logic held constant): run the REAL, database-state-aware
+	/// <see cref="PreTradeRiskService.ValidateAsync"/> against a LIVE PostgreSQL instance for every vector.
+	/// The logic is identical to Step 2 (ValidateAsync delegates to EvaluateGate), so passing Step 2 but
+	/// failing here isolates an ENGINE / dialect regression introduced by the SQL Server -> PostgreSQL
+	/// migration. This is the containerized step-3 run covering ALL seven checks at below/at/above.
+	/// </summary>
+	[TestMethod]
+	public async Task Step3_ConsolidatedGate_OnPostgreSql_MatchesGolden()
+	{
+		await using var connection = await OpenPostgresAsync();
+		foreach (var vector in ParityVectors)
+		{
+			var result = await ValidateAsyncOnPostgresAsync(connection, vector);
+			AssertGateDecision(result.IsValid, result.RejectReason, vector, "Step 3 (PreTradeRiskService.ValidateAsync on PostgreSQL)");
+		}
+	}
+
+	/// <summary>
+	/// STEP 3 (most-specific RiskLimits selection) via the REAL <see cref="PreTradeRiskService.ValidateAsync"/>
+	/// on PostgreSQL. Two sub-cases prove the production selection ports the T-SQL
+	/// <c>ORDER BY CASE ... effective_date DESC</c> exactly: (1) SPECIFICITY - portfolio+security beats
+	/// portfolio-only beats security-only; (2) effective_date TIE-BREAK - within the same specificity the
+	/// newest row wins. Each sub-case is arranged so the decision differs depending on which row is chosen,
+	/// so the accept/reject outcome alone proves the correct row was selected.
+	/// </summary>
+	[TestMethod]
+	public async Task Step3_MostSpecificRiskLimitsSelection_ViaValidateAsync()
+	{
+		await using var connection = await OpenPostgresAsync();
+		var service = new PreTradeRiskService();
+
+		// Sub-case 1 - SPECIFICITY: Row A (portfolio+security) caps price at 100; Row B (portfolio-only) at
+		// 1000; Row C (security-only) at 2000. An order at 150 rejects ONLY if Row A (the most specific) won.
+		{
+			await using var transaction = await connection.BeginTransactionAsync(CancellationToken);
+			var suffix = Guid.NewGuid().ToString("N");
+			var portfolioId = await InsertPortfolioAsync(connection, transaction, "MSPEC_" + suffix);
+			var securityId = await InsertSecurityAsync(connection, transaction, "MSPEC_" + suffix);
+			await PgInsertPriceLimitAsync(connection, transaction, portfolioId, securityId, 100.00m); // Row A (rank 0)
+			await PgInsertPriceLimitAsync(connection, transaction, portfolioId, null, 1000.00m);      // Row B (rank 1)
+			await PgInsertPriceLimitAsync(connection, transaction, null, securityId, 2000.00m);       // Row C (rank 2)
+
+			var rejected = await service.ValidateAsync(connection, transaction, portfolioId, securityId, "B", 1m, 150.00m, CancellationToken);
+			rejected.IsValid.AssertFalse();
+			rejected.RejectReason.AssertNotNull();
+			rejected.RejectReason.Contains("Order price").AssertTrue();
+
+			// Sanity: 99 < 100 accepts under Row A, confirming Row A's 100 ceiling (not a looser row) is active.
+			var accepted = await service.ValidateAsync(connection, transaction, portfolioId, securityId, "B", 1m, 99.00m, CancellationToken);
+			accepted.IsValid.AssertTrue();
+
+			await transaction.RollbackAsync(CancellationToken);
+		}
+
+		// Sub-case 2 - effective_date TIE-BREAK: two portfolio-only rows, the OLDER capping at 1000 and the
+		// NEWER at 100. An order at 150 rejects ONLY if the NEWER row won (ORDER BY effective_date DESC).
+		{
+			await using var transaction = await connection.BeginTransactionAsync(CancellationToken);
+			var suffix = Guid.NewGuid().ToString("N");
+			var portfolioId = await InsertPortfolioAsync(connection, transaction, "MSPEC2_" + suffix);
+			var securityId = await InsertSecurityAsync(connection, transaction, "MSPEC2_" + suffix);
+			await PgInsertPriceLimitWithAgeAsync(connection, transaction, portfolioId, 1000.00m, 1); // OLDER, looser
+			await PgInsertPriceLimitWithAgeAsync(connection, transaction, portfolioId, 100.00m, 0);  // NEWER, stricter
+
+			var rejected = await service.ValidateAsync(connection, transaction, portfolioId, securityId, "B", 1m, 150.00m, CancellationToken);
+			rejected.IsValid.AssertFalse();
+			rejected.RejectReason.Contains("Order price").AssertTrue();
+
+			await transaction.RollbackAsync(CancellationToken);
+		}
+	}
+
+	/// <summary>
+	/// STEP 4 (attribution matrix): the staged ORDERING is itself the diagnostic instrument. For every
+	/// vector this runs all three engines and cross-compares pairwise so a regression is attributable to a
+	/// specific axis - Step 1 vs Step 2 holds the ENGINE constant (SQL Server), so a mismatch is a LOGIC
+	/// regression; Step 2 vs Step 3 holds the LOGIC constant (canonical C#), so a mismatch is an
+	/// ENGINE/dialect regression. Requires BOTH engines to be configured.
+	/// </summary>
+	[TestMethod]
+	public async Task Step4_StagedOrdering_AttributionMatrix()
+	{
+		await using var sqlServer = await OpenSqlServerAsync();
+		await using var postgres = await OpenPostgresAsync();
+
+		foreach (var vector in ParityVectors)
+		{
+			var step1 = await SqlProcDecisionAsync(sqlServer, vector);
+			var step2 = await EvaluateGateOnSqlServerAsync(sqlServer, vector);
+			var step3 = await ValidateAsyncOnPostgresAsync(postgres, vector);
+
+			// Every engine must match the vector's documented expectation ...
+			AssertGateDecision(step1.IsValid, step1.Reason, vector, "Step 1 (SQL Server procedure)");
+			AssertGateDecision(step2.IsValid, step2.RejectReason, vector, "Step 2 (EvaluateGate on SQL Server state)");
+			AssertGateDecision(step3.IsValid, step3.RejectReason, vector, "Step 3 (ValidateAsync on PostgreSQL)");
+
+			// ... and the axes must agree pairwise so any regression is attributable to a named axis.
+			if (step1.IsValid != step2.IsValid)
+				Fail($"LOGIC-axis regression on vector '{vector.Name}': Step 1 (proc) IsValid={step1.IsValid} but Step 2 (EvaluateGate) IsValid={step2.IsValid} - the ENGINE was held at SQL Server, so the consolidated C# LOGIC diverged from the retired procedure.");
+			if (step2.IsValid != step3.IsValid)
+				Fail($"ENGINE-axis regression on vector '{vector.Name}': Step 2 (SQL Server state) IsValid={step2.IsValid} but Step 3 (PostgreSQL) IsValid={step3.IsValid} - the LOGIC was held constant, so the SQL Server -> PostgreSQL migration changed the decision.");
+		}
+	}
+
+	/// <summary>
+	/// STEP 4 (documented divergence): the ONE deliberate, AAP-0.6.4-mandated difference between the retired
+	/// SQL logic and the canonical C# logic. The retired proc guards each ceiling with <c>IS NOT NULL</c>, so
+	/// a literal 0 ceiling REJECTS; the canonical convention treats 0 as "unlimited" and ACCEPTS. This is a
+	/// LOGIC-axis difference only: the two canonical C# evaluations (Step 2 on SQL Server state, Step 3 on
+	/// PostgreSQL) must AGREE with each other (both accept) - only the retired proc diverges (rejects). It is
+	/// asserted as EXPECTED so a future regression that silently changes the 0-limit meaning is caught.
+	/// </summary>
+	[TestMethod]
+	public async Task Step4_ZeroLimitDivergence_IsDocumentedAndExpected()
+	{
+		var vector = new GateVector { Name = "zero_price_limit", TargetCheck = "order price (0)", MaxOrderPrice = 0m, CommissionRate = DemoCommissionRate, Qty = 1m, Price = 123.00m, ExpectValid = true };
+
+		await using var sqlServer = await OpenSqlServerAsync();
+		await using var postgres = await OpenPostgresAsync();
+
+		var procDecision = await SqlProcDecisionAsync(sqlServer, vector);        // retired SQL logic
+		var gateOnSqlServer = await EvaluateGateOnSqlServerAsync(sqlServer, vector); // canonical C# on SQL Server state
+		var validateOnPostgres = await ValidateAsyncOnPostgresAsync(postgres, vector); // canonical C# on PostgreSQL
+
+		// Retired SQL rejects on the 0 ceiling (IS NOT NULL, and 123 >= 0).
+		procDecision.IsValid.AssertFalse();
+		procDecision.Reason.AssertNotNull();
+		// Canonical C# treats 0 as unlimited and ACCEPTS - on BOTH engines, proving the divergence is LOGIC-only.
+		gateOnSqlServer.IsValid.AssertTrue();
+		validateOnPostgres.IsValid.AssertTrue();
+		// The two canonical evaluations agree (engine axis is clean); only the retired SQL logic differs.
+		gateOnSqlServer.IsValid.AssertEqual(validateOnPostgres.IsValid);
+	}
+
+	/// <summary>
+	/// Shared decision assertion: verifies the engine's accept/reject matches the vector's expectation and,
+	/// on a reject, that the reason CONTAINS the expected category phrase (loose match - see
+	/// <see cref="GateVector.ExpectRejectCategory"/>). Failure messages name the engine and vector so a
+	/// staged run pinpoints exactly which step and vector diverged.
+	/// </summary>
+	private void AssertGateDecision(bool actualValid, string actualReason, GateVector vector, string engine)
+	{
+		if (vector.ExpectValid)
+		{
+			if (!actualValid)
+				Fail($"{engine}: vector '{vector.Name}' expected ACCEPT but got REJECT (reason: {actualReason}).");
+		}
+		else
+		{
+			if (actualValid)
+				Fail($"{engine}: vector '{vector.Name}' expected REJECT (category '{vector.ExpectRejectCategory}') but got ACCEPT.");
+			if (actualReason.IsEmpty())
+				Fail($"{engine}: vector '{vector.Name}' expected a reject reason containing '{vector.ExpectRejectCategory}' but the reason was empty.");
+			if (!actualReason.Contains(vector.ExpectRejectCategory))
+				Fail($"{engine}: vector '{vector.Name}' expected reject category '{vector.ExpectRejectCategory}' but the reason was '{actualReason}'.");
+		}
+	}
+
+	// --- Mandatory connection guards (Inconclusive ONLY when unset; Fail when configured-but-unreachable) ---
+
+	/// <summary>
+	/// Opens a PostgreSQL connection for the step-3 tests. Reports <c>Inconclusive</c> ONLY when
+	/// STOCKSHARP_LEGACY_SQL_CONNECTION is unset (no Postgres engine opted in for this run); FAILS when the
+	/// variable IS set but the database cannot be opened, so a configured engine is always actually exercised.
+	/// </summary>
+	private async Task<NpgsqlConnection> OpenPostgresAsync()
+	{
+		// Gate on the opt-in variable: Resolve() always yields a localhost fallback, so "is a Postgres engine
+		// configured for THIS run" is decided by the variable, not by Resolve().
 		if (Environment.GetEnvironmentVariable("STOCKSHARP_LEGACY_SQL_CONNECTION").IsEmpty())
 		{
-			Inconclusive("No PostgreSQL connection configured (STOCKSHARP_LEGACY_SQL_CONNECTION unset) - skipping DB parity test.");
-			return null; // unreachable in practice (Inconclusive throws); required for definite assignment.
+			Inconclusive("No PostgreSQL connection configured (STOCKSHARP_LEGACY_SQL_CONNECTION unset) - skipping staged PostgreSQL parity.");
+			return null; // unreachable (Inconclusive throws); required for definite assignment.
 		}
 
 		NpgsqlConnection connection = null;
-
 		try
 		{
 			connection = new NpgsqlConnection(SqlLegacyConnection.Resolve());
@@ -739,10 +1032,473 @@ public class PreTradeRiskParityTests : BaseTestClass
 			if (connection is not null)
 				await connection.DisposeAsync();
 
-			Inconclusive($"PostgreSQL not reachable - skipping DB parity test: {ex.Message}");
-			return null; // unreachable in practice (Inconclusive throws); required for definite assignment.
+			// Configured but unreachable is a genuine FAILURE, not a skip - a configured step-3 engine must run.
+			Fail($"STOCKSHARP_LEGACY_SQL_CONNECTION is configured but PostgreSQL is not reachable: {ex.Message}");
+			return null; // unreachable (Fail throws); required for definite assignment.
 		}
 	}
+
+	/// <summary>
+	/// Opens a SQL Server connection for the step-1/step-2 golden baseline and ensures the embedded
+	/// characterization schema + retired procedures exist on it. Reports <c>Inconclusive</c> ONLY when
+	/// STOCKSHARP_LEGACY_MSSQL_CONNECTION is unset; FAILS when it is set but SQL Server is unreachable.
+	/// </summary>
+	private async Task<SqlConnection> OpenSqlServerAsync()
+	{
+		var connectionString = Environment.GetEnvironmentVariable("STOCKSHARP_LEGACY_MSSQL_CONNECTION");
+		if (connectionString.IsEmpty())
+		{
+			Inconclusive("No SQL Server connection configured (STOCKSHARP_LEGACY_MSSQL_CONNECTION unset) - skipping staged SQL Server golden baseline.");
+			return null; // unreachable (Inconclusive throws); required for definite assignment.
+		}
+
+		SqlConnection connection = null;
+		try
+		{
+			connection = new SqlConnection(connectionString);
+			await connection.OpenAsync(CancellationToken);
+		}
+		catch (Exception ex)
+		{
+			if (connection is not null)
+				await connection.DisposeAsync();
+
+			Fail($"STOCKSHARP_LEGACY_MSSQL_CONNECTION is configured but SQL Server is not reachable: {ex.Message}");
+			return null; // unreachable (Fail throws); required for definite assignment.
+		}
+
+		await EnsureSqlServerSchemaAsync(connection);
+		return connection;
+	}
+
+	// Guards a one-time, idempotent materialization of the embedded golden schema per test-run process.
+	private static readonly SemaphoreSlim _sqlServerSchemaGate = new(1, 1);
+	private static bool _sqlServerSchemaEnsured;
+
+	/// <summary>
+	/// Materializes the ORIGINAL SQL Server characterization schema and the two retired procedures on the
+	/// given connection by executing the embedded <c>OriginalCharacterizationSetup.sql</c> resource. The
+	/// script is idempotent (guarded CREATEs / CREATE OR ALTER), so re-runs are safe; a static flag avoids
+	/// redundant executions within a single process. Runs each GO-delimited batch on the SAME connection so
+	/// the leading SET ANSI_NULLS/QUOTED_IDENTIFIER ON persist for the filtered-index creation.
+	/// </summary>
+	private async Task EnsureSqlServerSchemaAsync(SqlConnection connection)
+	{
+		if (_sqlServerSchemaEnsured)
+			return;
+
+		await _sqlServerSchemaGate.WaitAsync(CancellationToken);
+		try
+		{
+			if (_sqlServerSchemaEnsured)
+				return;
+
+			var assembly = typeof(PreTradeRiskParityTests).Assembly;
+			var resourceName = assembly.GetManifestResourceNames()
+				.Single(name => name.EndsWith("OriginalCharacterizationSetup.sql", StringComparison.Ordinal));
+
+			string script;
+			await using (var stream = assembly.GetManifestResourceStream(resourceName))
+			using (var reader = new StreamReader(stream))
+				script = await reader.ReadToEndAsync(CancellationToken);
+
+			foreach (var batch in SplitSqlBatches(script))
+			{
+				await using var command = new SqlCommand(batch, connection);
+				await command.ExecuteNonQueryAsync(CancellationToken);
+			}
+
+			_sqlServerSchemaEnsured = true;
+		}
+		finally
+		{
+			_sqlServerSchemaGate.Release();
+		}
+	}
+
+	/// <summary>Splits a T-SQL script on standalone <c>GO</c> batch separators (Microsoft.Data.SqlClient
+	/// cannot execute <c>GO</c>), yielding each non-empty batch in order.</summary>
+	private static IEnumerable<string> SplitSqlBatches(string script)
+	{
+		var batch = new StringBuilder();
+		foreach (var line in script.Split('\n'))
+		{
+			if (line.Trim().Equals("GO", StringComparison.OrdinalIgnoreCase))
+			{
+				var text = batch.ToString().Trim();
+				if (!text.IsEmpty())
+					yield return text;
+				batch.Clear();
+			}
+			else
+			{
+				batch.AppendLine(line);
+			}
+		}
+
+		var tail = batch.ToString().Trim();
+		if (!tail.IsEmpty())
+			yield return tail;
+	}
+
+	// --- SQL Server engine helpers (Step 1 proc + Step 2 EvaluateGate-on-SQL-Server-state) ---
+
+	/// <summary>
+	/// STEP 1 per-vector: seeds the scenario in a transaction, executes the ORIGINAL
+	/// <c>dbo.usp_ValidatePreTradeRisk</c> with the prospective order (reading its BIT/NVARCHAR OUTPUT
+	/// parameters), then rolls back. The procedure reads the seeded state itself, so the prospective order
+	/// is NOT inserted (it is a pre-trade gate).
+	/// </summary>
+	private async Task<(bool IsValid, string Reason)> SqlProcDecisionAsync(SqlConnection connection, GateVector vector)
+	{
+		await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(CancellationToken);
+		var (portfolioId, securityId) = await SeedSqlServerScenarioAsync(connection, transaction, vector);
+
+		await using var command = new SqlCommand(
+			"EXEC dbo.usp_ValidatePreTradeRisk @portfolio_id = @portfolio_id, @security_id = @security_id, " +
+			"@side = @side, @qty = @qty, @price = @price, @is_valid = @is_valid OUTPUT, @reject_reason = @reject_reason OUTPUT",
+			connection, transaction);
+		command.Parameters.Add(SqlP("@portfolio_id", SqlDbType.Int, portfolioId));
+		command.Parameters.Add(SqlP("@security_id", SqlDbType.Int, securityId));
+		command.Parameters.Add(SqlP("@side", SqlDbType.VarChar, vector.Side));
+		command.Parameters.Add(SqlDec("@qty", vector.Qty));
+		command.Parameters.Add(SqlDec("@price", vector.Price));
+		var isValidParam = new SqlParameter("@is_valid", SqlDbType.Bit) { Direction = ParameterDirection.Output };
+		var reasonParam = new SqlParameter("@reject_reason", SqlDbType.NVarChar, 200) { Direction = ParameterDirection.Output };
+		command.Parameters.Add(isValidParam);
+		command.Parameters.Add(reasonParam);
+		await command.ExecuteNonQueryAsync(CancellationToken);
+
+		var isValid = (bool)isValidParam.Value;
+		var reason = reasonParam.Value as string; // DBNull.Value -> null
+		await transaction.RollbackAsync(CancellationToken);
+		return (isValid, reason);
+	}
+
+	/// <summary>
+	/// STEP 2 per-vector: seeds the scenario in a transaction, reads the resolved limits and the five
+	/// database-derived aggregates FROM SQL SERVER, runs the REAL <see cref="PreTradeRiskService.EvaluateGate"/>
+	/// on that state, then rolls back. The engine is SQL Server exactly as in Step 1, so only the LOGIC differs.
+	/// </summary>
+	private async Task<PreTradeRiskResult> EvaluateGateOnSqlServerAsync(SqlConnection connection, GateVector vector)
+	{
+		await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(CancellationToken);
+		var (portfolioId, securityId) = await SeedSqlServerScenarioAsync(connection, transaction, vector);
+		var inputs = await ReadSqlServerGateStateAsync(connection, transaction, portfolioId, securityId, vector);
+		var result = PreTradeRiskService.EvaluateGate(in inputs);
+		await transaction.RollbackAsync(CancellationToken);
+		return result;
+	}
+
+	/// <summary>
+	/// Reads, FROM SQL SERVER, exactly the state <see cref="PreTradeRiskService.EvaluateGate"/> consumes:
+	/// the most-specific risklimits row (replicating the proc's <c>ORDER BY CASE ... effective_date DESC</c>),
+	/// the trailing-window order count, the current position qty, the existing gross notional / last trade
+	/// price (commission), and today's accepted volume. Each aggregate is read only when its ceiling is
+	/// enabled (present AND &gt; 0), mirroring ValidateAsync, and returns the assembled <see cref="GateInputs"/>.
+	/// </summary>
+	private async Task<GateInputs> ReadSqlServerGateStateAsync(SqlConnection connection, SqlTransaction transaction, int portfolioId, int securityId, GateVector vector)
+	{
+		decimal? maxOrderPrice = null, maxOrderQty = null, maxOrderValue = null, maxPositionSize = null, maxDailyVolume = null, maxCommissionTotal = null, commissionRate = null;
+		int? maxOrderFreqCount = null, maxOrderFreqWindowSec = null;
+
+		await using (var command = new SqlCommand(
+			"SELECT TOP (1) max_order_price, max_order_qty, max_order_value, max_position_size, max_daily_volume, " +
+			"max_order_freq_count, max_order_freq_window_sec, max_commission_total, commission_rate " +
+			"FROM dbo.RiskLimits WHERE is_active = 1 " +
+			"AND (portfolio_id = @portfolio_id OR portfolio_id IS NULL) " +
+			"AND (security_id = @security_id OR security_id IS NULL) " +
+			"ORDER BY CASE WHEN portfolio_id IS NOT NULL AND security_id IS NOT NULL THEN 0 WHEN portfolio_id IS NOT NULL THEN 1 ELSE 2 END, effective_date DESC",
+			connection, transaction))
+		{
+			command.Parameters.Add(SqlP("@portfolio_id", SqlDbType.Int, portfolioId));
+			command.Parameters.Add(SqlP("@security_id", SqlDbType.Int, securityId));
+			await using var reader = await command.ExecuteReaderAsync(CancellationToken);
+			if (await reader.ReadAsync(CancellationToken))
+			{
+				maxOrderPrice = reader.IsDBNull(0) ? null : reader.GetDecimal(0);
+				maxOrderQty = reader.IsDBNull(1) ? null : reader.GetDecimal(1);
+				maxOrderValue = reader.IsDBNull(2) ? null : reader.GetDecimal(2);
+				maxPositionSize = reader.IsDBNull(3) ? null : reader.GetDecimal(3);
+				maxDailyVolume = reader.IsDBNull(4) ? null : reader.GetDecimal(4);
+				maxOrderFreqCount = reader.IsDBNull(5) ? null : reader.GetInt32(5);
+				maxOrderFreqWindowSec = reader.IsDBNull(6) ? null : reader.GetInt32(6);
+				maxCommissionTotal = reader.IsDBNull(7) ? null : reader.GetDecimal(7);
+				commissionRate = reader.IsDBNull(8) ? null : reader.GetDecimal(8);
+			}
+		}
+
+		// Enabled = present AND > 0 (canonical NULL-or-0 = unlimited); reads are skipped for disabled ceilings.
+		var frequencyEnabled = maxOrderFreqCount is > 0 && maxOrderFreqWindowSec is > 0;
+		var positionEnabled = maxPositionSize is > 0m;
+		var commissionEnabled = maxCommissionTotal is > 0m;
+		var dailyEnabled = maxDailyVolume is > 0m;
+
+		long recentOrderCount = 0;
+		if (frequencyEnabled)
+		{
+			await using var command = new SqlCommand(
+				"SELECT COUNT(*) FROM dbo.Orders WHERE portfolio_id = @portfolio_id " +
+				"AND submitted_date >= DATEADD(SECOND, -@window, SYSUTCDATETIME())", connection, transaction);
+			command.Parameters.Add(SqlP("@portfolio_id", SqlDbType.Int, portfolioId));
+			command.Parameters.Add(SqlP("@window", SqlDbType.Int, maxOrderFreqWindowSec.Value));
+			recentOrderCount = Convert.ToInt64(await command.ExecuteScalarAsync(CancellationToken));
+		}
+
+		decimal currentPositionQty = 0m;
+		if (positionEnabled)
+		{
+			await using var command = new SqlCommand(
+				"SELECT qty FROM dbo.Positions WHERE portfolio_id = @portfolio_id AND security_id = @security_id", connection, transaction);
+			command.Parameters.Add(SqlP("@portfolio_id", SqlDbType.Int, portfolioId));
+			command.Parameters.Add(SqlP("@security_id", SqlDbType.Int, securityId));
+			var scalar = await command.ExecuteScalarAsync(CancellationToken);
+			if (scalar is not null and not DBNull)
+				currentPositionQty = (decimal)scalar;
+		}
+
+		decimal existingGrossNotional = 0m;
+		decimal? lastTradePrice = null;
+		if (commissionEnabled)
+		{
+			// Market order (no price) falls back to the security's most recent trade price, as the proc did.
+			if (vector.Price is null)
+			{
+				await using var command = new SqlCommand(
+					"SELECT TOP (1) t.price FROM dbo.Trades t JOIN dbo.Orders o ON o.order_id = t.order_id " +
+					"WHERE o.security_id = @security_id ORDER BY t.executed_date DESC", connection, transaction);
+				command.Parameters.Add(SqlP("@security_id", SqlDbType.Int, securityId));
+				var scalar = await command.ExecuteScalarAsync(CancellationToken);
+				if (scalar is not null and not DBNull)
+					lastTradePrice = (decimal)scalar;
+			}
+
+			// Existing gross notional the retired proc's own way (SUM of trade qty*price); 0 for a fresh portfolio.
+			await using (var command = new SqlCommand(
+				"SELECT SUM(t.qty * t.price) FROM dbo.Trades t JOIN dbo.Orders o ON o.order_id = t.order_id " +
+				"WHERE o.portfolio_id = @portfolio_id", connection, transaction))
+			{
+				command.Parameters.Add(SqlP("@portfolio_id", SqlDbType.Int, portfolioId));
+				var scalar = await command.ExecuteScalarAsync(CancellationToken);
+				if (scalar is not null and not DBNull)
+					existingGrossNotional = (decimal)scalar;
+			}
+		}
+
+		decimal todayVolume = 0m;
+		if (dailyEnabled)
+		{
+			await using var command = new SqlCommand(
+				"SELECT SUM(qty) FROM dbo.Orders WHERE portfolio_id = @portfolio_id AND security_id = @security_id " +
+				"AND status IN ('ACCEPTED','FILLED','PARTFILLED') AND CAST(submitted_date AS DATE) = CAST(SYSUTCDATETIME() AS DATE)", connection, transaction);
+			command.Parameters.Add(SqlP("@portfolio_id", SqlDbType.Int, portfolioId));
+			command.Parameters.Add(SqlP("@security_id", SqlDbType.Int, securityId));
+			var scalar = await command.ExecuteScalarAsync(CancellationToken);
+			if (scalar is not null and not DBNull)
+				todayVolume = (decimal)scalar;
+		}
+
+		return new GateInputs
+		{
+			Side = vector.Side,
+			Qty = vector.Qty,
+			Price = vector.Price,
+			MaxOrderPrice = maxOrderPrice,
+			MaxOrderQty = maxOrderQty,
+			MaxOrderValue = maxOrderValue,
+			MaxPositionSize = maxPositionSize,
+			MaxDailyVolume = maxDailyVolume,
+			MaxOrderFreqCount = maxOrderFreqCount,
+			MaxOrderFreqWindowSec = maxOrderFreqWindowSec,
+			MaxCommissionTotal = maxCommissionTotal,
+			CommissionRate = commissionRate,
+			RecentOrderCount = recentOrderCount,
+			CurrentPositionQty = currentPositionQty,
+			ExistingGrossNotional = existingGrossNotional,
+			LastTradePrice = lastTradePrice,
+			TodayVolume = todayVolume,
+		};
+	}
+
+	/// <summary>Seeds a fresh portfolio + security, the vector's risklimits row (portfolio-scoped), and any
+	/// recent PENDING orders (frequency) / today ACCEPTED order (daily volume) the vector requires. The
+	/// prospective order is NOT seeded - both engines read state and decide on the prospective separately.</summary>
+	private async Task<(int PortfolioId, int SecurityId)> SeedSqlServerScenarioAsync(SqlConnection connection, SqlTransaction transaction, GateVector vector)
+	{
+		var suffix = Guid.NewGuid().ToString("N");
+		var portfolioId = await SqlInsertPortfolioAsync(connection, transaction, "PARITY_" + suffix);
+		var securityId = await SqlInsertSecurityAsync(connection, transaction, "SEC_" + suffix);
+		await SqlInsertRiskLimitsAsync(connection, transaction, portfolioId, null, vector);
+		for (var i = 0; i < vector.SeedRecentOrderCount; i++)
+			await SqlSeedOrderAsync(connection, transaction, portfolioId, securityId, "B", 1m, 1.00m, "PENDING");
+		if (vector.SeedTodayAcceptedQty > 0m)
+			await SqlSeedOrderAsync(connection, transaction, portfolioId, securityId, "B", vector.SeedTodayAcceptedQty, 1.00m, "ACCEPTED");
+		return (portfolioId, securityId);
+	}
+
+	private async Task<int> SqlInsertPortfolioAsync(SqlConnection connection, SqlTransaction transaction, string name)
+	{
+		await using var command = new SqlCommand(
+			"INSERT INTO dbo.Portfolios (name) OUTPUT INSERTED.portfolio_id VALUES (@name)", connection, transaction);
+		command.Parameters.Add(SqlP("@name", SqlDbType.NVarChar, name));
+		return (int)await command.ExecuteScalarAsync(CancellationToken);
+	}
+
+	private async Task<int> SqlInsertSecurityAsync(SqlConnection connection, SqlTransaction transaction, string code)
+	{
+		await using var command = new SqlCommand(
+			"INSERT INTO dbo.Securities (security_code) OUTPUT INSERTED.security_id VALUES (@code)", connection, transaction);
+		command.Parameters.Add(SqlP("@code", SqlDbType.NVarChar, code));
+		return (int)await command.ExecuteScalarAsync(CancellationToken);
+	}
+
+	/// <summary>Inserts one risklimits row from the vector's limit fields (commission_rate always supplied,
+	/// since the column is NOT NULL). Decimal parameters carry explicit NUMERIC precision/scale so SQL Server
+	/// does not silently truncate to scale 0.</summary>
+	private async Task SqlInsertRiskLimitsAsync(SqlConnection connection, SqlTransaction transaction, int portfolioId, int? securityId, GateVector vector)
+	{
+		await using var command = new SqlCommand(
+			"INSERT INTO dbo.RiskLimits (portfolio_id, security_id, max_order_price, max_order_qty, max_order_value, " +
+			"max_position_size, max_daily_volume, max_order_freq_count, max_order_freq_window_sec, max_commission_total, commission_rate) " +
+			"VALUES (@portfolio_id, @security_id, @max_order_price, @max_order_qty, @max_order_value, " +
+			"@max_position_size, @max_daily_volume, @max_order_freq_count, @max_order_freq_window_sec, @max_commission_total, @commission_rate)",
+			connection, transaction);
+		command.Parameters.Add(SqlP("@portfolio_id", SqlDbType.Int, portfolioId));
+		command.Parameters.Add(SqlP("@security_id", SqlDbType.Int, securityId));
+		command.Parameters.Add(SqlDec("@max_order_price", vector.MaxOrderPrice));
+		command.Parameters.Add(SqlDec("@max_order_qty", vector.MaxOrderQty));
+		command.Parameters.Add(SqlDec("@max_order_value", vector.MaxOrderValue));
+		command.Parameters.Add(SqlDec("@max_position_size", vector.MaxPositionSize));
+		command.Parameters.Add(SqlDec("@max_daily_volume", vector.MaxDailyVolume));
+		command.Parameters.Add(SqlP("@max_order_freq_count", SqlDbType.Int, vector.MaxOrderFreqCount));
+		command.Parameters.Add(SqlP("@max_order_freq_window_sec", SqlDbType.Int, vector.MaxOrderFreqWindowSec));
+		command.Parameters.Add(SqlDec("@max_commission_total", vector.MaxCommissionTotal));
+		command.Parameters.Add(SqlDec("@commission_rate", vector.CommissionRate ?? 0.0005m, 9, 6));
+		await command.ExecuteNonQueryAsync(CancellationToken);
+	}
+
+	private async Task SqlSeedOrderAsync(SqlConnection connection, SqlTransaction transaction, int portfolioId, int securityId, string side, decimal qty, decimal? price, string status)
+	{
+		await using var command = new SqlCommand(
+			"INSERT INTO dbo.Orders (portfolio_id, security_id, side, qty, price, order_type, status) " +
+			"VALUES (@portfolio_id, @security_id, @side, @qty, @price, @order_type, @status)", connection, transaction);
+		command.Parameters.Add(SqlP("@portfolio_id", SqlDbType.Int, portfolioId));
+		command.Parameters.Add(SqlP("@security_id", SqlDbType.Int, securityId));
+		command.Parameters.Add(SqlP("@side", SqlDbType.VarChar, side));
+		command.Parameters.Add(SqlDec("@qty", qty));
+		command.Parameters.Add(SqlDec("@price", price));
+		command.Parameters.Add(SqlP("@order_type", SqlDbType.VarChar, price is null ? "MARKET" : "LIMIT"));
+		command.Parameters.Add(SqlP("@status", SqlDbType.VarChar, status));
+		await command.ExecuteNonQueryAsync(CancellationToken);
+	}
+
+	/// <summary>Builds a SQL Server parameter, mapping a null value (including a null nullable) to DBNull.</summary>
+	private static SqlParameter SqlP(string name, SqlDbType type, object value)
+		=> new(name, type) { Value = value ?? DBNull.Value };
+
+	/// <summary>Builds a decimal SQL Server parameter with explicit NUMERIC precision/scale (default 18,4;
+	/// 9,6 for the commission rate) so the value is never truncated to scale 0.</summary>
+	private static SqlParameter SqlDec(string name, object value, byte precision = 18, byte scale = 4)
+		=> new(name, SqlDbType.Decimal) { Precision = precision, Scale = scale, Value = value ?? DBNull.Value };
+
+	// --- PostgreSQL engine helpers (Step 3 real ValidateAsync + self-contained seeding) ---
+
+	/// <summary>STEP 3 per-vector: seeds the scenario in a transaction and runs the REAL, database-state-aware
+	/// <see cref="PreTradeRiskService.ValidateAsync"/> on PostgreSQL for the prospective order, then rolls back.</summary>
+	private async Task<PreTradeRiskResult> ValidateAsyncOnPostgresAsync(NpgsqlConnection connection, GateVector vector)
+	{
+		await using var transaction = await connection.BeginTransactionAsync(CancellationToken);
+		var (portfolioId, securityId) = await SeedPostgresScenarioAsync(connection, transaction, vector);
+		var result = await new PreTradeRiskService()
+			.ValidateAsync(connection, transaction, portfolioId, securityId, vector.Side, vector.Qty, vector.Price, CancellationToken);
+		await transaction.RollbackAsync(CancellationToken);
+		return result;
+	}
+
+	/// <summary>PostgreSQL counterpart of <see cref="SeedSqlServerScenarioAsync"/>: identical seed shape,
+	/// Postgres dialect.</summary>
+	private async Task<(int PortfolioId, int SecurityId)> SeedPostgresScenarioAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, GateVector vector)
+	{
+		var suffix = Guid.NewGuid().ToString("N");
+		var portfolioId = await InsertPortfolioAsync(connection, transaction, "PARITY_" + suffix);
+		var securityId = await InsertSecurityAsync(connection, transaction, "SEC_" + suffix);
+		await PgInsertRiskLimitsAsync(connection, transaction, portfolioId, null, vector);
+		for (var i = 0; i < vector.SeedRecentOrderCount; i++)
+			await PgSeedOrderAsync(connection, transaction, portfolioId, securityId, "B", 1m, 1.00m, "PENDING");
+		if (vector.SeedTodayAcceptedQty > 0m)
+			await PgSeedOrderAsync(connection, transaction, portfolioId, securityId, "B", vector.SeedTodayAcceptedQty, 1.00m, "ACCEPTED");
+		return (portfolioId, securityId);
+	}
+
+	private async Task PgInsertRiskLimitsAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, int portfolioId, int? securityId, GateVector vector)
+	{
+		await using var command = new NpgsqlCommand(
+			"INSERT INTO risklimits (portfolio_id, security_id, max_order_price, max_order_qty, max_order_value, " +
+			"max_position_size, max_daily_volume, max_order_freq_count, max_order_freq_window_sec, max_commission_total, commission_rate) " +
+			"VALUES (@portfolio_id, @security_id, @max_order_price, @max_order_qty, @max_order_value, " +
+			"@max_position_size, @max_daily_volume, @max_order_freq_count, @max_order_freq_window_sec, @max_commission_total, @commission_rate)",
+			connection, transaction);
+		command.Parameters.Add(PgP("portfolio_id", NpgsqlDbType.Integer, portfolioId));
+		command.Parameters.Add(PgP("security_id", NpgsqlDbType.Integer, securityId));
+		command.Parameters.Add(PgP("max_order_price", NpgsqlDbType.Numeric, vector.MaxOrderPrice));
+		command.Parameters.Add(PgP("max_order_qty", NpgsqlDbType.Numeric, vector.MaxOrderQty));
+		command.Parameters.Add(PgP("max_order_value", NpgsqlDbType.Numeric, vector.MaxOrderValue));
+		command.Parameters.Add(PgP("max_position_size", NpgsqlDbType.Numeric, vector.MaxPositionSize));
+		command.Parameters.Add(PgP("max_daily_volume", NpgsqlDbType.Numeric, vector.MaxDailyVolume));
+		command.Parameters.Add(PgP("max_order_freq_count", NpgsqlDbType.Integer, vector.MaxOrderFreqCount));
+		command.Parameters.Add(PgP("max_order_freq_window_sec", NpgsqlDbType.Integer, vector.MaxOrderFreqWindowSec));
+		command.Parameters.Add(PgP("max_commission_total", NpgsqlDbType.Numeric, vector.MaxCommissionTotal));
+		command.Parameters.Add(PgP("commission_rate", NpgsqlDbType.Numeric, vector.CommissionRate ?? 0.0005m));
+		await command.ExecuteNonQueryAsync(CancellationToken);
+	}
+
+	/// <summary>Inserts a price-only risklimits row for the given (nullable) portfolio/security scope, used
+	/// by the most-specific-selection test.</summary>
+	private async Task PgInsertPriceLimitAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, int? portfolioId, int? securityId, decimal maxOrderPrice)
+	{
+		await using var command = new NpgsqlCommand(
+			"INSERT INTO risklimits (portfolio_id, security_id, max_order_price, commission_rate) " +
+			"VALUES (@portfolio_id, @security_id, @max_order_price, 0.0005)", connection, transaction);
+		command.Parameters.Add(PgP("portfolio_id", NpgsqlDbType.Integer, portfolioId));
+		command.Parameters.Add(PgP("security_id", NpgsqlDbType.Integer, securityId));
+		command.Parameters.Add(PgP("max_order_price", NpgsqlDbType.Numeric, maxOrderPrice));
+		await command.ExecuteNonQueryAsync(CancellationToken);
+	}
+
+	/// <summary>Inserts a portfolio-only price-limit row whose effective_date is <paramref name="ageDays"/>
+	/// days in the past (via a SQL-side interval so no client DateTime-kind conversion is needed), used by
+	/// the effective_date tie-break test.</summary>
+	private async Task PgInsertPriceLimitWithAgeAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, int portfolioId, decimal maxOrderPrice, int ageDays)
+	{
+		await using var command = new NpgsqlCommand(
+			"INSERT INTO risklimits (portfolio_id, max_order_price, commission_rate, effective_date) " +
+			"VALUES (@portfolio_id, @max_order_price, 0.0005, (now() at time zone 'utc') - make_interval(days => @age))", connection, transaction);
+		command.Parameters.Add(PgP("portfolio_id", NpgsqlDbType.Integer, portfolioId));
+		command.Parameters.Add(PgP("max_order_price", NpgsqlDbType.Numeric, maxOrderPrice));
+		command.Parameters.Add(PgP("age", NpgsqlDbType.Integer, ageDays));
+		await command.ExecuteNonQueryAsync(CancellationToken);
+	}
+
+	private async Task PgSeedOrderAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, int portfolioId, int securityId, string side, decimal qty, decimal? price, string status)
+	{
+		await using var command = new NpgsqlCommand(
+			"INSERT INTO orders (portfolio_id, security_id, side, qty, price, order_type, status) " +
+			"VALUES (@portfolio_id, @security_id, @side, @qty, @price, @order_type, @status)", connection, transaction);
+		command.Parameters.Add(PgP("portfolio_id", NpgsqlDbType.Integer, portfolioId));
+		command.Parameters.Add(PgP("security_id", NpgsqlDbType.Integer, securityId));
+		command.Parameters.Add(PgP("side", NpgsqlDbType.Varchar, side));
+		command.Parameters.Add(PgP("qty", NpgsqlDbType.Numeric, qty));
+		command.Parameters.Add(PgP("price", NpgsqlDbType.Numeric, price));
+		command.Parameters.Add(PgP("order_type", NpgsqlDbType.Varchar, price is null ? "MARKET" : "LIMIT"));
+		command.Parameters.Add(PgP("status", NpgsqlDbType.Varchar, status));
+		await command.ExecuteNonQueryAsync(CancellationToken);
+	}
+
+	/// <summary>Builds a Npgsql parameter, mapping a null value (including a null nullable) to DBNull.</summary>
+	private static NpgsqlParameter PgP(string name, NpgsqlDbType type, object value)
+		=> new(name, type) { Value = value ?? DBNull.Value };
+
+	// --- Preserved PostgreSQL seed helpers (unchanged from the original Phase G) ---
 
 	/// <summary>Inserts a portfolio with the given unique name and returns its generated id.</summary>
 	private async Task<int> InsertPortfolioAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, string name)
@@ -764,7 +1520,7 @@ public class PreTradeRiskParityTests : BaseTestClass
 
 	/// <summary>
 	/// Seeds the portfolio-scoped DEMO risklimits row (security_id left NULL). Mirrors the seeded values
-	/// in <c>Database/004_SeedData.sql</c> — especially <c>max_order_price = 500.00</c> — so the guarded
+	/// in <c>Database/004_SeedData.sql</c> - especially <c>max_order_price = 500.00</c> - so the guarded
 	/// scenarios reproduce the demo's accept/reject outcomes. <c>is_active</c> and <c>effective_date</c>
 	/// take their schema defaults (TRUE / now() at time zone 'utc').
 	/// </summary>
