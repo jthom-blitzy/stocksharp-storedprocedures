@@ -1,8 +1,17 @@
 ﻿namespace StockSharp.Tests;
 
+using System.Data;
+
+using Microsoft.Data.SqlClient;
+
 using StockSharp.Algo.Commissions;
+using StockSharp.Algo.Risk;
+using StockSharp.Algo.Storages.Sql;
 
 [TestClass]
+[DoNotParallelize] // The Live_* commission tests open real StockSharpLegacy transactions that hold locks
+                   // on the shared Orders/Trades/RiskLimits tables; running them concurrently would
+                   // deadlock. This follows the repo convention (see StorageNotParallelizeTests).
 public class CommissionTests
 {
 	private static DateTime Inc(ref DateTime time)
@@ -235,79 +244,223 @@ public class CommissionTests
 		result.AssertNull();
 	}
 
-	[TestMethod]
-	public void EstimateVsActualCommissionDivergence()
+	// =====================================================================================
+	// Different-by-design commission pair (AAP 0.6.2, LEGACY_LAYER.md:L58-L59).
+	//
+	// These two tests replace an earlier pair that asserted an inline-computed "SQL estimate" against
+	// itself (M14). They now source the pre-fill ESTIMATE from the REAL per-order gate
+	// PreTradeRiskService.ValidateAsync against the StockSharpLegacy SQL Server, and compare it
+	// INDEPENDENTLY against the REAL post-fill actual-commission rule RiskOrderCommissionRule. Both
+	// enforcement patterns consume the single canonical threshold RiskLimitSet.MaxCommissionTotal, yet
+	// because the gate PROJECTS an estimate from historical traded notional x rate before any fill while
+	// the risk rule ACCUMULATES the broker-reported ExecutionMessage.Commission after fills, the two are
+	// intentionally not merged under DRY. Gated on DB reachability via Assert.Inconclusive.
+	// =====================================================================================
+
+	private static async Task<SqlConnection> TryOpenLegacyAsync(CancellationToken cancellationToken = default)
 	{
-		var now = DateTime.UtcNow;
+		SqlConnection connection = null;
 
-		// Canonical shared commission rate (RiskLimits.commission_rate seed = 0.0005;
-		// AAP 0.6.2 / LEGACY_LAYER.md:L63). The SQL pre-trade gate ESTIMATES commission
-		// pre-fill as qty * estPrice * rate; the C# side computes the ACTUAL commission
-		// post-fill from the executed trade. Same rate, different price basis => they do
-		// NOT agree. This is intentional (different-by-design), not a regression.
-		const decimal rate = 0.0005m;
+		try
+		{
+			connection = new SqlConnection(SqlLegacyConnection.Resolve());
+			await connection.OpenAsync(cancellationToken);
+			return connection;
+		}
+		catch (Exception)
+		{
+			if (connection is not null)
+				await connection.DisposeAsync();
 
-		const decimal orderVolume = 1000m;
-		const decimal estPrice = 100m;   // price known pre-fill (order/estimate price)
-		const decimal fillPrice = 105m;  // actual execution price (differs from estimate)
+			return null;
+		}
+	}
 
-		// SQL-style PRE-FILL ESTIMATE for a fresh position (existingNotional = 0):
-		//   estimate = existingNotional*rate + qty*estPrice*rate  =>  qty*estPrice*rate
-		var estimate = orderVolume * estPrice * rate;                // 1000 * 100 * 0.0005 = 50
+	private static SqlParameter IntParam(string name, int value) => new(name, SqlDbType.Int) { Value = value };
 
-		// C#-style ACTUAL POST-FILL commission basis, computed off the executed trade
-		// via the (unchanged) CommissionTradePriceRule: TradePrice * TradeVolume * rate.
-		var actualRule = new CommissionTradePriceRule { Value = rate };
-		var actual = actualRule.Process(CreateTradeMessage(fillPrice, orderVolume, Inc(ref now)));
-		actual.AssertEqual(orderVolume * fillPrice * rate);          // 1000 * 105 * 0.0005 = 52.5
+	private static SqlParameter NInt(string name, int? value) => new(name, SqlDbType.Int) { Value = (object)value ?? DBNull.Value };
 
-		// DIFFERENT-BY-DESIGN: with fillPrice != estPrice the two DO NOT agree.
-		(actual != estimate).AssertTrue();                           // 52.5 != 50
+	private static SqlParameter MoneyParam(string name, decimal? value)
+		=> new(name, SqlDbType.Decimal) { Precision = 18, Scale = 4, Value = (object)value ?? DBNull.Value };
 
-		// SHARED CANONICAL THRESHOLD: when the fill matches the estimate price, the single
-		// shared rate makes the two agree exactly (proving they diverge only on price basis,
-		// not on the threshold/rate).
-		var actualAtEstPrice = new CommissionTradePriceRule { Value = rate }
-			.Process(CreateTradeMessage(estPrice, orderVolume, Inc(ref now)));
-		actualAtEstPrice.AssertEqual(estimate);                      // 1000 * 100 * 0.0005 = 50
+	private static async Task<(int PortfolioId, int SecurityId)> InsertScopeAsync(SqlConnection c, SqlTransaction t, CancellationToken ct)
+	{
+		var tag = Guid.NewGuid().ToString("N");
+		int portfolioId;
+		int securityId;
+
+		await using (var cmd = new SqlCommand("INSERT INTO dbo.Portfolios (name) OUTPUT INSERTED.portfolio_id VALUES (@n)", c, t))
+		{
+			cmd.Parameters.Add(new SqlParameter("@n", SqlDbType.NVarChar, 100) { Value = "TEST_" + tag });
+			portfolioId = (int)await cmd.ExecuteScalarAsync(ct);
+		}
+
+		await using (var cmd = new SqlCommand("INSERT INTO dbo.Securities (security_code, board_code) OUTPUT INSERTED.security_id VALUES (@c, @b)", c, t))
+		{
+			cmd.Parameters.Add(new SqlParameter("@c", SqlDbType.NVarChar, 50) { Value = "T" + tag.Substring(0, 10) });
+			cmd.Parameters.Add(new SqlParameter("@b", SqlDbType.NVarChar, 20) { Value = "TB" + tag.Substring(0, 6) });
+			securityId = (int)await cmd.ExecuteScalarAsync(ct);
+		}
+
+		return (portfolioId, securityId);
+	}
+
+	// Inserts a RiskLimits row that enforces ONLY the commission ceiling (all other limits NULL), so the
+	// gate evaluates the commission check in isolation.
+	private static async Task InsertCommissionLimitAsync(SqlConnection c, SqlTransaction t, int portfolioId, int securityId, decimal maxCommission, decimal rate, CancellationToken ct)
+	{
+		await using var cmd = new SqlCommand(
+			"INSERT INTO dbo.RiskLimits (portfolio_id, security_id, max_commission_total, commission_rate, is_active, effective_date) " +
+			"VALUES (@p, @s, @comm, @rate, 1, SYSUTCDATETIME())", c, t);
+		cmd.Parameters.Add(NInt("@p", portfolioId));
+		cmd.Parameters.Add(NInt("@s", securityId));
+		cmd.Parameters.Add(MoneyParam("@comm", maxCommission));
+		cmd.Parameters.Add(new SqlParameter("@rate", SqlDbType.Decimal) { Precision = 9, Scale = 6, Value = rate });
+		await cmd.ExecuteNonQueryAsync(ct);
+	}
+
+	private static async Task<long> InsertOrderAsync(SqlConnection c, SqlTransaction t, int portfolioId, int securityId, char side, decimal qty, decimal price, CancellationToken ct)
+	{
+		await using var cmd = new SqlCommand(
+			"INSERT INTO dbo.Orders (portfolio_id, security_id, side, qty, price, order_type, status) " +
+			"OUTPUT INSERTED.order_id VALUES (@p, @s, @side, @qty, @price, 'LIMIT', 'ACCEPTED')", c, t);
+		cmd.Parameters.Add(IntParam("@p", portfolioId));
+		cmd.Parameters.Add(IntParam("@s", securityId));
+		cmd.Parameters.Add(new SqlParameter("@side", SqlDbType.Char, 1) { Value = side.ToString() });
+		cmd.Parameters.Add(MoneyParam("@qty", qty));
+		cmd.Parameters.Add(MoneyParam("@price", price));
+		return (long)await cmd.ExecuteScalarAsync(ct);
+	}
+
+	private static async Task InsertTradeAsync(SqlConnection c, SqlTransaction t, long orderId, decimal qty, decimal price, CancellationToken ct)
+	{
+		await using var cmd = new SqlCommand("INSERT INTO dbo.Trades (order_id, qty, price) VALUES (@o, @qty, @price)", c, t);
+		cmd.Parameters.Add(new SqlParameter("@o", SqlDbType.BigInt) { Value = orderId });
+		cmd.Parameters.Add(MoneyParam("@qty", qty));
+		cmd.Parameters.Add(MoneyParam("@price", price));
+		await cmd.ExecuteNonQueryAsync(ct);
+	}
+
+	// Seeds a scope whose HISTORICAL TRADED NOTIONAL is 20,000 while the net POSITION is flat (a buy and
+	// an offsetting sell, both 100 @ 100). This deliberately makes traded-notional (20,000) and
+	// position-notional (qty 0 x avg 0 = 0) disagree, so a commission estimate can prove which basis the
+	// gate uses. Returns the fresh (portfolioId, securityId).
+	private static async Task<(int PortfolioId, int SecurityId)> SeedFlatButHighTradedNotionalAsync(SqlConnection c, SqlTransaction t, CancellationToken ct)
+	{
+		var (portfolioId, securityId) = await InsertScopeAsync(c, t, ct);
+
+		var buy = await InsertOrderAsync(c, t, portfolioId, securityId, 'B', 100m, 100m, ct);
+		await InsertTradeAsync(c, t, buy, 100m, 100m, ct);          // traded notional 10,000
+
+		var sell = await InsertOrderAsync(c, t, portfolioId, securityId, 'S', 100m, 100m, ct);
+		await InsertTradeAsync(c, t, sell, 100m, 100m, ct);        // traded notional +10,000 = 20,000
+
+		return (portfolioId, securityId);
+	}
+
+	private async Task RunWithFreshScopeAsync(Func<PreTradeRiskService, SqlConnection, SqlTransaction, int, int, Task> body)
+	{
+		await using var connection = await TryOpenLegacyAsync();
+
+		if (connection is null)
+		{
+			Assert.Inconclusive("StockSharpLegacy SQL Server is not reachable; skipping live commission integration test.");
+			return;
+		}
+
+		await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(IsolationLevel.ReadCommitted);
+
+		try
+		{
+			var service = new PreTradeRiskService(SqlLegacyConnection.Resolve());
+			var (portfolioId, securityId) = await SeedFlatButHighTradedNotionalAsync(connection, transaction, default);
+			await body(service, connection, transaction, portfolioId, securityId);
+		}
+		finally
+		{
+			await transaction.RollbackAsync();
+		}
 	}
 
 	[TestMethod]
-	public void SqlPreFillCommissionEstimate()
-	{
-		var now = DateTime.UtcNow;
+	public Task Live_CommissionEstimateUsesTradedNotionalFromRealGate()
+		=> RunWithFreshScopeAsync(async (svc, c, t, pid, sid) =>
+		{
+			// Scope has 20,000 historical TRADED notional but a FLAT position. rate = 0.0005.
+			// The real gate estimate for a new Buy 10 @ 100 (order notional 1,000) is:
+			//   20,000 * 0.0005 + 1,000 * 0.0005 = 10 + 0.5 = 10.5   (TRADED-notional basis)
+			// If the gate had (wrongly) used the position quantity x average price (= 0), the estimate
+			// would be only 0.5. A limit of 5.0 sits between the two, so a REJECT here - with the 10.5000
+			// figure in the reason - proves the estimate is sourced from historical TRADED notional
+			// (correcting M14's misdescription) and comes from the real gate, not inline arithmetic.
+			await InsertCommissionLimitAsync(c, t, pid, sid, maxCommission: 5.0m, rate: 0.0005m, default);
 
-		// Documents the SQL pre-trade gate's PRE-FILL commission ESTIMATE formula from
-		// usp_ValidatePreTradeRisk (AAP 0.6.2): existingNotional*rate + qty*estPrice*rate.
-		// The gate must GUESS commission before the fill because the real commission is only
-		// known once the order executes. This is the SQL "estimate" half of the
-		// different-by-design divergence asserted in EstimateVsActualCommissionDivergence.
-		const decimal rate = 0.0005m;              // canonical shared rate (seed commission_rate)
+			var rejected = await svc.ValidateAsync(c, t, pid, sid, Sides.Buy, 10m, 100m, OrderTypes.Limit);
+			rejected.IsValid.AssertFalse();
+			rejected.RejectReason.AssertEqual("Estimated cumulative commission 10.5000 meets/exceeds limit 5.0000");
 
-		const decimal existingQty = 200m;          // shares already held
-		const decimal existingPrice = 90m;         // avg price of the existing position
-		const decimal orderQty = 1000m;            // new order quantity
-		const decimal estPrice = 100m;             // pre-fill estimate price for the new order
+			// Bracket the exact estimate: raising the ceiling just above 10.5 must ACCEPT (10.5 < 10.6).
+			await using (var raise = new SqlCommand("UPDATE dbo.RiskLimits SET max_commission_total = 10.6 WHERE portfolio_id = @p", c, t))
+			{
+				raise.Parameters.Add(IntParam("@p", pid));
+				await raise.ExecuteNonQueryAsync();
+			}
 
-		// Full SQL estimate: the existing position's notional is folded in at the same rate.
-		var existingNotional = existingQty * existingPrice;          // 200 * 90 = 18000
-		var estimate = existingNotional * rate + orderQty * estPrice * rate;
-		estimate.AssertEqual(59m);                                   // 18000*0.0005 + 100000*0.0005 = 9 + 50 = 59
+			var accepted = await svc.ValidateAsync(c, t, pid, sid, Sides.Buy, 10m, 100m, OrderTypes.Limit);
+			accepted.IsValid.AssertTrue();
+			accepted.RejectReason.AssertNull();
+		});
 
-		// The C# ACTUAL commission is unknowable pre-fill: the trade-based rule returns null
-		// for an ORDER message (no trade has executed yet) - which is exactly why SQL estimates.
-		var actualRule = new CommissionTradePriceRule { Value = rate };
-		var preFill = actualRule.Process(CreateOrderMessage(estPrice, orderQty, Inc(ref now)));
-		preFill.AssertNull();
+	[TestMethod]
+	public Task Live_CommissionEstimateVsActualCommissionRuleDifferByDesign()
+		=> RunWithFreshScopeAsync(async (svc, c, t, pid, sid) =>
+		{
+			// SHARED canonical threshold for BOTH enforcement patterns.
+			const decimal canonicalLimit = 10.0m;
 
-		// Even when the fill lands EXACTLY at the estimate price, the ACTUAL reflects ONLY the
-		// executed trade's notional (orderQty * fillPrice * rate) and never the pre-existing
-		// position that the SQL estimate folded in - so estimate != actual by design.
-		const decimal fillPrice = 100m;
-		var actual = actualRule.Process(CreateTradeMessage(fillPrice, orderQty, Inc(ref now)));
-		actual.AssertEqual(orderQty * fillPrice * rate);             // 1000 * 100 * 0.0005 = 50
-		(actual != estimate).AssertTrue();                           // 50 != 59
-	}
+			// (1) PRE-FILL ESTIMATE from the REAL gate: 20,000*0.0005 + 10*100*0.0005 = 10.5 >= 10.0,
+			// so the gate REJECTS the order before any fill exists.
+			await InsertCommissionLimitAsync(c, t, pid, sid, maxCommission: canonicalLimit, rate: 0.0005m, default);
+
+			var gate = await svc.ValidateAsync(c, t, pid, sid, Sides.Buy, 10m, 100m, OrderTypes.Limit);
+			gate.IsValid.AssertFalse();
+			gate.RejectReason.AssertEqual("Estimated cumulative commission 10.5000 meets/exceeds limit 10.0000");
+
+			// (2) POST-FILL ACTUAL from the REAL RiskOrderCommissionRule sharing the SAME threshold.
+			// The broker reports the real commission on the executed order as 4.0 (NOT the 10.5 estimate).
+			var actualRule = new RiskOrderCommissionRule
+			{
+				Commission = canonicalLimit,
+				Action = RiskActions.StopTrading,
+			};
+
+			var fill1 = new ExecutionMessage
+			{
+				DataTypeEx = DataType.Transactions,
+				SecurityId = Helper.CreateSecurityId(),
+				ServerTime = DateTime.UtcNow,
+				HasOrderInfo = true,
+				Commission = 4.0m,
+			};
+
+			// DIFFERENT-BY-DESIGN: for the identical threshold (10.0) the gate rejects (estimate 10.5)
+			// yet the actual rule does NOT trip (realized 4.0 < 10.0). The two disagree by construction
+			// because one projects an estimate and the other measures the realized total.
+			actualRule.ProcessMessage(fill1).AssertFalse();
+
+			// SINGLE SOURCE OF TRUTH: the actual rule still enforces the SAME canonical ceiling - once the
+			// realized commission reaches it (4.0 + 6.5 = 10.5 >= 10.0) the rule trips.
+			var fill2 = new ExecutionMessage
+			{
+				DataTypeEx = DataType.Transactions,
+				SecurityId = Helper.CreateSecurityId(),
+				ServerTime = DateTime.UtcNow,
+				HasOrderInfo = true,
+				Commission = 6.5m,
+			};
+
+			actualRule.ProcessMessage(fill2).AssertTrue();
+		});
 
 	[TestMethod]
 	public void SecurityIdRule()

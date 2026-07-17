@@ -1,14 +1,33 @@
 ﻿namespace StockSharp.Tests;
 
-using StockSharp.Algo.Risk;
+using System.Data;
 
-// Characterization + parity tests for the pure, database-free core of the per-order pre-trade gate
-// PreTradeRiskService.Evaluate. Each test pins one of the seven checks ported from the SQL
-// dbo.usp_ValidatePreTradeRisk (Database/002_StoredProcedures.sql) to the DEMO seed values
-// (Database/004_SeedData.sql) so every reject string matches the SQL CONVERT(VARCHAR, ...) output
-// byte-for-byte. There is no SQL Server and no gateway here: Evaluate is intentionally pure, which
-// is exactly what makes these unit tests fast and deterministic (AAP data-locality split, 0.6.7).
+using Microsoft.Data.SqlClient;
+
+using StockSharp.Algo.Risk;
+using StockSharp.Algo.Storages.Sql;
+
+// This suite exercises the per-order pre-trade gate PreTradeRiskService at two layers:
+//
+//  (1) Pure decision-core UNIT tests of the database-free PreTradeRiskService.Evaluate. Each test
+//      pins one of the seven checks ported from dbo.usp_ValidatePreTradeRisk
+//      (Database/002_StoredProcedures.sql) to the DEMO seed values (Database/004_SeedData.sql) so
+//      every reject string matches the SQL CONVERT(VARCHAR, ...) output byte-for-byte. Evaluate is
+//      intentionally pure, which is what makes these fast and deterministic (AAP data-locality split,
+//      0.6.7). These are unit tests of the decision logic - NOT live characterization.
+//
+//  (2) Live INTEGRATION + characterization/parity tests (the "Live_*" methods) that exercise the real
+//      ValidateAsync query path against the StockSharpLegacy SQL Server: they load dbo.RiskLimits and
+//      query dbo.Orders/dbo.Positions/dbo.Trades through the actual ADO.NET commands and parameter
+//      metadata, then assert the outcome equals the legacy oracle captured (via the original
+//      dbo.usp_ValidatePreTradeRisk) BEFORE the SQL layer was reduced to pure CRUD. Every live test
+//      runs inside a transaction that is ROLLED BACK, so it uses fresh, collision-free scope rows and
+//      leaves the database pristine. The whole live layer is gated on database reachability: when the
+//      Docker SQL Server is absent the tests report Inconclusive rather than fail (AAP 0.6.7).
 [TestClass]
+[DoNotParallelize] // The Live_* tests open real StockSharpLegacy transactions that hold locks on the
+                   // shared Portfolios/Securities/RiskLimits/Orders tables; running them concurrently
+                   // would deadlock. This follows the repo convention (see StorageNotParallelizeTests).
 public class PreTradeRiskServiceTests : BaseTestClass
 {
 	// Canonical DEMO seed (Database/004_SeedData.sql), portfolio-wide (SecurityId null). Every
@@ -99,6 +118,30 @@ public class PreTradeRiskServiceTests : BaseTestClass
 
 		negative.IsValid.AssertFalse();
 		negative.RejectReason.AssertEqual("Invalid qty");
+	}
+
+	// ---- Task 4b : DECIMAL(18,4) parity - a sub-tick quantity rounds to the persisted scale (C02) ----
+	// The legacy gate's @qty parameter is DECIMAL(18,4); a value below half a tick is rounded to 0.0000
+	// at the parameter boundary and rejected as "Invalid qty". The C# gate must coerce identically before
+	// its zero-guard rather than evaluating the raw high-precision decimal. Both boundary values below were
+	// captured directly from the live dbo.usp_ValidatePreTradeRisk proc (round-half-away-from-zero):
+	//   qty = 0.00004 -> rounds to 0.0000 -> is_valid = 0, reject_reason = "Invalid qty"
+	//   qty = 0.00005 -> rounds to 0.0001 -> is_valid = 1, reject_reason = NULL (accepted)
+	[TestMethod]
+	public void SubTickQtyMatchesDecimalScale()
+	{
+		// Below half a tick: rounds down to zero and is rejected, exactly like the SQL DECIMAL(18,4) coercion.
+		var rejected = PreTradeRiskService.Evaluate(SeedLimits(), new PreTradeState(), Sides.Buy, 0.00004m, 150m);
+
+		rejected.IsValid.AssertFalse();
+		rejected.RejectReason.AssertEqual("Invalid qty");
+
+		// At/above half a tick: rounds up to the smallest representable quantity (0.0001) and survives the
+		// preamble; with a compliant price every downstream check passes, so the order is accepted.
+		var accepted = PreTradeRiskService.Evaluate(SeedLimits(), new PreTradeState(), Sides.Buy, 0.00005m, 150m);
+
+		accepted.IsValid.AssertTrue();
+		accepted.RejectReason.AssertNull();
 	}
 
 	// ---- Task 5 : check 1 (order price ceiling) -------------------------------------------------
@@ -338,5 +381,482 @@ public class PreTradeRiskServiceTests : BaseTestClass
 		var sellUnder = PreTradeRiskService.Evaluate(PositionOnlyLimits(), new PreTradeState { CurrentPositionQty = 60000m }, Sides.Sell, 50000m, 1m);
 		sellUnder.IsValid.AssertTrue();
 		sellUnder.RejectReason.AssertNull();
+	}
+
+	// =====================================================================================
+	// Layer 2 - live integration + characterization/parity against the StockSharpLegacy DB.
+	// Every "Live_*" test below runs inside a rolled-back transaction over a fresh, unique
+	// (portfolio, security) scope, so it exercises the real ValidateAsync ADO.NET query path
+	// (parameter metadata, nullable scalars, the RiskLimits load and the Orders/Positions/Trades
+	// reads) yet leaves the shared database exactly as it found it. Reject strings are asserted
+	// against the legacy oracle captured from dbo.usp_ValidatePreTradeRisk BEFORE the SQL layer
+	// was reduced to CRUD, proving the C# gate reproduces the retired proc byte-for-byte.
+	// =====================================================================================
+
+	// Opens a connection to the StockSharpLegacy database, or returns null when it is unreachable
+	// so the live layer degrades to Inconclusive rather than a hard failure on a DB-less machine.
+	private static async Task<SqlConnection> TryOpenLegacyAsync(CancellationToken cancellationToken = default)
+	{
+		SqlConnection connection = null;
+
+		try
+		{
+			connection = new SqlConnection(SqlLegacyConnection.Resolve());
+			await connection.OpenAsync(cancellationToken);
+			return connection;
+		}
+		catch (Exception)
+		{
+			if (connection is not null)
+				await connection.DisposeAsync();
+
+			return null;
+		}
+	}
+
+	// A DECIMAL(18,4) parameter carrying DBNull for a C# null (the "not enforced" convention).
+	private static SqlParameter Money(string name, decimal? value)
+		=> new(name, SqlDbType.Decimal) { Precision = 18, Scale = 4, Value = (object)value ?? DBNull.Value };
+
+	// A nullable INT parameter carrying DBNull for a C# null.
+	private static SqlParameter NInt(string name, int? value)
+		=> new(name, SqlDbType.Int) { Value = (object)value ?? DBNull.Value };
+
+	// Inserts a fresh, collision-free portfolio + security (IDENTITY ids returned via OUTPUT) so no
+	// pre-existing seed/demo rows can pollute the state-dependent checks.
+	private static async Task<(int PortfolioId, int SecurityId)> InsertScopeAsync(SqlConnection c, SqlTransaction t, CancellationToken ct)
+	{
+		var tag = Guid.NewGuid().ToString("N");
+		int portfolioId;
+		int securityId;
+
+		await using (var cmd = new SqlCommand("INSERT INTO dbo.Portfolios (name) OUTPUT INSERTED.portfolio_id VALUES (@n)", c, t))
+		{
+			cmd.Parameters.Add(new SqlParameter("@n", SqlDbType.NVarChar, 100) { Value = "TEST_" + tag });
+			portfolioId = (int)await cmd.ExecuteScalarAsync(ct);
+		}
+
+		await using (var cmd = new SqlCommand("INSERT INTO dbo.Securities (security_code, board_code) OUTPUT INSERTED.security_id VALUES (@c, @b)", c, t))
+		{
+			cmd.Parameters.Add(new SqlParameter("@c", SqlDbType.NVarChar, 50) { Value = "T" + tag.Substring(0, 10) });
+			cmd.Parameters.Add(new SqlParameter("@b", SqlDbType.NVarChar, 20) { Value = "TB" + tag.Substring(0, 6) });
+			securityId = (int)await cmd.ExecuteScalarAsync(ct);
+		}
+
+		return (portfolioId, securityId);
+	}
+
+	// Inserts one RiskLimits row for the scope. A null argument persists SQL NULL, i.e. "not enforced".
+	private static async Task InsertLimitsAsync(SqlConnection c, SqlTransaction t, int portfolioId, int securityId, CancellationToken ct,
+		decimal? price = null, decimal? qty = null, decimal? value = null, decimal? position = null,
+		decimal? daily = null, int? freqCount = null, int? freqWindow = null, decimal? commission = null, decimal rate = 0.0005m)
+	{
+		await using var cmd = new SqlCommand(
+			"""
+			INSERT INTO dbo.RiskLimits
+			  (portfolio_id, security_id, max_order_price, max_order_qty, max_order_value, max_position_size,
+			   max_daily_volume, max_order_freq_count, max_order_freq_window_sec, max_commission_total,
+			   commission_rate, is_active, effective_date)
+			VALUES (@p, @s, @price, @qty, @value, @pos, @daily, @fc, @fw, @comm, @rate, 1, SYSUTCDATETIME())
+			""", c, t);
+
+		cmd.Parameters.Add(NInt("@p", portfolioId));
+		cmd.Parameters.Add(NInt("@s", securityId));
+		cmd.Parameters.Add(Money("@price", price));
+		cmd.Parameters.Add(Money("@qty", qty));
+		cmd.Parameters.Add(Money("@value", value));
+		cmd.Parameters.Add(Money("@pos", position));
+		cmd.Parameters.Add(Money("@daily", daily));
+		cmd.Parameters.Add(NInt("@fc", freqCount));
+		cmd.Parameters.Add(NInt("@fw", freqWindow));
+		cmd.Parameters.Add(Money("@comm", commission));
+		cmd.Parameters.Add(new SqlParameter("@rate", SqlDbType.Decimal) { Precision = 9, Scale = 6, Value = rate });
+
+		await cmd.ExecuteNonQueryAsync(ct);
+	}
+
+	// Inserts an order and returns its BIGINT id. When submitted is null the DB clock stamps the row
+	// (so freq-window tests are measured against SYSUTCDATETIME, immune to host/container clock skew).
+	private static async Task<long> InsertOrderAsync(SqlConnection c, SqlTransaction t, int portfolioId, int securityId,
+		char side, decimal qty, decimal? price, string status, CancellationToken ct, DateTime? submitted = null)
+	{
+		await using var cmd = new SqlCommand(
+			"""
+			INSERT INTO dbo.Orders (portfolio_id, security_id, side, qty, price, order_type, status, submitted_date)
+			OUTPUT INSERTED.order_id
+			VALUES (@p, @s, @side, @qty, @price, 'LIMIT', @status, ISNULL(@submitted, SYSUTCDATETIME()))
+			""", c, t);
+
+		cmd.Parameters.Add(NInt("@p", portfolioId));
+		cmd.Parameters.Add(NInt("@s", securityId));
+		cmd.Parameters.Add(new SqlParameter("@side", SqlDbType.Char, 1) { Value = side.ToString() });
+		cmd.Parameters.Add(Money("@qty", qty));
+		cmd.Parameters.Add(Money("@price", price));
+		cmd.Parameters.Add(new SqlParameter("@status", SqlDbType.VarChar, 12) { Value = status });
+		cmd.Parameters.Add(new SqlParameter("@submitted", SqlDbType.DateTime2) { Value = (object)submitted ?? DBNull.Value });
+
+		return (long)await cmd.ExecuteScalarAsync(ct);
+	}
+
+	// Inserts a trade against an order.
+	private static async Task InsertTradeAsync(SqlConnection c, SqlTransaction t, long orderId, decimal qty, decimal price, CancellationToken ct)
+	{
+		await using var cmd = new SqlCommand("INSERT INTO dbo.Trades (order_id, qty, price) VALUES (@o, @qty, @price)", c, t);
+		cmd.Parameters.Add(new SqlParameter("@o", SqlDbType.BigInt) { Value = orderId });
+		cmd.Parameters.Add(Money("@qty", qty));
+		cmd.Parameters.Add(Money("@price", price));
+		await cmd.ExecuteNonQueryAsync(ct);
+	}
+
+	// Inserts a Positions row (avg_price/pnl default to 0) for the scope.
+	private static async Task InsertPositionAsync(SqlConnection c, SqlTransaction t, int portfolioId, int securityId, decimal qty, CancellationToken ct)
+	{
+		await using var cmd = new SqlCommand("INSERT INTO dbo.Positions (portfolio_id, security_id, qty) VALUES (@p, @s, @qty)", c, t);
+		cmd.Parameters.Add(NInt("@p", portfolioId));
+		cmd.Parameters.Add(NInt("@s", securityId));
+		cmd.Parameters.Add(Money("@qty", qty));
+		await cmd.ExecuteNonQueryAsync(ct);
+	}
+
+	// Runs the given body against a fresh scope inside a transaction that is always rolled back.
+	private async Task RunWithFreshScopeAsync(Func<PreTradeRiskService, SqlConnection, SqlTransaction, int, int, Task> body)
+	{
+		await using var connection = await TryOpenLegacyAsync();
+
+		if (connection is null)
+		{
+			Inconclusive("StockSharpLegacy SQL Server is not reachable; skipping live pre-trade integration test.");
+			return;
+		}
+
+		await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(IsolationLevel.ReadCommitted);
+
+		try
+		{
+			var service = new PreTradeRiskService(SqlLegacyConnection.Resolve());
+			var (portfolioId, securityId) = await InsertScopeAsync(connection, transaction, default);
+			await body(service, connection, transaction, portfolioId, securityId);
+		}
+		finally
+		{
+			await transaction.RollbackAsync();
+		}
+	}
+
+	[TestMethod]
+	public Task Live_AcceptsCompliantOrder()
+		=> RunWithFreshScopeAsync(async (svc, c, t, pid, sid) =>
+		{
+			await InsertLimitsAsync(c, t, pid, sid, default,
+				price: 500m, qty: 10000m, value: 1000000m, position: 100000m, daily: 250000m,
+				freqCount: 5, freqWindow: 60, commission: 5000m);
+
+			var r = await svc.ValidateAsync(c, t, pid, sid, Sides.Buy, 10m, 100m, OrderTypes.Limit);
+			r.IsValid.AssertTrue();
+			r.RejectReason.AssertNull();
+		});
+
+	[TestMethod]
+	public Task Live_PriceCeilingRejects()
+		=> RunWithFreshScopeAsync(async (svc, c, t, pid, sid) =>
+		{
+			await InsertLimitsAsync(c, t, pid, sid, default, price: 500m);
+
+			var r = await svc.ValidateAsync(c, t, pid, sid, Sides.Buy, 1m, 500m, OrderTypes.Limit);
+			r.IsValid.AssertFalse();
+			r.RejectReason.AssertEqual("Order price 500.0000 meets/exceeds limit 500.0000");
+		});
+
+	[TestMethod]
+	public Task Live_QtyCeilingRejects()
+		=> RunWithFreshScopeAsync(async (svc, c, t, pid, sid) =>
+		{
+			await InsertLimitsAsync(c, t, pid, sid, default, qty: 10000m);
+
+			var r = await svc.ValidateAsync(c, t, pid, sid, Sides.Buy, 10000m, 10m, OrderTypes.Limit);
+			r.IsValid.AssertFalse();
+			r.RejectReason.AssertEqual("Order qty 10000.0000 meets/exceeds limit 10000.0000");
+		});
+
+	[TestMethod]
+	public Task Live_NotionalValueRejects()
+		=> RunWithFreshScopeAsync(async (svc, c, t, pid, sid) =>
+		{
+			await InsertLimitsAsync(c, t, pid, sid, default, value: 1000000m);
+
+			// 5000 * 200 = 1,000,000; the SQL product renders with EIGHT fractional digits (DECIMAL(37,8)).
+			var r = await svc.ValidateAsync(c, t, pid, sid, Sides.Buy, 5000m, 200m, OrderTypes.Limit);
+			r.IsValid.AssertFalse();
+			r.RejectReason.AssertEqual("Order value 1000000.00000000 meets/exceeds limit 1000000.0000");
+		});
+
+	[TestMethod]
+	public Task Live_SubTickQtyMatchesPersistedScale()
+		=> RunWithFreshScopeAsync(async (svc, c, t, pid, sid) =>
+		{
+			await InsertLimitsAsync(c, t, pid, sid, default, price: 500m);
+
+			// C02 parity through the DB path: 0.00004 rounds to DECIMAL(18,4) 0.0000 -> "Invalid qty".
+			var rejected = await svc.ValidateAsync(c, t, pid, sid, Sides.Buy, 0.00004m, 150m, OrderTypes.Limit);
+			rejected.IsValid.AssertFalse();
+			rejected.RejectReason.AssertEqual("Invalid qty");
+
+			// 0.00005 rounds up to 0.0001 -> survives the preamble; price 150 < 500 -> accept.
+			var accepted = await svc.ValidateAsync(c, t, pid, sid, Sides.Buy, 0.00005m, 150m, OrderTypes.Limit);
+			accepted.IsValid.AssertTrue();
+			accepted.RejectReason.AssertNull();
+		});
+
+	[TestMethod]
+	public Task Live_FrequencyRollingCount()
+		=> RunWithFreshScopeAsync(async (svc, c, t, pid, sid) =>
+		{
+			await InsertLimitsAsync(c, t, pid, sid, default, freqCount: 5, freqWindow: 60);
+
+			// Four prior orders inside the rolling 60s window (DB-clock stamped). The 5th is the candidate.
+			for (var i = 0; i < 4; i++)
+				await InsertOrderAsync(c, t, pid, sid, 'B', 10m, 100m, "ACCEPTED", default);
+
+			var r = await svc.ValidateAsync(c, t, pid, sid, Sides.Buy, 10m, 100m, OrderTypes.Limit);
+			r.IsValid.AssertFalse();
+			r.RejectReason.AssertEqual("Order frequency 5 in 60s meets/exceeds limit 5");
+		});
+
+	[TestMethod]
+	public Task Live_PositionPostFillProjection()
+		=> RunWithFreshScopeAsync(async (svc, c, t, pid, sid) =>
+		{
+			await InsertLimitsAsync(c, t, pid, sid, default, position: 100000m);
+			await InsertPositionAsync(c, t, pid, sid, 99000m, default);
+
+			// current 99,000 (read from dbo.Positions) + 1,000 buy = 100,000 >= 100,000 -> reject.
+			var r = await svc.ValidateAsync(c, t, pid, sid, Sides.Buy, 1000m, 100m, OrderTypes.Limit);
+			r.IsValid.AssertFalse();
+			r.RejectReason.AssertEqual("Resulting position 100000.0000 meets/exceeds limit 100000.0000");
+		});
+
+	[TestMethod]
+	public Task Live_CommissionEstimateFromTrades()
+		=> RunWithFreshScopeAsync(async (svc, c, t, pid, sid) =>
+		{
+			await InsertLimitsAsync(c, t, pid, sid, default, commission: 5000m, rate: 0.0005m);
+
+			// existing traded notional = 100,000 * 100 = 10,000,000 (read via Trades JOIN Orders).
+			var orderId = await InsertOrderAsync(c, t, pid, sid, 'B', 100000m, 100m, "FILLED", default);
+			await InsertTradeAsync(c, t, orderId, 100000m, 100m, default);
+
+			// estimate = 10,000,000*0.0005 + 10*100*0.0005 = 5000 + 0.5 = 5000.5 >= 5000 -> reject.
+			var r = await svc.ValidateAsync(c, t, pid, sid, Sides.Buy, 10m, 100m, OrderTypes.Limit);
+			r.IsValid.AssertFalse();
+			r.RejectReason.AssertEqual("Estimated cumulative commission 5000.5000 meets/exceeds limit 5000.0000");
+		});
+
+	[TestMethod]
+	public Task Live_DailyVolumeStatusAndDayFilter()
+		=> RunWithFreshScopeAsync(async (svc, c, t, pid, sid) =>
+		{
+			await InsertLimitsAsync(c, t, pid, sid, default, daily: 250000m);
+
+			// Counted (ACCEPTED/FILLED, today): 200,000 + 49,000 = 249,000.
+			await InsertOrderAsync(c, t, pid, sid, 'B', 200000m, 100m, "ACCEPTED", default);
+			await InsertOrderAsync(c, t, pid, sid, 'B', 49000m, 100m, "FILLED", default);
+			// NOT counted: a REJECTED order today (status filter) and an ACCEPTED order dated yesterday
+			// (UTC-day boundary). If either leaked in, the reject number below would differ.
+			await InsertOrderAsync(c, t, pid, sid, 'B', 500000m, 100m, "REJECTED", default);
+			await InsertOrderAsync(c, t, pid, sid, 'B', 500000m, 100m, "ACCEPTED", default, submitted: DateTime.UtcNow.AddDays(-1));
+
+			// today 249,000 + 1,000 = 250,000 >= 250,000 -> reject, proving both filters.
+			var r = await svc.ValidateAsync(c, t, pid, sid, Sides.Buy, 1000m, 100m, OrderTypes.Limit);
+			r.IsValid.AssertFalse();
+			r.RejectReason.AssertEqual("Daily volume 250000.0000 meets/exceeds limit 250000.0000");
+		});
+
+	[TestMethod]
+	public Task Live_ZeroCeilingsAreNotEnforced()
+		=> RunWithFreshScopeAsync(async (svc, c, t, pid, sid) =>
+		{
+			// A row of all-zero ceilings must load as "unlimited" (the NULL/0 convention), not always-reject.
+			await InsertLimitsAsync(c, t, pid, sid, default,
+				price: 0m, qty: 0m, value: 0m, position: 0m, daily: 0m, freqCount: 0, freqWindow: 0, commission: 0m);
+
+			var r = await svc.ValidateAsync(c, t, pid, sid, Sides.Buy, 999999m, 999999m, OrderTypes.Limit);
+			r.IsValid.AssertTrue();
+			r.RejectReason.AssertNull();
+		});
+
+	[TestMethod]
+	public Task Live_MalformedFrequencyPairIsNotEnforced()
+		=> RunWithFreshScopeAsync(async (svc, c, t, pid, sid) =>
+		{
+			// A count without a window is a malformed pair -> frequency is disabled, never an always-reject.
+			await InsertLimitsAsync(c, t, pid, sid, default, freqCount: 5, freqWindow: null);
+
+			for (var i = 0; i < 10; i++)
+				await InsertOrderAsync(c, t, pid, sid, 'B', 10m, 100m, "ACCEPTED", default);
+
+			var r = await svc.ValidateAsync(c, t, pid, sid, Sides.Buy, 10m, 100m, OrderTypes.Limit);
+			r.IsValid.AssertTrue();
+			r.RejectReason.AssertNull();
+		});
+
+	[TestMethod]
+	public Task Live_FirstFailWinsThroughDbPath()
+		=> RunWithFreshScopeAsync(async (svc, c, t, pid, sid) =>
+		{
+			await InsertLimitsAsync(c, t, pid, sid, default, price: 500m, qty: 10000m, value: 1000000m);
+
+			// Violates price, qty and value at once; the price reason (check 1) must win.
+			var r = await svc.ValidateAsync(c, t, pid, sid, Sides.Buy, 20000m, 600m, OrderTypes.Limit);
+			r.IsValid.AssertFalse();
+			r.RejectReason.AssertEqual("Order price 600.0000 meets/exceeds limit 500.0000");
+		});
+
+	[TestMethod]
+	public Task Live_InvalidSideRejectedBeforeDbRead()
+		=> RunWithFreshScopeAsync(async (svc, c, t, pid, sid) =>
+		{
+			await InsertLimitsAsync(c, t, pid, sid, default, price: 500m);
+
+			// The side/qty preamble runs before any DB read, so an invalid side is an authoritative reject.
+			var r = await svc.ValidateAsync(c, t, pid, sid, (Sides)999, 10m, 100m, OrderTypes.Limit);
+			r.IsValid.AssertFalse();
+			r.RejectReason.AssertEqual("Invalid side: 999");
+		});
+
+	[TestMethod]
+	public Task Live_UnsupportedOrderTypeThrows()
+		=> RunWithFreshScopeAsync(async (svc, c, t, pid, sid) =>
+		{
+			await InsertLimitsAsync(c, t, pid, sid, default, price: 500m);
+
+			await ThrowsExactlyAsync<NotSupportedException>(async ()
+				=> await svc.ValidateAsync(c, t, pid, sid, Sides.Buy, 10m, 100m, OrderTypes.Conditional));
+		});
+
+	[TestMethod]
+	public Task Live_InvalidIdentifiersThrow()
+		=> RunWithFreshScopeAsync(async (svc, c, t, pid, sid) =>
+		{
+			await ThrowsExactlyAsync<ArgumentOutOfRangeException>(async ()
+				=> await svc.ValidateAsync(c, t, 0, sid, Sides.Buy, 10m, 100m, OrderTypes.Limit));
+
+			await ThrowsExactlyAsync<ArgumentOutOfRangeException>(async ()
+				=> await svc.ValidateAsync(c, t, pid, -1, Sides.Buy, 10m, 100m, OrderTypes.Limit));
+		});
+
+	[TestMethod]
+	public Task Live_OverflowQtyThrows()
+		=> RunWithFreshScopeAsync(async (svc, c, t, pid, sid) =>
+		{
+			await InsertLimitsAsync(c, t, pid, sid, default, price: 500m);
+
+			// A magnitude beyond DECIMAL(18,4) fails deterministically (the C# analogue of SQL overflow).
+			await ThrowsExactlyAsync<OverflowException>(async ()
+				=> await svc.ValidateAsync(c, t, pid, sid, Sides.Buy, 1e20m, 100m, OrderTypes.Limit));
+		});
+
+	[TestMethod]
+	public Task Live_CancellationIsObserved()
+		=> RunWithFreshScopeAsync(async (svc, c, t, pid, sid) =>
+		{
+			await InsertLimitsAsync(c, t, pid, sid, default, freqCount: 5, freqWindow: 60);
+
+			using var cts = new CancellationTokenSource();
+			cts.Cancel();
+
+			// A pre-cancelled token is observed at the first database read (the RiskLimits load).
+			await ThrowsAsync<OperationCanceledException>(async ()
+				=> await svc.ValidateAsync(c, t, pid, sid, Sides.Buy, 10m, 100m, OrderTypes.Limit, cts.Token));
+		});
+
+	[TestMethod]
+	public async Task Live_ConvenienceOverloadRejectsOverPriceOrder()
+	{
+		await using (var probe = await TryOpenLegacyAsync())
+		{
+			if (probe is null)
+			{
+				Inconclusive("StockSharpLegacy SQL Server is not reachable; skipping live convenience-overload test.");
+				return;
+			}
+		}
+
+		// The connection/transaction-free overload opens and commits its OWN read-only transaction. The
+		// seeded DEMO portfolio (1) caps price at 500, so an order at 999 is rejected at check 1 regardless
+		// of order history - deterministic against the shared seed and writes no rows.
+		var service = new PreTradeRiskService(SqlLegacyConnection.Resolve());
+
+		var r = await service.ValidateAsync(1, 1, Sides.Buy, 1m, 999m, OrderTypes.Limit);
+		r.IsValid.AssertFalse();
+		r.RejectReason.AssertEqual("Order price 999.0000 meets/exceeds limit 500.0000");
+	}
+
+	[TestMethod]
+	public async Task Live_ConcurrentSubmissionsSerializeThroughGateway()
+	{
+		await using (var probe = await TryOpenLegacyAsync())
+		{
+			if (probe is null)
+			{
+				Inconclusive("StockSharpLegacy SQL Server is not reachable; skipping live concurrency test.");
+				return;
+			}
+		}
+
+		var connectionString = SqlLegacyConnection.Resolve();
+		int portfolioId;
+		int securityId;
+
+		// Commit a fresh scope with a small daily-volume ceiling (150). Two concurrent buys of 100 each
+		// would BOTH pass if validated against stale (pre-insert) state; the gateway's per-portfolio
+		// application lock + transaction must serialize them so exactly ONE is accepted (C03/TOCTOU).
+		await using (var setup = new SqlConnection(connectionString))
+		{
+			await setup.OpenAsync();
+			await using var tx = (SqlTransaction)await setup.BeginTransactionAsync(IsolationLevel.ReadCommitted);
+			(portfolioId, securityId) = await InsertScopeAsync(setup, tx, default);
+			await InsertLimitsAsync(setup, tx, portfolioId, securityId, default, daily: 150m);
+			await tx.CommitAsync();
+		}
+
+		try
+		{
+			var gateway = new SqlLegacyOrderGateway(connectionString);
+
+			var first = gateway.SubmitOrderAsync(portfolioId, securityId, Sides.Buy, 100m, 100m, OrderTypes.Limit);
+			var second = gateway.SubmitOrderAsync(portfolioId, securityId, Sides.Buy, 100m, 100m, OrderTypes.Limit);
+
+			var results = await Task.WhenAll(first, second);
+
+			// Exactly one accepted, one rejected (the race did not let both through).
+			var accepted = results.Count(r => r.IsValid);
+			var rejected = results.Count(r => !r.IsValid);
+			accepted.AssertEqual(1);
+			rejected.AssertEqual(1);
+
+			// The rejected one failed the daily-volume ceiling once the first order's 100 was committed.
+			var rejectedResult = results.Single(r => !r.IsValid);
+			rejectedResult.RejectReason.AssertEqual("Daily volume 200.0000 meets/exceeds limit 150.0000");
+		}
+		finally
+		{
+			// Remove every row the committed scope produced, children before parents (FK order).
+			await using var cleanup = new SqlConnection(connectionString);
+			await cleanup.OpenAsync();
+
+			await using var cmd = new SqlCommand(
+				"""
+				DELETE h FROM dbo.OrderStatusHistory h JOIN dbo.Orders o ON o.order_id = h.order_id WHERE o.portfolio_id = @p;
+				DELETE FROM dbo.Trades WHERE order_id IN (SELECT order_id FROM dbo.Orders WHERE portfolio_id = @p);
+				DELETE FROM dbo.Orders WHERE portfolio_id = @p;
+				DELETE FROM dbo.Positions WHERE portfolio_id = @p;
+				DELETE FROM dbo.RiskLimits WHERE portfolio_id = @p;
+				DELETE FROM dbo.Securities WHERE security_id = @s;
+				DELETE FROM dbo.Portfolios WHERE portfolio_id = @p;
+				""", cleanup);
+			cmd.Parameters.Add(NInt("@p", portfolioId));
+			cmd.Parameters.Add(NInt("@s", securityId));
+			await cmd.ExecuteNonQueryAsync();
+		}
 	}
 }

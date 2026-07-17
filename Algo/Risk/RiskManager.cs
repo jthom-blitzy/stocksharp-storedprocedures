@@ -4,19 +4,20 @@ namespace StockSharp.Algo.Risk;
 /// The risks control manager.
 /// </summary>
 /// <remarks>
-/// Since the StockSharpLegacy SQL layer was added (see /Database,
-/// Algo/Storages/Sql, and LEGACY_LAYER.md at the repo root), this is no
-/// longer the only place pre-trade risk is enforced, and the two don't cover
-/// the same rules. This engine is a portfolio-wide circuit breaker: a
-/// triggered rule takes a global action (ClosePositions/StopTrading/
-/// CancelOrders via RiskMessageAdapter) rather than rejecting the one order
-/// that tripped it. dbo.usp_ValidatePreTradeRisk is the opposite model - a
-/// classic per-order gate that rejects a single order before it's accepted,
-/// and it also enforces two limits (order notional value, daily traded
-/// volume) that have no rule class here at all. Nothing in this codebase
-/// reconciles the two, which is the point - a caller going through
-/// SqlLegacyOrderGateway gets SQL-side coverage only; a caller going through
-/// this RiskManager gets C#-side coverage only.
+/// This engine is a portfolio-wide circuit breaker: when a rule trips it takes a global action
+/// (ClosePositions/StopTrading/CancelOrders via <see cref="RiskMessageAdapter"/>) rather than
+/// rejecting the single order that tripped it. That keeps it architecturally distinct from the
+/// per-order pre-trade gate <see cref="PreTradeRiskService"/> (the C# port of
+/// <c>dbo.usp_ValidatePreTradeRisk</c>), which rejects one order before it is accepted. The two
+/// enforcement patterns are deliberately kept separate and are intentionally NOT merged (AAP §0.6).
+/// They are, however, no longer defined independently: the risk decisioning that used to live in
+/// T-SQL stored procedures has been consolidated into C#, and both patterns now resolve their
+/// thresholds from the same canonical <see cref="RiskLimitSet"/>, so every limit is defined exactly
+/// once. Call <see cref="ApplyCanonicalLimits(RiskLimitSet)"/> to seed this manager's circuit-breaker
+/// rules from that shared definition; the two limits that were historically SQL-only - order notional
+/// value and daily traded volume - now have first-class rule classes here
+/// (<see cref="RiskOrderValueRule"/> and <see cref="RiskDailyVolumeRule"/>). The circuit-breaker
+/// action behaviour itself is unchanged.
 /// </remarks>
 public class RiskManager : BaseLogReceiver, IRiskManager
 {
@@ -53,6 +54,69 @@ public class RiskManager : BaseLogReceiver, IRiskManager
 			return [];
 
 		return [.. rules.Where(r => r.ProcessMessage(message))];
+	}
+
+	/// <summary>
+	/// Seeds this circuit breaker's <see cref="Rules"/> from the canonical, single-source-of-truth
+	/// <see cref="RiskLimitSet"/> so every threshold enforced here is defined exactly once and is
+	/// identical to the one enforced by the per-order pre-trade gate <see cref="PreTradeRiskService"/>.
+	/// This is the "canonical seed helper" referenced by the individual rule classes.
+	/// </summary>
+	/// <remarks>
+	/// The existing rule set is replaced with one rule per <b>enforced</b> canonical ceiling, honouring
+	/// the same NULL/0 "not enforced" convention as <see cref="RiskLimitSet"/>: a ceiling that is not
+	/// enforced (null or non-positive) contributes no rule and therefore can never trip. Building the
+	/// set from the enforced ceilings - rather than assigning a zero threshold to a disabled rule -
+	/// deliberately avoids the circuit-breaker rules' "a zero <c>&gt;=</c> ceiling always trips" hazard
+	/// (for example <see cref="RiskOrderPriceRule"/>, whose <see cref="RiskOrderPriceRule.Price"/> of 0
+	/// would otherwise match every order). The mapping is one canonical ceiling to one rule:
+	/// <see cref="RiskLimitSet.EffectiveMaxOrderPrice"/> -&gt; <see cref="RiskOrderPriceRule"/>,
+	/// <see cref="RiskLimitSet.EffectiveMaxOrderQty"/> -&gt; <see cref="RiskOrderVolumeRule"/>,
+	/// <see cref="RiskLimitSet.EffectiveMaxOrderValue"/> -&gt; <see cref="RiskOrderValueRule"/>,
+	/// <see cref="RiskLimitSet.EffectiveMaxPositionSize"/> -&gt; <see cref="RiskPositionSizeRule"/>,
+	/// <see cref="RiskLimitSet.EffectiveMaxDailyVolume"/> -&gt; <see cref="RiskDailyVolumeRule"/>, the
+	/// frequency pair (<see cref="RiskLimitSet.IsFrequencyEnforced"/>) -&gt;
+	/// <see cref="RiskOrderFreqRule"/>, and <see cref="RiskLimitSet.EffectiveMaxCommissionTotal"/> -&gt;
+	/// <see cref="RiskCommissionRule"/>. This method only configures which rules are present and their
+	/// thresholds; the circuit-breaker action behaviour and the role of this manager are unchanged.
+	/// </remarks>
+	/// <param name="limits">
+	/// The canonical limit set to seed from (for example, the row chosen by
+	/// <see cref="RiskLimitSet.SelectMostSpecific(IEnumerable{RiskLimitSet}, int, int)"/>). Cannot be null.
+	/// </param>
+	/// <exception cref="ArgumentNullException"><paramref name="limits"/> is <see langword="null"/>.</exception>
+	public void ApplyCanonicalLimits(RiskLimitSet limits)
+	{
+		if (limits is null)
+			throw new ArgumentNullException(nameof(limits));
+
+		// Rebuild deterministically so repeated calls never accumulate duplicate rules.
+		Rules.Clear();
+
+		if (limits.EffectiveMaxOrderPrice is decimal maxOrderPrice)
+			Rules.Add(new RiskOrderPriceRule { Price = maxOrderPrice });
+
+		if (limits.EffectiveMaxOrderQty is decimal maxOrderQty)
+			Rules.Add(new RiskOrderVolumeRule { Volume = maxOrderQty });
+
+		if (limits.EffectiveMaxOrderValue is decimal maxOrderValue)
+			Rules.Add(new RiskOrderValueRule { Value = maxOrderValue });
+
+		if (limits.EffectiveMaxPositionSize is decimal maxPositionSize)
+			Rules.Add(new RiskPositionSizeRule { Position = maxPositionSize });
+
+		if (limits.EffectiveMaxDailyVolume is decimal maxDailyVolume)
+			Rules.Add(new RiskDailyVolumeRule { Volume = maxDailyVolume });
+
+		if (limits.IsFrequencyEnforced)
+			Rules.Add(new RiskOrderFreqRule
+			{
+				Count = limits.MaxOrderFreqCount.Value,
+				Interval = limits.MaxOrderFreqWindow.Value,
+			});
+
+		if (limits.EffectiveMaxCommissionTotal is decimal maxCommissionTotal)
+			Rules.Add(new RiskCommissionRule { Commission = maxCommissionTotal });
 	}
 
 	/// <inheritdoc />

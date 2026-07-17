@@ -47,6 +47,42 @@ public class RiskOrderValueRule : RiskRule
 	/// <inheritdoc />
 	protected override string GetTitle() => _value.To<string>();
 
+	/// <summary>
+	/// Evaluate the notional (<paramref name="volume"/> * <paramref name="price"/>) against the
+	/// configured <see cref="Value"/> ceiling. Register and replace messages are handled identically:
+	/// a non-positive <see cref="Value"/> disables the rule, non-positive volume or price contribute
+	/// no notional, and the multiplication is overflow-safe (a saturating overflow is treated as a
+	/// breach, since an overflowing notional is necessarily above any finite ceiling).
+	/// </summary>
+	/// <param name="volume">Order volume.</param>
+	/// <param name="price">Order price.</param>
+	/// <returns><see langword="true" /> when the notional meets or exceeds <see cref="Value"/>.</returns>
+	private bool IsBreached(decimal volume, decimal price)
+	{
+		// A non-positive ceiling means "no limit" (mirrors the RiskLimits NULL/0 convention).
+		if (Value <= 0)
+			return false;
+
+		// Malformed / non-positive inputs carry no notional exposure.
+		if (volume <= 0 || price <= 0)
+			return false;
+
+		decimal notional;
+
+		try
+		{
+			notional = checked(volume * price);
+		}
+		catch (OverflowException)
+		{
+			// An overflowing notional is unbounded and therefore necessarily above the ceiling;
+			// treat it as a breach (conservative, never less strict).
+			return true;
+		}
+
+		return notional >= Value;
+	}
+
 	/// <inheritdoc />
 	public override bool ProcessMessage(Message message)
 	{
@@ -55,13 +91,13 @@ public class RiskOrderValueRule : RiskRule
 			case MessageTypes.OrderRegister:
 			{
 				var orderReg = (OrderRegisterMessage)message;
-				return Value != 0 && orderReg.Price > 0 && (orderReg.Volume * orderReg.Price) >= Value;
+				return IsBreached(orderReg.Volume, orderReg.Price);
 			}
 
 			case MessageTypes.OrderReplace:
 			{
 				var orderReplace = (OrderReplaceMessage)message;
-				return Value != 0 && orderReplace.Price > 0 && orderReplace.Volume > 0 && (orderReplace.Volume * orderReplace.Price) >= Value;
+				return IsBreached(orderReplace.Volume, orderReplace.Price);
 			}
 
 			default:

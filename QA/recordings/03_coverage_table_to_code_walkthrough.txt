@@ -1,0 +1,74 @@
+Recording 03 (substitution) - Coverage table -> code walkthrough
+=================================================================
+Documented substitution (no GUI/video environment). This captioned transcript walks each row
+of the LEGACY_LAYER.md rule-by-rule coverage table and maps it to the exact C# implementation
+that now owns it. The numbered PNG frames rendered from it accompany it
+(03_coverage_table_to_code_walkthrough_01.png, _02.png). File/line references below were
+resolved from the working tree on 2026-07-17.
+
+### Single source of truth: the canonical thresholds (Algo/Risk/RiskLimitSet.cs)
+Every threshold is defined exactly once on RiskLimitSet and consumed by BOTH enforcement
+patterns (the per-order gate and the portfolio-wide circuit breaker):
+
+  RiskLimitSet.cs:24  public decimal? MaxOrderPrice
+  RiskLimitSet.cs:30  public decimal? MaxOrderQty
+  RiskLimitSet.cs:38  public decimal? MaxOrderValue
+  RiskLimitSet.cs:45  public decimal? MaxPositionSize
+  RiskLimitSet.cs:52  public decimal? MaxDailyVolume
+  RiskLimitSet.cs:59  public int?     MaxOrderFreqCount
+  RiskLimitSet.cs:67  public int?     MaxOrderFreqWindowSeconds
+  RiskLimitSet.cs:73  public decimal? MaxCommissionTotal
+  RiskLimitSet.cs:80  public decimal  CommissionRate = 0.0005m
+  (NULL / non-positive ceiling  ==  "not enforced", carried over from the RiskLimits table.)
+
+### Row 1-2  Price & qty ceilings  (MERGED - duplicative-by-accident)
+  canonical : RiskLimitSet.MaxOrderPrice / MaxOrderQty
+  gate      : PreTradeRiskService.cs:118  reject "Order price ... meets/exceeds limit ..."
+              PreTradeRiskService.cs:122  reject "Order qty ... meets/exceeds limit ..."
+  breaker   : Algo/Risk/RiskOrderPriceRule.cs , Algo/Risk/RiskOrderVolumeRule.cs
+  Both patterns reject when value >= limit.
+
+### Row 3  Order notional value (qty x price)  (WAS SQL-ONLY -> now a first-class C# rule)
+  canonical : RiskLimitSet.MaxOrderValue
+  gate      : PreTradeRiskService.cs:129  reject "Order value ... meets/exceeds limit ..."
+  breaker   : Algo/Risk/RiskOrderValueRule.cs  (NEW)
+
+### Row 4  Order frequency  (RECONCILED to the stricter rolling-count algorithm)
+  canonical : RiskLimitSet.MaxOrderFreqCount / MaxOrderFreqWindowSeconds
+  gate      : PreTradeRiskService.cs:131-141  rolling COUNT over "now minus window"
+  breaker   : Algo/Risk/RiskOrderFreqRule.cs   rolling-count + late-event watermark
+  The single intentional behavioral change: never less strict than the old fixed window.
+
+### Row 5  Resulting position size  (PRESERVED-DISTINCT - shares one threshold)
+  canonical : RiskLimitSet.MaxPositionSize
+  gate      : PreTradeRiskService.cs:144-152  checks the HYPOTHETICAL post-fill position
+  breaker   : Algo/Risk/RiskPositionSizeRule.cs  checks the CURRENT position
+  Same threshold; two evaluation contexts answering different questions (AAP 0.6.2).
+
+### Row 6  Cumulative commission  (PRESERVED-DISTINCT - shares one threshold)
+  canonical : RiskLimitSet.MaxCommissionTotal (+ CommissionRate)
+  gate      : PreTradeRiskService.cs:155-169  PRE-fill ESTIMATE from historical traded
+                                              notional x rate
+  breaker   : Algo/Risk/RiskCommissionRule.cs / RiskOrderCommissionRule.cs /
+              RiskTransactionCommissionRule.cs  ACTUAL commission off ExecutionMessage
+  Same threshold; different basis - they do not agree by construction.
+
+### Row 7  Daily traded volume  (WAS SQL-ONLY -> now a first-class C# rule)
+  canonical : RiskLimitSet.MaxDailyVolume
+  gate      : PreTradeRiskService.cs:172-178  reads today's accepted/filled/part-filled volume
+  breaker   : Algo/Risk/RiskDailyVolumeRule.cs  (NEW) in-stream running total by
+              portfolio+security, rolled over on the UTC day
+
+### Circuit-breaker-only (need live state the gate does not have; unchanged)
+  Algo/Risk/RiskPositionTimeRule.cs , RiskPnLRule.cs , RiskSlippageRule.cs
+
+### Position recalculation (average-cost + realized P&L) - moved out of SQL
+  Algo/Risk/PositionRecalculationService.cs  ports usp_RecalculatePositionOnTrade;
+  invoked exactly once per recorded trade from
+  Algo/Storages/Sql/SqlLegacyOrderGateway.RecordTradeAsync -> single-apply, so the old
+  trigger/standalone double-count hazard is eliminated.
+
+### Wiring: the circuit breaker reads the same canonical definitions
+  Algo/Risk/RiskManager.cs  ApplyCanonicalLimits(RiskLimitSet) seeds the circuit-breaker
+  rules from the very same RiskLimitSet the gate uses - proving "define once, enforce in
+  two patterns".

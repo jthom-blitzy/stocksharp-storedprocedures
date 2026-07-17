@@ -1,14 +1,25 @@
 /*
-	StockSharpLegacy - triggers
+	StockSharpLegacy - triggers (consolidated state)
 	----------------------------------------
-	trg_Trades_PositionRecalc - fires on every Trades insert and drives the
-	position/P&L recalculation. This is the trigger that makes
-	usp_RecalculatePositionOnTrade "automatic" - see the warning on that
-	proc in 002_StoredProcedures.sql about not calling it a second time.
+	trg_Trades_PositionRecalc has been REMOVED. The per-trade position/P&L
+	recalculation it used to drive (via usp_RecalculatePositionOnTrade) now lives in
+	Algo/Risk/PositionRecalculationService.cs, invoked exactly once per recorded trade
+	by Algo/Storages/Sql/SqlLegacyOrderGateway.RecordTradeAsync inside the same
+	transaction as the dbo.Trades INSERT. Removing the trigger also eliminates the
+	long-standing double-count hazard - the trigger and the standalone reconciliation
+	jobs both calling the recalc for the same trade - documented in LEGACY_LAYER.md.
 
-	trg_Orders_StatusAudit - cascades order status changes into
-	OrderStatusHistory. Narrow on purpose: only fires when status actually
-	changed, not on every column update.
+	trg_Orders_StatusAudit is RETAINED (AAP 0.6.5, Option A). It is an append-only
+	audit cascade: it copies an order's status transition into OrderStatusHistory and
+	contains no risk decisioning, thresholds, or P&L math. Keeping it as a
+	database-level cascade preserves the append-only history guarantee with the least
+	risk and is defensible pure-storage behavior; its only conditional - "did the
+	status actually change" - gates the audit write, it is not business logic being
+	left behind in SQL. (Option B, relocating it to C#, is only required under a
+	strict "zero conditional logic in SQL" reading, which the AAP does not mandate.)
+
+	This script is idempotent: it DROPs the relocated trigger if it exists and
+	(re)creates the retained audit trigger. Run it after 002_StoredProcedures.sql.
 */
 
 USE StockSharpLegacy;
@@ -18,54 +29,19 @@ SET ANSI_NULLS ON;
 SET QUOTED_IDENTIFIER ON;
 GO
 
--- ============================================================================
--- trg_Trades_PositionRecalc
---
--- Cursor-based on purpose (or at least, that's the polite way to put it -
--- this was written back when multi-row trade inserts were rare enough that
--- nobody optimized for them, and it's never been revisited). Processes
--- inserted rows oldest-first so avg_price/realized_pnl land the same as if
--- the trades had been inserted one at a time.
--- ============================================================================
-CREATE OR ALTER TRIGGER dbo.trg_Trades_PositionRecalc
-ON dbo.Trades
-AFTER INSERT
-AS
-BEGIN
-	SET NOCOUNT ON;
-
-	DECLARE @order_id BIGINT, @qty DECIMAL(18,4), @price DECIMAL(18,4);
-
-	DECLARE trade_cursor CURSOR LOCAL FAST_FORWARD FOR
-		SELECT order_id, qty, price
-		FROM inserted
-		ORDER BY executed_date ASC, trade_id ASC;
-
-	OPEN trade_cursor;
-	FETCH NEXT FROM trade_cursor INTO @order_id, @qty, @price;
-
-	WHILE @@FETCH_STATUS = 0
-	BEGIN
-		EXEC dbo.usp_RecalculatePositionOnTrade
-			@order_id = @order_id,
-			@trade_qty = @qty,
-			@trade_price = @price;
-
-		FETCH NEXT FROM trade_cursor INTO @order_id, @qty, @price;
-	END
-
-	CLOSE trade_cursor;
-	DEALLOCATE trade_cursor;
-END
+-- Position/P&L recalculation relocated to PositionRecalculationService (C#), invoked once per
+-- recorded trade by the gateway; drop the trigger driver and its double-count hazard.
+DROP TRIGGER IF EXISTS dbo.trg_Trades_PositionRecalc;
 GO
 
 -- ============================================================================
--- trg_Orders_StatusAudit
+-- trg_Orders_StatusAudit  (RETAINED - Option A, AAP 0.6.5)
 --
--- Cascades a status change (e.g. -> 'FILLED') to OrderStatusHistory. Only
--- fires when the status column is part of the UPDATE and the value actually
--- changed - an UPDATE that touches other columns (price amendment, etc.)
--- without changing status does not create a history row.
+-- Cascades a status change (e.g. -> 'FILLED') to OrderStatusHistory. Only fires when
+-- the status column is part of the UPDATE and the value actually changed - an UPDATE
+-- that touches other columns (a price amendment, etc.) without changing status does
+-- not create a history row. This is a pure append-only audit cascade: no thresholds,
+-- no accept/reject decision, no P&L math.
 -- ============================================================================
 CREATE OR ALTER TRIGGER dbo.trg_Orders_StatusAudit
 ON dbo.Orders

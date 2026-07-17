@@ -82,6 +82,64 @@ public class RiskTests : BaseTestClass
 	}
 
 	[TestMethod]
+	public void ManagerApplyCanonicalLimits()
+	{
+		var manager = new RiskManager();
+
+		// A canonical set with some ceilings enforced and others deliberately "not enforced"
+		// (null or non-positive), plus the frequency pair enforced.
+		var limits = new RiskLimitSet
+		{
+			MaxOrderPrice = 500m,            // enforced   -> RiskOrderPriceRule
+			MaxOrderQty = 1000m,             // enforced   -> RiskOrderVolumeRule
+			MaxOrderValue = 250000m,         // enforced   -> RiskOrderValueRule
+			MaxPositionSize = 100m,          // enforced   -> RiskPositionSizeRule
+			MaxDailyVolume = null,           // NOT enforced (null)          -> no rule
+			MaxOrderFreqCount = 5,           // enforced pair -> RiskOrderFreqRule
+			MaxOrderFreqWindowSeconds = 60,
+			MaxCommissionTotal = 0m,         // NOT enforced (non-positive)  -> no rule
+		};
+
+		manager.ApplyCanonicalLimits(limits);
+
+		// Exactly the enforced ceilings produced a rule: price, qty, value, position, frequency.
+		manager.Rules.Count.AssertEqual(5);
+		manager.Rules.OfType<RiskOrderPriceRule>().Single().Price.AssertEqual(500m);
+		manager.Rules.OfType<RiskOrderVolumeRule>().Single().Volume.AssertEqual(1000m);
+		manager.Rules.OfType<RiskOrderValueRule>().Single().Value.AssertEqual(250000m);
+		manager.Rules.OfType<RiskPositionSizeRule>().Single().Position.AssertEqual(100m);
+
+		var freq = manager.Rules.OfType<RiskOrderFreqRule>().Single();
+		freq.Count.AssertEqual(5);
+		freq.Interval.AssertEqual(TimeSpan.FromSeconds(60));
+
+		// Not-enforced ceilings contribute no rule, so they can never trip - this is what avoids the
+		// circuit-breaker rules' "a zero >= ceiling always trips" hazard.
+		manager.Rules.OfType<RiskDailyVolumeRule>().Any().AssertFalse();
+		manager.Rules.OfType<RiskCommissionRule>().Any().AssertFalse();
+
+		// The seeded price rule enforces the SAME canonical threshold as the pre-trade gate would:
+		// reject-when-price-&gt;=-500, defined exactly once on the RiskLimitSet.
+		var priceRule = manager.Rules.OfType<RiskOrderPriceRule>().Single();
+		var secId = Helper.CreateSecurityId();
+		priceRule.ProcessMessage(new OrderRegisterMessage { SecurityId = secId, Price = 499m }).AssertFalse();
+		priceRule.ProcessMessage(new OrderRegisterMessage { SecurityId = secId, Price = 500m }).AssertTrue();
+
+		// Re-applying rebuilds deterministically (no duplicate accumulation): now only price is enforced.
+		manager.ApplyCanonicalLimits(new RiskLimitSet { MaxOrderPrice = 250m });
+		manager.Rules.Count.AssertEqual(1);
+		manager.Rules.OfType<RiskOrderPriceRule>().Single().Price.AssertEqual(250m);
+	}
+
+	[TestMethod]
+	public void ManagerApplyCanonicalLimitsNullThrows()
+	{
+		var manager = new RiskManager();
+
+		ThrowsExactly<ArgumentNullException>(() => manager.ApplyCanonicalLimits(null));
+	}
+
+	[TestMethod]
 	public void ManagerSaveLoad()
 	{
 		var manager = new RiskManager();
@@ -764,6 +822,221 @@ public class RiskTests : BaseTestClass
 
 		rule.ProcessMessage(orderMsg).AssertFalse();
 		rule.ProcessMessage(orderMsg).AssertTrue();
+	}
+
+	[TestMethod]
+	public void OrderFreqBoundary()
+	{
+		// M15: correct rolling-window boundary for Count=5 / window=60s using offsets [0,1,2,59,60].
+		// At t=60s the trailing [t-60, t] = [0, 60] window still contains all five orders (the boundary
+		// is inclusive, mirroring the SQL gate's submitted_date >= now - window), so recentCount 4 + 1
+		// reaches Count 5 and trips. The former fixed-window rule bucketed [0,60) and [60,120): the
+		// fifth order (t=60s) fell into the next bucket and would NOT have tripped, which is exactly the
+		// authorized at-least-as-strict tightening this test pins down.
+		var rule = new RiskOrderFreqRule
+		{
+			Count = 5,
+			Interval = TimeSpan.FromSeconds(60),
+		};
+
+		var start = DateTime.UtcNow;
+
+		foreach (var off in new[] { 0, 1, 2, 59 })
+		{
+			var msg = new OrderRegisterMessage
+			{
+				SecurityId = Helper.CreateSecurityId(),
+				LocalTime = start.AddSeconds(off),
+			};
+
+			rule.ProcessMessage(msg).AssertFalse();
+		}
+
+		var boundaryMsg = new OrderRegisterMessage
+		{
+			SecurityId = Helper.CreateSecurityId(),
+			LocalTime = start.AddSeconds(60),
+		};
+
+		rule.ProcessMessage(boundaryMsg).AssertTrue();
+	}
+
+	[TestMethod]
+	public void OrderFreqLateEventNeverLessStrict()
+	{
+		// C07: verified out-of-order counterexample. Count=3, window=50s, in-order events at 80/90/200s,
+		// then a LATE event at 100s. The correct rolling window at t=100s is [50, 100], which contains
+		// the 80s, 90s and 100s orders (three) and must reject. Because the newer 200s event evicts the
+		// 80s/90s timestamps from bounded state, a naive rolling count would under-count the late event
+		// and wrongly accept it. The watermark policy treats the out-of-order event conservatively as a
+		// breach, guaranteeing the reconciled rule is never less strict than a correct rolling count.
+		var rule = new RiskOrderFreqRule
+		{
+			Count = 3,
+			Interval = TimeSpan.FromSeconds(50),
+		};
+
+		var start = DateTime.UtcNow;
+
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), LocalTime = start.AddSeconds(80) }).AssertFalse();
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), LocalTime = start.AddSeconds(90) }).AssertFalse();
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), LocalTime = start.AddSeconds(200) }).AssertFalse();
+
+		// Late (out-of-order) event: trips conservatively rather than silently under-counting.
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), LocalTime = start.AddSeconds(100) }).AssertTrue();
+	}
+
+	[TestMethod]
+	public void OrderFreqZeroIntervalInactive()
+	{
+		// M15: a non-positive interval means no trailing window is configured, so the rule is inactive
+		// and never trips regardless of burst size (deterministic same-timestamp behaviour).
+		var rule = new RiskOrderFreqRule
+		{
+			Count = 1,
+			Interval = TimeSpan.Zero,
+		};
+
+		var t = DateTime.UtcNow;
+
+		for (var i = 0; i < 10; i++)
+		{
+			var msg = new OrderRegisterMessage
+			{
+				SecurityId = Helper.CreateSecurityId(),
+				LocalTime = t,
+			};
+
+			rule.ProcessMessage(msg).AssertFalse();
+		}
+	}
+
+	[TestMethod]
+	public void OrderFreqConcurrentAccessDoesNotThrow()
+	{
+		// M10: state access is synchronized, so concurrent message delivery must not corrupt the
+		// bounded queue. Count is set very high so the count predicate never trips; the test asserts
+		// only that synchronized access does not throw (e.g. no Queue enumeration/mutation races).
+		var rule = new RiskOrderFreqRule
+		{
+			Count = 1_000_000,
+			Interval = TimeSpan.FromSeconds(60),
+		};
+
+		var start = DateTime.UtcNow;
+		var sec = Helper.CreateSecurityId();
+
+		System.Threading.Tasks.Parallel.For(0, 500, i =>
+		{
+			var msg = new OrderRegisterMessage
+			{
+				SecurityId = sec,
+				LocalTime = start.AddTicks(i),
+			};
+
+			rule.ProcessMessage(msg);
+		});
+	}
+
+	[TestMethod]
+	public void OrderValue()
+	{
+		// M15: predicate / boundary / absent-price / invalid-volume / replacement behaviour for the
+		// notional (volume * price) rule.
+		var rule = new RiskOrderValueRule
+		{
+			Value = 1000,
+			Action = RiskActions.CancelOrders,
+		};
+
+		// Below the ceiling (500 < 1000).
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Volume = 5, Price = 100 }).AssertFalse();
+		// Exact boundary: >= trips (1000 >= 1000).
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Volume = 10, Price = 100 }).AssertTrue();
+		// Above the ceiling (2000 >= 1000).
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Volume = 20, Price = 100 }).AssertTrue();
+
+		// Absent (zero) price contributes no notional.
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Volume = 1_000_000, Price = 0 }).AssertFalse();
+		// Invalid (non-positive) volume contributes no notional and is handled the same for register/replace.
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Volume = -5, Price = 100 }).AssertFalse();
+
+		// Replace message is handled identically to register.
+		rule.ProcessMessage(new OrderReplaceMessage { SecurityId = Helper.CreateSecurityId(), Volume = 10, Price = 100 }).AssertTrue();
+		rule.ProcessMessage(new OrderReplaceMessage { SecurityId = Helper.CreateSecurityId(), Volume = 5, Price = 100 }).AssertFalse();
+
+		// Overflow saturates to a breach instead of throwing.
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Volume = decimal.MaxValue, Price = 2 }).AssertTrue();
+	}
+
+	[TestMethod]
+	public void OrderValueZeroDisabled()
+	{
+		// M15: a non-positive Value disables the rule (mirrors the RiskLimits NULL/0 convention).
+		var rule = new RiskOrderValueRule { Value = 0 };
+
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Volume = 1_000_000, Price = 1_000_000 }).AssertFalse();
+	}
+
+	[TestMethod]
+	public void OrderValueInvalidValue()
+	{
+		var rule = new RiskOrderValueRule();
+
+		ThrowsExactly<ArgumentOutOfRangeException>(() => rule.Value = -100);
+	}
+
+	[TestMethod]
+	public void DailyVolume()
+	{
+		// C08 / M15: scope (portfolio+security partition), UTC-day rollover, negative-input handling,
+		// replacement handling, and reset behaviour for the in-stream daily-volume circuit breaker.
+		var rule = new RiskDailyVolumeRule
+		{
+			Volume = 1000,
+			Action = RiskActions.StopTrading,
+		};
+
+		var pf = Helper.CreatePortfolio().Name;
+		var sec1 = Helper.CreateSecurityId();
+		var sec2 = Helper.CreateSecurityId();
+		var day = new DateTime(2024, 1, 2, 10, 0, 0, DateTimeKind.Utc);
+
+		// Accumulate within the (pf, sec1) partition.
+		rule.ProcessMessage(new OrderRegisterMessage { PortfolioName = pf, SecurityId = sec1, Volume = 600, LocalTime = day }).AssertFalse();
+		// A different security in the same portfolio is a separate partition and does not aggregate.
+		rule.ProcessMessage(new OrderRegisterMessage { PortfolioName = pf, SecurityId = sec2, Volume = 600, LocalTime = day.AddMinutes(1) }).AssertFalse();
+		// Back to sec1: 600 + 600 = 1200 >= 1000 trips (proves sec2's 600 did NOT leak into sec1's total).
+		rule.ProcessMessage(new OrderRegisterMessage { PortfolioName = pf, SecurityId = sec1, Volume = 600, LocalTime = day.AddMinutes(2) }).AssertTrue();
+
+		// Crossing to a newer UTC day clears the prior day's partition totals.
+		var nextDay = day.AddDays(1);
+		rule.ProcessMessage(new OrderRegisterMessage { PortfolioName = pf, SecurityId = sec1, Volume = 600, LocalTime = nextDay }).AssertFalse();
+		// Non-positive (malformed) volume is not accumulated.
+		rule.ProcessMessage(new OrderRegisterMessage { PortfolioName = pf, SecurityId = sec1, Volume = -500, LocalTime = nextDay.AddMinutes(1) }).AssertFalse();
+		// Replace message counts as additional submitted volume: 600 + 600 = 1200 >= 1000 trips.
+		rule.ProcessMessage(new OrderReplaceMessage { PortfolioName = pf, SecurityId = sec1, Volume = 600, LocalTime = nextDay.AddMinutes(2) }).AssertTrue();
+
+		// Reset clears all partitioned state.
+		rule.Reset();
+		rule.ProcessMessage(new OrderRegisterMessage { PortfolioName = pf, SecurityId = sec1, Volume = 600, LocalTime = nextDay.AddMinutes(3) }).AssertFalse();
+	}
+
+	[TestMethod]
+	public void DailyVolumeZeroDisabled()
+	{
+		// M15: a non-positive Volume disables the rule.
+		var rule = new RiskDailyVolumeRule { Volume = 0 };
+
+		rule.ProcessMessage(new OrderRegisterMessage { PortfolioName = Helper.CreatePortfolio().Name, SecurityId = Helper.CreateSecurityId(), Volume = 10_000_000, LocalTime = DateTime.UtcNow }).AssertFalse();
+	}
+
+	[TestMethod]
+	public void DailyVolumeInvalidVolume()
+	{
+		var rule = new RiskDailyVolumeRule();
+
+		ThrowsExactly<ArgumentOutOfRangeException>(() => rule.Volume = -100);
 	}
 
 	[TestMethod]

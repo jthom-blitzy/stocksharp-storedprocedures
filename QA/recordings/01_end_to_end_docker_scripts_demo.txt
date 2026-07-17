@@ -1,0 +1,81 @@
+Recording 01 (substitution) - End-to-end: Docker SQL Server, apply scripts 001->004, run the demo
+====================================================================================================
+This is the documented substitution for a screen recording. No GUI/video-capture environment
+exists in this headless CI container, so the "recording" is this captioned transcript of the
+REAL, unaltered command output plus the numbered PNG frames rendered from it
+(01_end_to_end_docker_scripts_demo_01.png ... _03.png). Every line below is genuine output
+captured on 2026-07-17 against the live SQL Server 2022 container on host port 14330.
+
+Scenario walked: (1) container is healthy; (2) reset the database and apply the four DDL/CRUD
+scripts in run order; (3) confirm SQL holds NO business logic (0 procedures, 1 pure audit
+trigger) with the seed intact; (4) run the console demo and observe the three outcomes
+(accept / reject-by-price / trade-recomputes-position); (5) inspect the persisted rows.
+
+### STEP 1 — SQL Server container healthy
+stocksharp-legacy-sql | Up 8 hours | 0.0.0.0:14330->1433/tcp
+2026-07-16 18:42:59.84 spid50s     Recovery is complete. This is an informational message only. No user action is required.
+
+### STEP 2 — reset database to a clean slate (drop, then re-apply scripts 001->004)
+$ sqlcmd -Q "ALTER DATABASE StockSharpLegacy SET SINGLE_USER ...; DROP DATABASE StockSharpLegacy"
+
+### STEP 3 — apply scripts in run order 001 -> 002 -> 003 -> 004
+$ sqlcmd -i /tmp/db_e2e/001_Schema.sql
+Changed database context to 'StockSharpLegacy'.
+$ sqlcmd -i /tmp/db_e2e/002_StoredProcedures.sql
+Changed database context to 'StockSharpLegacy'.
+$ sqlcmd -i /tmp/db_e2e/003_Triggers.sql
+Changed database context to 'StockSharpLegacy'.
+$ sqlcmd -i /tmp/db_e2e/004_SeedData.sql
+Changed database context to 'StockSharpLegacy'.
+
+(1 rows affected)
+
+(1 rows affected)
+
+(1 rows affected)
+
+(1 rows affected)
+(all four scripts applied)
+
+### STEP 4 — verify consolidated state (no business logic in SQL; seed intact)
+$ sqlcmd -d StockSharpLegacy -Q "<introspection>"
+stored_procedures = 0                             
+user_triggers = 1                             
+retained trigger = trg_Orders_StatusAudit                                                                                                          
+portfolios = 1                             
+securities = 2                             
+risklimits_rows = 1                             
+orders = 0                             
+trades = 0                             
+positions = 0                             
+
+### STEP 5 — run the console demo against the live SQL Server (three observable outcomes)
+$ dotnet run --project Samples/08_Misc/03_LegacySqlDemo/03_Misc.LegacySqlDemo.csproj -c Release --no-build
+Portfolio 'DEMO' = portfolio_id 1
+Security 'AAPL@NASDAQ' = security_id 1
+
+Submitting BUY 100 @ 150.00 (within limits)...
+  -> order_id=1 is_valid=True reject_reason=(none)
+
+Submitting BUY 10 @ 999.00 (price exceeds the seeded max_order_price limit)...
+  -> order_id=2 is_valid=False reject_reason=Order price 999.0000 meets/exceeds limit 500.0000
+     Note: this rejection comes from the C# PreTradeRiskService (the per-order pre-trade
+     gate), which reads the applicable RiskLimits row and enforces it in C#. The C#
+     RiskManager (Algo/Risk) is the portfolio-wide circuit breaker - a distinct
+     enforcement pattern that now shares the same canonical RiskLimitSet thresholds.
+
+Recording a trade: 100 @ 150.00 against order #1...
+  -> position after C# recompute: qty=100.0000 avg_price=150.0000 realized_pnl=0.0000
+
+
+### STEP 6 — persisted DB state after the demo (plain CRUD written by the C# gateway)
+order_id             side qty                  price                status       reject_reason                                                                                                                                                                                           
+-------------------- ---- -------------------- -------------------- ------------ --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                   1 B                100.0000             150.0000 ACCEPTED     NULL                                                                                                                                                                                                    
+                   2 B                 10.0000             999.0000 REJECTED     Order price 999.0000 meets/exceeds limit 500.0000                                                                                                                                                       
+trade_id             order_id             qty                  price               
+-------------------- -------------------- -------------------- --------------------
+                   1                    1             100.0000             150.0000
+portfolio_id security_id qty                  avg_price            realized_pnl        
+------------ ----------- -------------------- -------------------- --------------------
+           1           1             100.0000             150.0000                .0000

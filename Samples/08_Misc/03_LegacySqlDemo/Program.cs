@@ -8,11 +8,11 @@ using StockSharp.BusinessEntities;
 using StockSharp.Messages;
 
 /// <summary>
-/// End-to-end walkthrough of the StockSharpLegacy SQL layer added under
-/// /Database and Algo/Storages/Sql: submit a compliant order, submit a
-/// non-compliant one, record a fill, and show the trigger-driven position
-/// update. See LEGACY_LAYER.md at the repo root for the full writeup of what
-/// this layer is and why it exists.
+/// End-to-end walkthrough of the StockSharpLegacy SQL layer under /Database and Algo/Storages/Sql:
+/// submit a compliant order, submit a non-compliant one, record a fill, and show the position that
+/// the C# PositionRecalculationService recomputes. After the SQL -&gt; C# consolidation the gateway runs
+/// the pre-trade checks in PreTradeRiskService and the position math in PositionRecalculationService;
+/// the database is pure storage. See LEGACY_LAYER.md at the repo root for the full writeup.
 ///
 /// Requires a running SQL Server with the StockSharpLegacy database - see
 /// Database/README.md for the one-line Docker command, or set
@@ -52,23 +52,24 @@ class Program
 		Console.WriteLine();
 
 		// --- order #2: price breaches RiskLimits.max_order_price (seeded at 500.00) -> REJECTED ---
-		Console.WriteLine("Submitting BUY 10 @ 999.00 (price exceeds the SQL-side max_order_price limit)...");
+		Console.WriteLine("Submitting BUY 10 @ 999.00 (price exceeds the seeded max_order_price limit)...");
 		var order2 = await gateway.SubmitOrderAsync(portfolioId, securityId, Sides.Buy, 10m, 999.00m, OrderTypes.Limit);
 		Console.WriteLine($"  -> order_id={order2.OrderId} is_valid={order2.IsValid} reject_reason={order2.RejectReason ?? "(none)"}");
-		Console.WriteLine("     Note: this rejection comes from dbo.usp_ValidatePreTradeRisk. The C# RiskManager");
-		Console.WriteLine("     (Algo/Risk) is a separate, unsynchronized rule set - see the remarks on");
-		Console.WriteLine("     RiskManager and RiskOrderFreqRule for how the two now diverge.");
+		Console.WriteLine("     Note: this rejection comes from the C# PreTradeRiskService (the per-order pre-trade");
+		Console.WriteLine("     gate), which reads the applicable RiskLimits row and enforces it in C#. The C#");
+		Console.WriteLine("     RiskManager (Algo/Risk) is the portfolio-wide circuit breaker - a distinct");
+		Console.WriteLine("     enforcement pattern that now shares the same canonical RiskLimitSet thresholds.");
 		Console.WriteLine();
 
 		if (!order1.IsValid)
 			return;
 
-		// --- record a fill against the accepted order; trg_Trades_PositionRecalc
-		//     recomputes dbo.Positions automatically on the INSERT below ---
+		// --- record a fill against the accepted order; RecordTradeAsync inserts the trade and then
+		//     invokes PositionRecalculationService once to recompute dbo.Positions in C# ---
 		Console.WriteLine("Recording a trade: 100 @ 150.00 against order #1...");
 		await gateway.RecordTradeAsync(order1.OrderId, 100m, 150.00m);
 
 		var position = await gateway.GetPositionAsync(portfolioId, securityId);
-		Console.WriteLine($"  -> position after trigger fires: qty={position.Quantity} avg_price={position.AveragePrice} realized_pnl={position.RealizedPnL}");
+		Console.WriteLine($"  -> position after C# recompute: qty={position.Quantity} avg_price={position.AveragePrice} realized_pnl={position.RealizedPnL}");
 	}
 }

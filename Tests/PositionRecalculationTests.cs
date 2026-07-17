@@ -1,24 +1,40 @@
 namespace StockSharp.Tests;
 
+using System.Data;
+
+using Microsoft.Data.SqlClient;
+
 using StockSharp.Algo.Risk;
+using StockSharp.Algo.Storages.Sql;
 
 /// <summary>
-/// Characterization + parity tests for <see cref="PositionRecalculationService.Recalculate"/>, the pure
-/// average-cost + realized-P&amp;L core ported from the SQL dbo.usp_RecalculatePositionOnTrade
-/// (Database/002_StoredProcedures.sql:L262-L334) as part of the SQL-&gt;C# risk-consolidation refactor
-/// (AAP 0.2.1, 0.4.1, 0.6.3, 0.6.4).
+/// Tests for <see cref="PositionRecalculationService"/>, the average-cost + realized-P&amp;L logic ported
+/// from the SQL dbo.usp_RecalculatePositionOnTrade (Database/002_StoredProcedures.sql:L262-L334) as part
+/// of the SQL-&gt;C# risk-consolidation refactor (AAP 0.2.1, 0.4.1, 0.6.3, 0.6.4). The suite has two layers:
 ///
-/// Every trace below is byte-verified against the SQL math and exercises both branches of the algorithm:
-/// the same-sign weighted-average branch (opening / adding) and the opposite-sign realize-P&amp;L branch
-/// (partial close, exact close, and flip). The double-count guard test proves the historical hazard
-/// (LEGACY_LAYER.md:L74-L89) is understood and pins the single-apply contract.
+///  (1) Pure decision-core UNIT tests of the database-free <see cref="PositionRecalculationService.Recalculate"/>.
+///      Each trace is byte-verified against the SQL math and exercises both branches of the algorithm: the
+///      same-sign weighted-average branch (opening / adding) and the opposite-sign realize-P&amp;L branch
+///      (partial close, exact close, and flip), plus the input-domain guards (M07/M08). These are DB-free
+///      and deterministic. Realized P&amp;L is asserted; unrealized P&amp;L is intentionally NOT maintained by
+///      the service (it stays an end-of-day mark-to-market concern, Database/001_Schema.sql:L193-L197).
 ///
-/// The method under test is a deterministic, side-effect-free pure function, so these are DB-free unit
-/// tests: no SQL Server, gateway, or connection is involved. Realized P&amp;L is asserted; unrealized P&amp;L
-/// is intentionally NOT maintained by the service (it stays an end-of-day mark-to-market concern,
-/// Database/001_Schema.sql:L193-L197) and is therefore never asserted here.
+///  (2) Live INTEGRATION + characterization/parity tests (the "Live_*" methods) that exercise the real
+///      <see cref="PositionRecalculationService.ApplyTradeAsync(SqlConnection, SqlTransaction, long, System.Threading.CancellationToken)"/>
+///      persistence path against the StockSharpLegacy SQL Server: they INSERT trades into dbo.Trades and
+///      assert both the returned state and the persisted dbo.Positions row equal the legacy oracle captured
+///      (via the original dbo.usp_RecalculatePositionOnTrade) BEFORE the SQL layer was reduced to CRUD.
+///      They prove the recompute-from-persisted-trades design is idempotent (the historical double-count
+///      hazard, LEGACY_LAYER.md:L74-L89, is structurally eliminated: re-running for the same trades does
+///      NOT double the position), that transaction rollback discards the write, and that the gateway's
+///      RecordTradeAsync applies exactly once end-to-end even under concurrent fills. Each rolled-back test
+///      uses a fresh, collision-free scope and leaves the database pristine; the whole layer is gated on
+///      database reachability via Inconclusive (AAP 0.6.7).
 /// </summary>
 [TestClass]
+[DoNotParallelize] // The Live_* tests open real StockSharpLegacy transactions that hold locks on the
+                   // shared Positions/Trades/Orders tables; running them concurrently would deadlock.
+                   // This follows the repo convention (see StorageNotParallelizeTests).
 public class PositionRecalculationTests : BaseTestClass
 {
 	[TestMethod]
@@ -29,7 +45,6 @@ public class PositionRecalculationTests : BaseTestClass
 			existingQty: 0m,
 			existingAvgPrice: 0m,
 			existingRealizedPnl: 0m,
-			positionExists: false,
 			side: Sides.Buy,
 			tradeQty: 100m,
 			tradePrice: 10m);
@@ -47,7 +62,6 @@ public class PositionRecalculationTests : BaseTestClass
 			existingQty: 100m,
 			existingAvgPrice: 10m,
 			existingRealizedPnl: 0m,
-			positionExists: true,
 			side: Sides.Buy,
 			tradeQty: 100m,
 			tradePrice: 20m);
@@ -66,7 +80,6 @@ public class PositionRecalculationTests : BaseTestClass
 			existingQty: 100m,
 			existingAvgPrice: 10m,
 			existingRealizedPnl: 0m,
-			positionExists: true,
 			side: Sides.Sell,
 			tradeQty: 40m,
 			tradePrice: 15m);
@@ -85,7 +98,6 @@ public class PositionRecalculationTests : BaseTestClass
 			existingQty: 100m,
 			existingAvgPrice: 10m,
 			existingRealizedPnl: 0m,
-			positionExists: true,
 			side: Sides.Sell,
 			tradeQty: 100m,
 			tradePrice: 15m);
@@ -105,7 +117,6 @@ public class PositionRecalculationTests : BaseTestClass
 			existingQty: 100m,
 			existingAvgPrice: 10m,
 			existingRealizedPnl: 0m,
-			positionExists: true,
 			side: Sides.Sell,
 			tradeQty: 150m,
 			tradePrice: 15m);
@@ -124,7 +135,6 @@ public class PositionRecalculationTests : BaseTestClass
 			existingQty: -100m,
 			existingAvgPrice: 20m,
 			existingRealizedPnl: 0m,
-			positionExists: true,
 			side: Sides.Buy,
 			tradeQty: 100m,
 			tradePrice: 15m);
@@ -144,7 +154,6 @@ public class PositionRecalculationTests : BaseTestClass
 			existingQty: -100m,
 			existingAvgPrice: 20m,
 			existingRealizedPnl: 0m,
-			positionExists: true,
 			side: Sides.Sell,
 			tradeQty: 50m,
 			tradePrice: 10m);
@@ -163,7 +172,6 @@ public class PositionRecalculationTests : BaseTestClass
 			existingQty: 100m,
 			existingAvgPrice: 10m,
 			existingRealizedPnl: 200m,
-			positionExists: true,
 			side: Sides.Sell,
 			tradeQty: 40m,
 			tradePrice: 15m);
@@ -174,29 +182,40 @@ public class PositionRecalculationTests : BaseTestClass
 	}
 
 	[TestMethod]
-	public void DoubleCountGuard()
+	public void RejectsInvalidSide()
 	{
-		// The service itself is a deterministic pure function: ONE call == ONE apply. Idempotent
-		// single-apply is guaranteed by the gateway invoking it EXACTLY ONCE per recorded trade
-		// (RecordTradeAsync -> ApplyTradeAsync), which is why this test never asserts unrealized P&L.
+		// M07 input-domain guard: a side that is neither Buy nor Sell must fail loudly, never be
+		// silently coerced to Sell (which would corrupt the signed-quantity math).
+		ThrowsExactly<ArgumentOutOfRangeException>(
+			() => PositionRecalculationService.Recalculate(0m, 0m, 0m, (Sides)999, 100m, 10m));
+	}
 
-		// Single apply of one trade against a flat position.
-		var single = PositionRecalculationService.Recalculate(0m, 0m, 0m, false, Sides.Buy, 100m, 10m);
-		single.Quantity.AssertEqual(100m);
-		single.AveragePrice.AssertEqual(10m);
-		single.RealizedPnl.AssertEqual(0m);
+	[TestMethod]
+	public void RejectsNonPositiveQty()
+	{
+		// Zero or negative trade quantity is invalid (it would divide-by-zero or corrupt the average).
+		ThrowsExactly<ArgumentOutOfRangeException>(
+			() => PositionRecalculationService.Recalculate(0m, 0m, 0m, Sides.Buy, 0m, 10m));
+		ThrowsExactly<ArgumentOutOfRangeException>(
+			() => PositionRecalculationService.Recalculate(0m, 0m, 0m, Sides.Buy, -5m, 10m));
+	}
 
-		// The OLD hazard (LEGACY_LAYER.md:L74-89): the AFTER-INSERT trigger AND the standalone
-		// proc both recalculated the SAME trade, double-counting qty/avg/realized_pnl. If we
-		// (wrongly) feed the first result back and re-apply the identical trade, the quantity
-		// doubles - demonstrating why the refactor makes the C# service the SINGLE apply path
-		// (RecordTradeAsync -> ApplyTradeAsync exactly once) and removed the trigger's calc driver.
-		var doubleApplied = PositionRecalculationService.Recalculate(
-			single.Quantity, single.AveragePrice, single.RealizedPnl, true, Sides.Buy, 100m, 10m);
-		doubleApplied.Quantity.AssertEqual(200m);            // 100 doubled -> 200
+	[TestMethod]
+	public void RejectsNonPositivePrice()
+	{
+		// dbo.Trades.CHECK constrains price > 0; the pure core enforces the same contract.
+		ThrowsExactly<ArgumentOutOfRangeException>(
+			() => PositionRecalculationService.Recalculate(0m, 0m, 0m, Sides.Buy, 100m, 0m));
+		ThrowsExactly<ArgumentOutOfRangeException>(
+			() => PositionRecalculationService.Recalculate(0m, 0m, 0m, Sides.Buy, 100m, -1m));
+	}
 
-		// Exactly-once yields 100; a spurious second apply yields 200. They MUST differ.
-		(single.Quantity != doubleApplied.Quantity).AssertTrue();
+	[TestMethod]
+	public void RejectsOverflowInput()
+	{
+		// M08 range guard: a magnitude beyond DECIMAL(18,4) cannot be stored and must fail deterministically.
+		ThrowsExactly<OverflowException>(
+			() => PositionRecalculationService.Recalculate(0m, 0m, 0m, Sides.Buy, 1e20m, 10m));
 	}
 
 	[TestMethod]
@@ -208,7 +227,6 @@ public class PositionRecalculationTests : BaseTestClass
 			existingQty: 0m,
 			existingAvgPrice: 0m,
 			existingRealizedPnl: 0m,
-			positionExists: false,
 			side: Sides.Sell,
 			tradeQty: 100m,
 			tradePrice: 10m);
@@ -216,5 +234,481 @@ public class PositionRecalculationTests : BaseTestClass
 		result.Quantity.AssertEqual(-100m);
 		result.AveragePrice.AssertEqual(10m);
 		result.RealizedPnl.AssertEqual(0m);
+	}
+
+	// =====================================================================================
+	// Layer 2 - live integration + characterization/parity against the StockSharpLegacy DB.
+	// The rolled-back "Live_*" tests exercise the real ApplyTradeAsync persistence path over a fresh,
+	// unique (portfolio, security) scope and assert BOTH the returned state and the persisted
+	// dbo.Positions row against the legacy oracle captured from dbo.usp_RecalculatePositionOnTrade BEFORE
+	// the SQL layer was reduced to CRUD. The committed-scope tests (rollback, end-to-end, concurrency)
+	// clean up after themselves. All are gated on DB reachability via Inconclusive.
+	// =====================================================================================
+
+	private static async Task<SqlConnection> TryOpenLegacyAsync(CancellationToken cancellationToken = default)
+	{
+		SqlConnection connection = null;
+
+		try
+		{
+			connection = new SqlConnection(SqlLegacyConnection.Resolve());
+			await connection.OpenAsync(cancellationToken);
+			return connection;
+		}
+		catch (Exception)
+		{
+			if (connection is not null)
+				await connection.DisposeAsync();
+
+			return null;
+		}
+	}
+
+	private static SqlParameter IntParam(string name, int value) => new(name, SqlDbType.Int) { Value = value };
+
+	private static SqlParameter Money(string name, decimal value)
+		=> new(name, SqlDbType.Decimal) { Precision = 18, Scale = 4, Value = value };
+
+	// Inserts a fresh, collision-free portfolio + security and returns their IDENTITY ids.
+	private static async Task<(int PortfolioId, int SecurityId)> InsertScopeAsync(SqlConnection c, SqlTransaction t, CancellationToken ct)
+	{
+		var tag = Guid.NewGuid().ToString("N");
+		int portfolioId;
+		int securityId;
+
+		await using (var cmd = new SqlCommand("INSERT INTO dbo.Portfolios (name) OUTPUT INSERTED.portfolio_id VALUES (@n)", c, t))
+		{
+			cmd.Parameters.Add(new SqlParameter("@n", SqlDbType.NVarChar, 100) { Value = "TEST_" + tag });
+			portfolioId = (int)await cmd.ExecuteScalarAsync(ct);
+		}
+
+		await using (var cmd = new SqlCommand("INSERT INTO dbo.Securities (security_code, board_code) OUTPUT INSERTED.security_id VALUES (@c, @b)", c, t))
+		{
+			cmd.Parameters.Add(new SqlParameter("@c", SqlDbType.NVarChar, 50) { Value = "T" + tag.Substring(0, 10) });
+			cmd.Parameters.Add(new SqlParameter("@b", SqlDbType.NVarChar, 20) { Value = "TB" + tag.Substring(0, 6) });
+			securityId = (int)await cmd.ExecuteScalarAsync(ct);
+		}
+
+		return (portfolioId, securityId);
+	}
+
+	// Inserts one ACCEPTED order and returns its BIGINT id (side 'B' or 'S').
+	private static async Task<long> InsertOrderAsync(SqlConnection c, SqlTransaction t, int portfolioId, int securityId, char side, decimal qty, decimal price, CancellationToken ct)
+	{
+		await using var cmd = new SqlCommand(
+			"INSERT INTO dbo.Orders (portfolio_id, security_id, side, qty, price, order_type, status) " +
+			"OUTPUT INSERTED.order_id VALUES (@p, @s, @side, @qty, @price, 'LIMIT', 'ACCEPTED')", c, t);
+
+		cmd.Parameters.Add(IntParam("@p", portfolioId));
+		cmd.Parameters.Add(IntParam("@s", securityId));
+		cmd.Parameters.Add(new SqlParameter("@side", SqlDbType.Char, 1) { Value = side.ToString() });
+		cmd.Parameters.Add(Money("@qty", qty));
+		cmd.Parameters.Add(Money("@price", price));
+
+		return (long)await cmd.ExecuteScalarAsync(ct);
+	}
+
+	private static async Task InsertTradeAsync(SqlConnection c, SqlTransaction t, long orderId, decimal qty, decimal price, CancellationToken ct)
+	{
+		await using var cmd = new SqlCommand("INSERT INTO dbo.Trades (order_id, qty, price) VALUES (@o, @qty, @price)", c, t);
+		cmd.Parameters.Add(new SqlParameter("@o", SqlDbType.BigInt) { Value = orderId });
+		cmd.Parameters.Add(Money("@qty", qty));
+		cmd.Parameters.Add(Money("@price", price));
+		await cmd.ExecuteNonQueryAsync(ct);
+	}
+
+	// Reads the persisted position row for a scope (null when no row exists).
+	private static async Task<(decimal Qty, decimal Avg, decimal Realized)?> ReadPositionAsync(SqlConnection c, SqlTransaction t, int portfolioId, int securityId, CancellationToken ct)
+	{
+		await using var cmd = new SqlCommand(
+			"SELECT qty, avg_price, realized_pnl FROM dbo.Positions WHERE portfolio_id = @p AND security_id = @s", c, t);
+		cmd.Parameters.Add(IntParam("@p", portfolioId));
+		cmd.Parameters.Add(IntParam("@s", securityId));
+
+		await using var reader = await cmd.ExecuteReaderAsync(CommandBehavior.SingleRow, ct);
+
+		if (!await reader.ReadAsync(ct))
+			return null;
+
+		return (reader.GetDecimal(0), reader.GetDecimal(1), reader.GetDecimal(2));
+	}
+
+	// Runs the body against a fresh scope inside a transaction that is always rolled back.
+	private async Task RunWithFreshScopeAsync(Func<PositionRecalculationService, SqlConnection, SqlTransaction, int, int, Task> body)
+	{
+		await using var connection = await TryOpenLegacyAsync();
+
+		if (connection is null)
+		{
+			Inconclusive("StockSharpLegacy SQL Server is not reachable; skipping live position-recalculation integration test.");
+			return;
+		}
+
+		await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(IsolationLevel.ReadCommitted);
+
+		try
+		{
+			var service = new PositionRecalculationService(SqlLegacyConnection.Resolve());
+			var (portfolioId, securityId) = await InsertScopeAsync(connection, transaction, default);
+			await body(service, connection, transaction, portfolioId, securityId);
+		}
+		finally
+		{
+			await transaction.RollbackAsync();
+		}
+	}
+
+	// Removes every row a committed scope produced, children before parents (FK order).
+	private static async Task CleanupScopeAsync(string connectionString, int portfolioId, int securityId)
+	{
+		await using var cleanup = new SqlConnection(connectionString);
+		await cleanup.OpenAsync();
+
+		await using var cmd = new SqlCommand(
+			"""
+			DELETE h FROM dbo.OrderStatusHistory h JOIN dbo.Orders o ON o.order_id = h.order_id WHERE o.portfolio_id = @p;
+			DELETE FROM dbo.Trades WHERE order_id IN (SELECT order_id FROM dbo.Orders WHERE portfolio_id = @p);
+			DELETE FROM dbo.Orders WHERE portfolio_id = @p;
+			DELETE FROM dbo.Positions WHERE portfolio_id = @p;
+			DELETE FROM dbo.RiskLimits WHERE portfolio_id = @p;
+			DELETE FROM dbo.Securities WHERE security_id = @s;
+			DELETE FROM dbo.Portfolios WHERE portfolio_id = @p;
+			""", cleanup);
+		cmd.Parameters.Add(IntParam("@p", portfolioId));
+		cmd.Parameters.Add(IntParam("@s", securityId));
+		await cmd.ExecuteNonQueryAsync();
+	}
+
+	[TestMethod]
+	public Task Live_OpenLongPersists()
+		=> RunWithFreshScopeAsync(async (svc, c, t, pid, sid) =>
+		{
+			var orderId = await InsertOrderAsync(c, t, pid, sid, 'B', 100m, 150m, default);
+			await InsertTradeAsync(c, t, orderId, 100m, 150m, default);
+
+			var result = await svc.ApplyTradeAsync(c, t, orderId);
+			result.Quantity.AssertEqual(100m);
+			result.AveragePrice.AssertEqual(150m);
+			result.RealizedPnl.AssertEqual(0m);
+
+			// The persisted dbo.Positions row must match the returned state (real persistence path).
+			var persisted = await ReadPositionAsync(c, t, pid, sid, default);
+			persisted.HasValue.AssertTrue();
+			persisted.Value.Qty.AssertEqual(100m);
+			persisted.Value.Avg.AssertEqual(150m);
+			persisted.Value.Realized.AssertEqual(0m);
+		});
+
+	[TestMethod]
+	public Task Live_AddThenPartialClosePersists()
+		=> RunWithFreshScopeAsync(async (svc, c, t, pid, sid) =>
+		{
+			// Legacy oracle: open long 100@150 -> add 100@160 (qty200 avg155) -> sell 50@170 partial.
+			var buy1 = await InsertOrderAsync(c, t, pid, sid, 'B', 100m, 150m, default);
+			await InsertTradeAsync(c, t, buy1, 100m, 150m, default);
+			await svc.ApplyTradeAsync(c, t, buy1);
+
+			var buy2 = await InsertOrderAsync(c, t, pid, sid, 'B', 100m, 160m, default);
+			await InsertTradeAsync(c, t, buy2, 100m, 160m, default);
+			var added = await svc.ApplyTradeAsync(c, t, buy2);
+			added.Quantity.AssertEqual(200m);
+			added.AveragePrice.AssertEqual(155m);
+			added.RealizedPnl.AssertEqual(0m);
+
+			var sell = await InsertOrderAsync(c, t, pid, sid, 'S', 50m, 170m, default);
+			await InsertTradeAsync(c, t, sell, 50m, 170m, default);
+			var partial = await svc.ApplyTradeAsync(c, t, sell);
+			// closingQty 50 * (170 - 155) = 750 realized; remaining long 150 keeps avg 155.
+			partial.Quantity.AssertEqual(150m);
+			partial.AveragePrice.AssertEqual(155m);
+			partial.RealizedPnl.AssertEqual(750m);
+
+			var persisted = await ReadPositionAsync(c, t, pid, sid, default);
+			persisted.Value.Qty.AssertEqual(150m);
+			persisted.Value.Avg.AssertEqual(155m);
+			persisted.Value.Realized.AssertEqual(750m);
+		});
+
+	[TestMethod]
+	public Task Live_FlipLongToShortPersists()
+		=> RunWithFreshScopeAsync(async (svc, c, t, pid, sid) =>
+		{
+			// Legacy oracle flip: long 100@150 then sell 250@200 -> qty -150, avg 200, realized 5000.
+			var buy = await InsertOrderAsync(c, t, pid, sid, 'B', 100m, 150m, default);
+			await InsertTradeAsync(c, t, buy, 100m, 150m, default);
+			await svc.ApplyTradeAsync(c, t, buy);
+
+			var sell = await InsertOrderAsync(c, t, pid, sid, 'S', 250m, 200m, default);
+			await InsertTradeAsync(c, t, sell, 250m, 200m, default);
+			var flipped = await svc.ApplyTradeAsync(c, t, sell);
+			flipped.Quantity.AssertEqual(-150m);
+			flipped.AveragePrice.AssertEqual(200m);
+			flipped.RealizedPnl.AssertEqual(5000m);
+		});
+
+	[TestMethod]
+	public Task Live_FlipShortToLongPersists()
+		=> RunWithFreshScopeAsync(async (svc, c, t, pid, sid) =>
+		{
+			// Short-to-long flip: short 100@200 then buy 250@150.
+			// closingQty 100 * (150-200) * sign(-100) = 5000 realized; remaining 150 opens long at 150.
+			var sell = await InsertOrderAsync(c, t, pid, sid, 'S', 100m, 200m, default);
+			await InsertTradeAsync(c, t, sell, 100m, 200m, default);
+			await svc.ApplyTradeAsync(c, t, sell);
+
+			var buy = await InsertOrderAsync(c, t, pid, sid, 'B', 250m, 150m, default);
+			await InsertTradeAsync(c, t, buy, 250m, 150m, default);
+			var flipped = await svc.ApplyTradeAsync(c, t, buy);
+			flipped.Quantity.AssertEqual(150m);
+			flipped.AveragePrice.AssertEqual(150m);
+			flipped.RealizedPnl.AssertEqual(5000m);
+		});
+
+	[TestMethod]
+	public Task Live_LossRealizationPersists()
+		=> RunWithFreshScopeAsync(async (svc, c, t, pid, sid) =>
+		{
+			// Legacy oracle loss: buy 100@150 then sell 100@140 -> qty 0, avg 0, realized -1000.
+			var buy = await InsertOrderAsync(c, t, pid, sid, 'B', 100m, 150m, default);
+			await InsertTradeAsync(c, t, buy, 100m, 150m, default);
+			await svc.ApplyTradeAsync(c, t, buy);
+
+			var sell = await InsertOrderAsync(c, t, pid, sid, 'S', 100m, 140m, default);
+			await InsertTradeAsync(c, t, sell, 100m, 140m, default);
+			var closed = await svc.ApplyTradeAsync(c, t, sell);
+			closed.Quantity.AssertEqual(0m);
+			closed.AveragePrice.AssertEqual(0m);
+			closed.RealizedPnl.AssertEqual(-1000m);
+		});
+
+	[TestMethod]
+	public Task Live_MidpointRoundingPersists()
+		=> RunWithFreshScopeAsync(async (svc, c, t, pid, sid) =>
+		{
+			// Same-sign short add with a non-terminating average: short 100@20 then sell 50@10.
+			// avg = (100*20 + 50*10)/150 = 16.6666... -> DECIMAL(18,4) away-from-zero = 16.6667.
+			var sell1 = await InsertOrderAsync(c, t, pid, sid, 'S', 100m, 20m, default);
+			await InsertTradeAsync(c, t, sell1, 100m, 20m, default);
+			await svc.ApplyTradeAsync(c, t, sell1);
+
+			var sell2 = await InsertOrderAsync(c, t, pid, sid, 'S', 50m, 10m, default);
+			await InsertTradeAsync(c, t, sell2, 50m, 10m, default);
+			var result = await svc.ApplyTradeAsync(c, t, sell2);
+			result.Quantity.AssertEqual(-150m);
+			result.AveragePrice.AssertEqual(16.6667m);
+
+			// The persisted DECIMAL(18,4) row must carry the same rounded scale.
+			var persisted = await ReadPositionAsync(c, t, pid, sid, default);
+			persisted.Value.Avg.AssertEqual(16.6667m);
+		});
+
+	[TestMethod]
+	public Task Live_ApplyTradeIsIdempotent()
+		=> RunWithFreshScopeAsync(async (svc, c, t, pid, sid) =>
+		{
+			// C11 REAL double-count guard. One order, one persisted trade. Applying twice over the SAME
+			// persisted trade set must yield the SAME position (100), NOT double it (200) - the recompute
+			// reads all trades and folds from flat, so it is idempotent. The historical trigger+standalone
+			// hazard (LEGACY_LAYER.md:L74-L89) is structurally impossible here.
+			var orderId = await InsertOrderAsync(c, t, pid, sid, 'B', 100m, 150m, default);
+			await InsertTradeAsync(c, t, orderId, 100m, 150m, default);
+
+			var first = await svc.ApplyTradeAsync(c, t, orderId);
+			first.Quantity.AssertEqual(100m);
+
+			var second = await svc.ApplyTradeAsync(c, t, orderId);
+			second.Quantity.AssertEqual(100m);          // NOT 200 - idempotent
+			second.AveragePrice.AssertEqual(150m);
+			second.RealizedPnl.AssertEqual(0m);
+
+			var persisted = await ReadPositionAsync(c, t, pid, sid, default);
+			persisted.Value.Qty.AssertEqual(100m);      // persisted row is single-applied, not doubled
+		});
+
+	[TestMethod]
+	public Task Live_RecomputeSeesAllPersistedTrades()
+		=> RunWithFreshScopeAsync(async (svc, c, t, pid, sid) =>
+		{
+			// Complements the idempotency guard: after a SECOND real trade is persisted, the recompute
+			// reflects the full set (qty 200, avg 155) - proving it reads all trades, not a stale row.
+			var buy1 = await InsertOrderAsync(c, t, pid, sid, 'B', 100m, 150m, default);
+			await InsertTradeAsync(c, t, buy1, 100m, 150m, default);
+			var afterOne = await svc.ApplyTradeAsync(c, t, buy1);
+			afterOne.Quantity.AssertEqual(100m);
+
+			var buy2 = await InsertOrderAsync(c, t, pid, sid, 'B', 100m, 160m, default);
+			await InsertTradeAsync(c, t, buy2, 100m, 160m, default);
+			var afterTwo = await svc.ApplyTradeAsync(c, t, buy2);
+			afterTwo.Quantity.AssertEqual(200m);
+			afterTwo.AveragePrice.AssertEqual(155m);
+		});
+
+	[TestMethod]
+	public Task Live_OrderNotFoundThrows()
+		=> RunWithFreshScopeAsync(async (svc, c, t, pid, sid) =>
+		{
+			// An orderId with no dbo.Orders row cannot resolve a portfolio/security and must fail loudly.
+			await ThrowsAsync<InvalidOperationException>(async () => await svc.ApplyTradeAsync(c, t, 9_000_000_000L));
+		});
+
+	[TestMethod]
+	public async Task Live_RollbackDiscardsPersistedPosition()
+	{
+		var connectionString = SqlLegacyConnection.Resolve();
+
+		await using (var probe = await TryOpenLegacyAsync())
+		{
+			if (probe is null)
+			{
+				Inconclusive("StockSharpLegacy SQL Server is not reachable; skipping live rollback test.");
+				return;
+			}
+		}
+
+		int portfolioId;
+		int securityId;
+		long orderId;
+
+		// Commit a scope with one buy order but NO trade/position yet.
+		await using (var setup = new SqlConnection(connectionString))
+		{
+			await setup.OpenAsync();
+			await using var tx = (SqlTransaction)await setup.BeginTransactionAsync(IsolationLevel.ReadCommitted);
+			(portfolioId, securityId) = await InsertScopeAsync(setup, tx, default);
+			orderId = await InsertOrderAsync(setup, tx, portfolioId, securityId, 'B', 100m, 150m, default);
+			await tx.CommitAsync();
+		}
+
+		try
+		{
+			var service = new PositionRecalculationService(connectionString);
+
+			// In a SEPARATE transaction, insert a trade and persist the position, then ROLL BACK.
+			await using (var work = new SqlConnection(connectionString))
+			{
+				await work.OpenAsync();
+				await using var tx = (SqlTransaction)await work.BeginTransactionAsync(IsolationLevel.ReadCommitted);
+				await InsertTradeAsync(work, tx, orderId, 100m, 150m, default);
+				var applied = await service.ApplyTradeAsync(work, tx, orderId);
+				applied.Quantity.AssertEqual(100m);      // visible within the transaction
+
+				var within = await ReadPositionAsync(work, tx, portfolioId, securityId, default);
+				within.HasValue.AssertTrue();            // present before rollback
+
+				await tx.RollbackAsync();
+			}
+
+			// A fresh connection must see NO position row - the write was inside the rolled-back transaction.
+			await using (var verify = new SqlConnection(connectionString))
+			{
+				await verify.OpenAsync();
+				await using var tx = (SqlTransaction)await verify.BeginTransactionAsync(IsolationLevel.ReadCommitted);
+				var after = await ReadPositionAsync(verify, tx, portfolioId, securityId, default);
+				(after is null).AssertTrue();
+				await tx.RollbackAsync();
+			}
+		}
+		finally
+		{
+			await CleanupScopeAsync(connectionString, portfolioId, securityId);
+		}
+	}
+
+	[TestMethod]
+	public async Task Live_GatewayRecordTradeSingleApplyEndToEnd()
+	{
+		var connectionString = SqlLegacyConnection.Resolve();
+
+		await using (var probe = await TryOpenLegacyAsync())
+		{
+			if (probe is null)
+			{
+				Inconclusive("StockSharpLegacy SQL Server is not reachable; skipping live gateway end-to-end test.");
+				return;
+			}
+		}
+
+		int portfolioId;
+		int securityId;
+
+		await using (var setup = new SqlConnection(connectionString))
+		{
+			await setup.OpenAsync();
+			await using var tx = (SqlTransaction)await setup.BeginTransactionAsync(IsolationLevel.ReadCommitted);
+			(portfolioId, securityId) = await InsertScopeAsync(setup, tx, default);
+			await tx.CommitAsync();
+		}
+
+		try
+		{
+			var gateway = new SqlLegacyOrderGateway(connectionString);
+
+			// No RiskLimits row for this fresh scope -> unlimited -> the order is accepted.
+			var submit = await gateway.SubmitOrderAsync(portfolioId, securityId, Sides.Buy, 100m, 150m, OrderTypes.Limit);
+			submit.IsValid.AssertTrue();
+
+			// A single RecordTradeAsync must apply the fill EXACTLY once end-to-end (not double-count).
+			await gateway.RecordTradeAsync(submit.OrderId, 100m, 150m);
+
+			var position = await gateway.GetPositionAsync(portfolioId, securityId);
+			position.AssertNotNull();
+			position.Quantity.AssertEqual(100m);       // single apply -> 100, NOT 200
+			position.AveragePrice.AssertEqual(150m);
+			position.RealizedPnL.AssertEqual(0m);
+		}
+		finally
+		{
+			await CleanupScopeAsync(connectionString, portfolioId, securityId);
+		}
+	}
+
+	[TestMethod]
+	public async Task Live_ConcurrentFillsSerializeThroughGateway()
+	{
+		var connectionString = SqlLegacyConnection.Resolve();
+
+		await using (var probe = await TryOpenLegacyAsync())
+		{
+			if (probe is null)
+			{
+				Inconclusive("StockSharpLegacy SQL Server is not reachable; skipping live concurrent-fill test.");
+				return;
+			}
+		}
+
+		int portfolioId;
+		int securityId;
+		long orderId;
+
+		await using (var setup = new SqlConnection(connectionString))
+		{
+			await setup.OpenAsync();
+			await using var tx = (SqlTransaction)await setup.BeginTransactionAsync(IsolationLevel.ReadCommitted);
+			(portfolioId, securityId) = await InsertScopeAsync(setup, tx, default);
+			orderId = await InsertOrderAsync(setup, tx, portfolioId, securityId, 'B', 200m, 155m, default);
+			await tx.CommitAsync();
+		}
+
+		try
+		{
+			var gateway = new SqlLegacyOrderGateway(connectionString);
+
+			// Two concurrent fills of the same instrument. The service's UPDLOCK/HOLDLOCK on the position
+			// key serializes the recompute+persist, and because each recompute folds over ALL committed
+			// trades, the last writer sees both fills - so neither fill is lost (no double-count, no
+			// lost update). Final: qty 200, avg (100*150 + 100*160)/200 = 155.
+			var fillA = gateway.RecordTradeAsync(orderId, 100m, 150m);
+			var fillB = gateway.RecordTradeAsync(orderId, 100m, 160m);
+			await Task.WhenAll(fillA, fillB);
+
+			var position = await gateway.GetPositionAsync(portfolioId, securityId);
+			position.AssertNotNull();
+			position.Quantity.AssertEqual(200m);
+			position.AveragePrice.AssertEqual(155m);
+		}
+		finally
+		{
+			await CleanupScopeAsync(connectionString, portfolioId, securityId);
+		}
 	}
 }

@@ -4,12 +4,18 @@ using System.Data;
 
 using Microsoft.Data.SqlClient;
 
+using StockSharp.Algo.Risk;
+
 /// <summary>
-/// ADO.NET gateway onto the StockSharpLegacy stored-proc layer (schema and
-/// procs live under /Database at the repo root). Deliberately raw
-/// <see cref="SqlCommand"/> calls, not an ORM - this is meant to look like
-/// the real production call pattern (CommandType.StoredProcedure + output
-/// params), not a clean data-access abstraction.
+/// ADO.NET gateway onto the StockSharpLegacy database (schema lives under /Database at the repo
+/// root). Deliberately raw <see cref="SqlCommand"/> calls, not an ORM. Following the SQL -&gt; C#
+/// risk-logic consolidation this is a <i>pure data-access adapter</i>: it performs only plain
+/// parameterized INSERT/SELECT statements and delegates every risk decision and position
+/// calculation to the C# services in the <see cref="StockSharp.Algo.Risk"/> namespace -
+/// <see cref="PreTradeRiskService"/> for the seven-check pre-trade gate and
+/// <see cref="PositionRecalculationService"/> for average-cost / realized-P&amp;L. The database no
+/// longer holds any stored-procedure business logic, so there are no CommandType.StoredProcedure
+/// decisioning calls here any more (the old EXEC dbo.usp_SubmitOrder path is gone).
 ///
 /// This is an adapter that sits <i>alongside</i> <see cref="IEntityRegistry"/>,
 /// not a replacement for it: Securities/Exchanges/subscriptions are still
@@ -21,6 +27,8 @@ using Microsoft.Data.SqlClient;
 public class SqlLegacyOrderGateway
 {
 	private readonly string _connectionString;
+	private readonly PreTradeRiskService _preTradeRiskService;
+	private readonly PositionRecalculationService _positionRecalculationService;
 
 	/// <summary>
 	/// Initializes a new instance of the <see cref="SqlLegacyOrderGateway"/>.
@@ -32,6 +40,13 @@ public class SqlLegacyOrderGateway
 			throw new ArgumentNullException(nameof(connectionString));
 
 		_connectionString = connectionString;
+
+		// The gateway owns the two risk services that replaced the SQL stored procedures. They are
+		// constructed from the same connection string; the gateway passes them its own open connection
+		// and transaction (see SubmitOrderAsync / RecordTradeAsync) so validation, calculation and the
+		// INSERT it guards all run inside a single atomic unit.
+		_preTradeRiskService = new PreTradeRiskService(connectionString);
+		_positionRecalculationService = new PositionRecalculationService(connectionString);
 	}
 
 	private SqlConnection CreateConnection() => new(_connectionString);
@@ -104,66 +119,138 @@ public class SqlLegacyOrderGateway
 	}
 
 	/// <summary>
-	/// Submits an order through usp_SubmitOrder, which runs usp_ValidatePreTradeRisk
-	/// internally before inserting the row (accepted or rejected).
+	/// Submits an order: validates it against the seven pre-trade checks in
+	/// <see cref="PreTradeRiskService"/> and then records the row in dbo.Orders (ACCEPTED, or REJECTED
+	/// with a reject_reason - rejected orders are still recorded, not dropped, so there is an audit trail
+	/// of what was blocked and why). Validation and the INSERT execute inside ONE transaction guarded by a
+	/// per-portfolio application lock, so two concurrent submissions cannot both read stale state and both
+	/// slip past a shared limit (closes the check-then-act race, review finding C03). This replaces the old
+	/// EXEC dbo.usp_SubmitOrder / usp_ValidatePreTradeRisk path.
 	/// </summary>
+	/// <param name="portfolioId">The SQL-side portfolio identifier.</param>
+	/// <param name="securityId">The SQL-side security identifier.</param>
+	/// <param name="side">The order side.</param>
+	/// <param name="volume">The order quantity.</param>
+	/// <param name="price">The order price, or null for a market order.</param>
+	/// <param name="orderType">The order type (LIMIT or MARKET only).</param>
+	/// <param name="externalTransactionId">Optional external transaction identifier stored on the row.</param>
+	/// <param name="cancellationToken">The cancellation token.</param>
+	/// <returns>The submission outcome: the new order_id, whether it was accepted, and any reject reason.</returns>
 	public async Task<SqlOrderSubmitResult> SubmitOrderAsync(
 		int portfolioId, int securityId, Sides side, decimal volume, decimal? price, OrderTypes orderType,
-		long? externalTransactionId = null, string requestedBy = null, CancellationToken cancellationToken = default)
+		long? externalTransactionId = null, CancellationToken cancellationToken = default)
 	{
 		await using var connection = CreateConnection();
 		await connection.OpenAsync(cancellationToken);
+		await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(IsolationLevel.ReadCommitted, cancellationToken);
 
-		await using var command = new SqlCommand("dbo.usp_SubmitOrder", connection)
+		// Serialize concurrent submissions for this portfolio so the validate-then-insert sequence is a
+		// single atomic check-then-act. Portfolio scope (not portfolio+security) is deliberate: the
+		// frequency and commission checks are portfolio-wide, so a narrower lock would leave those races
+		// open. The lock is held for the life of the transaction and released on commit/rollback.
+		await AcquireOrderAppLockAsync(connection, transaction, portfolioId, cancellationToken);
+
+		var evaluation = await _preTradeRiskService.ValidateAsync(
+			connection, transaction, portfolioId, securityId, side, volume, price, orderType, cancellationToken);
+
+		var status = evaluation.IsValid ? "ACCEPTED" : "REJECTED";
+
+		long orderId;
+
+		// Plain parameterized INSERT - no decisioning here. Rejected orders are recorded too (with the
+		// reason). Note dbo.Orders.CK_Orders_qty enforces qty > 0, so an "Invalid qty" rejection is not
+		// storable and surfaces as a constraint error, exactly as the old usp_SubmitOrder INSERT did.
+		await using (var insert = new SqlCommand(
+			"""
+			INSERT INTO dbo.Orders (portfolio_id, security_id, side, qty, price, order_type, status, reject_reason, external_transaction_id)
+			OUTPUT INSERTED.order_id
+			VALUES (@portfolio_id, @security_id, @side, @qty, @price, @order_type, @status, @reject_reason, @external_transaction_id)
+			""", connection, transaction))
 		{
-			CommandType = CommandType.StoredProcedure,
-		};
+			insert.Parameters.Add(new SqlParameter("@portfolio_id", SqlDbType.Int) { Value = portfolioId });
+			insert.Parameters.Add(new SqlParameter("@security_id", SqlDbType.Int) { Value = securityId });
+			insert.Parameters.Add(new SqlParameter("@side", SqlDbType.Char, 1) { Value = side == Sides.Buy ? "B" : "S" });
+			insert.Parameters.Add(new SqlParameter("@qty", SqlDbType.Decimal) { Precision = 18, Scale = 4, Value = volume });
+			insert.Parameters.Add(new SqlParameter("@price", SqlDbType.Decimal) { Precision = 18, Scale = 4, Value = (object)price ?? DBNull.Value });
+			insert.Parameters.Add(new SqlParameter("@order_type", SqlDbType.VarChar, 10) { Value = MapOrderType(orderType) });
+			insert.Parameters.Add(new SqlParameter("@status", SqlDbType.VarChar, 10) { Value = status });
+			insert.Parameters.Add(new SqlParameter("@reject_reason", SqlDbType.NVarChar, 200) { Value = (object)evaluation.RejectReason ?? DBNull.Value });
+			insert.Parameters.Add(new SqlParameter("@external_transaction_id", SqlDbType.BigInt) { Value = (object)externalTransactionId ?? DBNull.Value });
 
-		command.Parameters.AddWithValue("@portfolio_id", portfolioId);
-		command.Parameters.AddWithValue("@security_id", securityId);
-		command.Parameters.AddWithValue("@side", side == Sides.Buy ? "B" : "S");
-		command.Parameters.AddWithValue("@qty", volume);
-		command.Parameters.AddWithValue("@price", (object)price ?? DBNull.Value);
-		command.Parameters.AddWithValue("@order_type", MapOrderType(orderType));
-		command.Parameters.AddWithValue("@external_transaction_id", (object)externalTransactionId ?? DBNull.Value);
-		command.Parameters.AddWithValue("@requested_by", (object)requestedBy ?? DBNull.Value);
+			orderId = (long)await insert.ExecuteScalarAsync(cancellationToken);
+		}
 
-		var orderIdParam = new SqlParameter("@order_id", SqlDbType.BigInt) { Direction = ParameterDirection.Output };
-		var isValidParam = new SqlParameter("@is_valid", SqlDbType.Bit) { Direction = ParameterDirection.Output };
-		var rejectReasonParam = new SqlParameter("@reject_reason", SqlDbType.NVarChar, 200) { Direction = ParameterDirection.Output };
-
-		command.Parameters.Add(orderIdParam);
-		command.Parameters.Add(isValidParam);
-		command.Parameters.Add(rejectReasonParam);
-
-		await command.ExecuteNonQueryAsync(cancellationToken);
+		await transaction.CommitAsync(cancellationToken);
 
 		return new()
 		{
-			OrderId = (long)orderIdParam.Value,
-			IsValid = (bool)isValidParam.Value,
-			RejectReason = rejectReasonParam.Value as string,
+			OrderId = orderId,
+			IsValid = evaluation.IsValid,
+			RejectReason = evaluation.RejectReason,
 		};
 	}
 
+	// Serializes concurrent order submissions for a portfolio using sp_getapplock in Transaction-owner
+	// mode. Combined with the enclosing transaction this makes validation + INSERT a single atomic
+	// check-then-act (C03/CWE-367): a second submission for the same portfolio waits here until the first
+	// commits, so it can no longer read pre-insert state and be accepted past a shared limit. The lock is
+	// released automatically when the transaction ends.
+	private static async Task AcquireOrderAppLockAsync(SqlConnection connection, SqlTransaction transaction, int portfolioId, CancellationToken cancellationToken)
+	{
+		await using var command = new SqlCommand("sys.sp_getapplock", connection, transaction)
+		{
+			CommandType = CommandType.StoredProcedure,
+		};
+		command.Parameters.Add(new SqlParameter("@Resource", SqlDbType.NVarChar, 255) { Value = $"StockSharpLegacy:Order:Portfolio:{portfolioId}" });
+		command.Parameters.Add(new SqlParameter("@LockMode", SqlDbType.VarChar, 32) { Value = "Exclusive" });
+		command.Parameters.Add(new SqlParameter("@LockOwner", SqlDbType.VarChar, 32) { Value = "Transaction" });
+		command.Parameters.Add(new SqlParameter("@LockTimeout", SqlDbType.Int) { Value = 15000 });
+
+		var returnValue = new SqlParameter { Direction = ParameterDirection.ReturnValue };
+		command.Parameters.Add(returnValue);
+
+		await command.ExecuteNonQueryAsync(cancellationToken);
+
+		// sp_getapplock returns >= 0 on success (0 granted immediately, 1 granted after waiting) and < 0
+		// on failure (-1 timeout, -2 cancelled, -3 deadlock victim, -999 validation error).
+		if (returnValue.Value is int returnCode && returnCode < 0)
+			throw new InvalidOperationException($"Could not acquire the order submission lock for portfolio {portfolioId} (sp_getapplock returned {returnCode}).");
+	}
+
 	/// <summary>
-	/// Records a fill against a SQL-side order. Inserting into dbo.Trades fires
-	/// trg_Trades_PositionRecalc automatically, which recomputes the position -
-	/// callers must NOT also invoke usp_RecalculatePositionOnTrade for the same
-	/// trade (see the warning in Database/002_StoredProcedures.sql).
+	/// Records a fill against a SQL-side order and recomputes the affected position. The dbo.Trades
+	/// INSERT and the position recompute run inside ONE transaction, and the recompute is performed
+	/// exactly once by <see cref="PositionRecalculationService"/>. The old trg_Trades_PositionRecalc
+	/// trigger - and the double-count hazard of the trigger and a standalone recalc both firing for the
+	/// same trade - is gone; the recompute is no longer "automatic" inside SQL.
 	/// </summary>
+	/// <param name="orderId">The order the fill is recorded against.</param>
+	/// <param name="qty">The fill quantity.</param>
+	/// <param name="price">The fill price.</param>
+	/// <param name="cancellationToken">The cancellation token.</param>
 	public async Task RecordTradeAsync(long orderId, decimal qty, decimal price, CancellationToken cancellationToken = default)
 	{
 		await using var connection = CreateConnection();
 		await connection.OpenAsync(cancellationToken);
+		await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(IsolationLevel.ReadCommitted, cancellationToken);
 
-		await using var command = new SqlCommand(
-			"INSERT INTO dbo.Trades (order_id, qty, price) VALUES (@order_id, @qty, @price)", connection);
-		command.Parameters.AddWithValue("@order_id", orderId);
-		command.Parameters.AddWithValue("@qty", qty);
-		command.Parameters.AddWithValue("@price", price);
+		// Plain parameterized INSERT of the fill.
+		await using (var insert = new SqlCommand(
+			"INSERT INTO dbo.Trades (order_id, qty, price) VALUES (@order_id, @qty, @price)", connection, transaction))
+		{
+			insert.Parameters.Add(new SqlParameter("@order_id", SqlDbType.BigInt) { Value = orderId });
+			insert.Parameters.Add(new SqlParameter("@qty", SqlDbType.Decimal) { Precision = 18, Scale = 4, Value = qty });
+			insert.Parameters.Add(new SqlParameter("@price", SqlDbType.Decimal) { Precision = 18, Scale = 4, Value = price });
 
-		await command.ExecuteNonQueryAsync(cancellationToken);
+			await insert.ExecuteNonQueryAsync(cancellationToken);
+		}
+
+		// Recompute the position from the persisted trade set exactly once, inside the same transaction.
+		// The service takes UPDLOCK/HOLDLOCK on the position row, so concurrent fills for the same
+		// position are serialized and the trade is applied once and only once (no double-count).
+		await _positionRecalculationService.ApplyTradeAsync(connection, transaction, orderId, cancellationToken);
+
+		await transaction.CommitAsync(cancellationToken);
 	}
 
 	/// <summary>

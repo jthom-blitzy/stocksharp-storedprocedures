@@ -25,7 +25,8 @@ public class PositionRecalcResult
 /// realized-P&amp;L tracking, ported from dbo.usp_RecalculatePositionOnTrade. This is the SINGLE
 /// entry point for position recalculation, invoked exactly once per trade by the gateway; there is
 /// no competing database trigger, which eliminates the historical double-count hazard. The pure math
-/// (<see cref="Recalculate"/>) is separated from the database read/write (<see cref="ApplyTradeAsync"/>)
+/// (<see cref="Recalculate"/>) is separated from the database read/write
+/// (<see cref="ApplyTradeAsync(SqlConnection, SqlTransaction, long, CancellationToken)"/>)
 /// so it is unit-testable without a database.
 /// </summary>
 public class PositionRecalculationService
@@ -55,13 +56,36 @@ public class PositionRecalculationService
 	/// <param name="existingQty">The current signed position quantity (0 when flat / no row).</param>
 	/// <param name="existingAvgPrice">The current average price (0 when flat / no row).</param>
 	/// <param name="existingRealizedPnl">The current cumulative realized P&amp;L (0 when no row).</param>
-	/// <param name="positionExists">Whether a position row already exists (kept for caller clarity; the math does not branch on it).</param>
-	/// <param name="side">The trade side.</param>
-	/// <param name="tradeQty">The trade quantity (&gt; 0).</param>
-	/// <param name="tradePrice">The trade price (&gt; 0).</param>
+	/// <param name="side">The trade side (must be <see cref="Sides.Buy"/> or <see cref="Sides.Sell"/>).</param>
+	/// <param name="tradeQty">The trade quantity (must be &gt; 0).</param>
+	/// <param name="tradePrice">The trade price (must be &gt; 0).</param>
 	/// <returns>The recomputed position.</returns>
-	public static PositionRecalcResult Recalculate(decimal existingQty, decimal existingAvgPrice, decimal existingRealizedPnl, bool positionExists, Sides side, decimal tradeQty, decimal tradePrice)
+	/// <exception cref="ArgumentOutOfRangeException">
+	/// <paramref name="side"/> is not Buy/Sell, or <paramref name="tradeQty"/>/<paramref name="tradePrice"/> is non-positive.
+	/// </exception>
+	/// <exception cref="OverflowException">Any input or computed output falls outside the DECIMAL(18,4) range.</exception>
+	public static PositionRecalcResult Recalculate(decimal existingQty, decimal existingAvgPrice, decimal existingRealizedPnl, Sides side, decimal tradeQty, decimal tradePrice)
 	{
+		// M07 - validate the full domain contract before any arithmetic (a non-Buy side must NOT be
+		// silently treated as Sell, and zero/negative qty or price must fail rather than divide by zero
+		// or corrupt the average-cost math).
+		if (side is not (Sides.Buy or Sides.Sell))
+			throw new ArgumentOutOfRangeException(nameof(side), side, "Trade side must be Buy or Sell.");
+
+		if (tradeQty <= 0)
+			throw new ArgumentOutOfRangeException(nameof(tradeQty), tradeQty, "Trade quantity must be positive.");
+
+		if (tradePrice <= 0)
+			throw new ArgumentOutOfRangeException(nameof(tradePrice), tradePrice, "Trade price must be positive.");
+
+		// M08 - normalize inputs to the persisted DECIMAL(18,4) scale/range so the C# math operates on
+		// exactly the values SQL Server stores, and out-of-range magnitudes fail deterministically.
+		existingQty = NormalizeMoney(existingQty, nameof(existingQty));
+		existingAvgPrice = NormalizeMoney(existingAvgPrice, nameof(existingAvgPrice));
+		existingRealizedPnl = NormalizeMoney(existingRealizedPnl, nameof(existingRealizedPnl));
+		tradeQty = NormalizeMoney(tradeQty, nameof(tradeQty));
+		tradePrice = NormalizeMoney(tradePrice, nameof(tradePrice));
+
 		// Signed trade quantity: buys add, sells subtract (mirrors the SQL CASE on @side).
 		var tradeSignedQty = side == Sides.Buy ? tradeQty : -tradeQty;
 
@@ -98,45 +122,84 @@ public class PositionRecalculationService
 			}
 		}
 
-		// Round to 4 dp (DECIMAL(18,4)) away-from-zero so sequential recomputations stay bit-identical to
-		// the SQL, which reads each subsequent trade off the 4dp-stored avg_price.
+		// NormalizeMoney rounds to 4 dp away-from-zero (so sequential recomputations stay bit-identical to
+		// the SQL, which reads each subsequent trade off the 4dp-stored avg_price) AND enforces the
+		// DECIMAL(18,4) range, so a computed value that could not be stored fails deterministically.
 		return new PositionRecalcResult
 		{
-			Quantity = Math.Round(newQty, 4, MidpointRounding.AwayFromZero),
-			AveragePrice = Math.Round(newAvgPrice, 4, MidpointRounding.AwayFromZero),
-			RealizedPnl = Math.Round(newRealizedPnl, 4, MidpointRounding.AwayFromZero),
+			Quantity = NormalizeMoney(newQty, nameof(newQty)),
+			AveragePrice = NormalizeMoney(newAvgPrice, nameof(newAvgPrice)),
+			RealizedPnl = NormalizeMoney(newRealizedPnl, nameof(newRealizedPnl)),
 		};
 	}
 
+	// Largest magnitude representable by the persisted DECIMAL(18,4) columns (18 digits, 4 after the point).
+	private const decimal _moneyMax = 99_999_999_999_999.9999m;
+
 	/// <summary>
-	/// Applies a single recorded trade to its portfolio position: looks up the trade's order, reads the
-	/// existing position, computes the new state via <see cref="Recalculate"/>, and persists it. Must be
-	/// called exactly once per recorded trade (the gateway's single entry point) — there is no trigger or
-	/// standalone job that also recalculates, so a trade is never double-applied.
+	/// Normalizes a decimal to the persisted DECIMAL(18,4) contract: rounds to 4 decimal places
+	/// away-from-zero and rejects any value outside the column's representable range with a
+	/// deterministic <see cref="OverflowException"/>.
 	/// </summary>
-	/// <param name="orderId">The order the trade belongs to (source of portfolio/security/side).</param>
-	/// <param name="tradeQty">The executed trade quantity.</param>
-	/// <param name="tradePrice">The executed trade price.</param>
-	/// <param name="cancellationToken">The cancellation token.</param>
-	public async Task ApplyTradeAsync(long orderId, decimal tradeQty, decimal tradePrice, CancellationToken cancellationToken = default)
+	private static decimal NormalizeMoney(decimal value, string name)
 	{
-		await using var connection = CreateConnection();
-		await connection.OpenAsync(cancellationToken);
+		var rounded = Math.Round(value, 4, MidpointRounding.AwayFromZero);
 
-		// The read-modify-write of the single dbo.Positions row is wrapped in one transaction so the
-		// position read (step 3) and the UPSERT (step 5) are atomic - the same atomicity the stored
-		// procedure relied on when it ran as a single batch.
-		await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(cancellationToken);
+		if (Math.Abs(rounded) > _moneyMax)
+			throw new OverflowException($"PositionRecalculationService: {name} value {value} is outside the DECIMAL(18,4) range.");
 
-		// Step 2 - resolve the order this trade belongs to (portfolio / security / side).
+		return rounded;
+	}
+
+	private static SqlParameter BigIntParam(string name, long value)
+		=> new(name, SqlDbType.BigInt) { Value = value };
+
+	private static SqlParameter IntParam(string name, int value)
+		=> new(name, SqlDbType.Int) { Value = value };
+
+	private static SqlParameter DecimalParam(string name, decimal value)
+		=> new(name, SqlDbType.Decimal) { Precision = 18, Scale = 4, Value = value };
+
+	/// <summary>
+	/// Recomputes and persists the position for the portfolio/security that owns <paramref name="orderId"/>,
+	/// enrolling in the caller's (gateway-owned) <paramref name="transaction"/> so the trade insertion and the
+	/// position mutation commit or roll back together.
+	/// <para>
+	/// The position is recomputed <b>deterministically from the entire persisted trade set</b> of the
+	/// portfolio/security (folding <see cref="Recalculate"/> over the trades in executed order) rather than
+	/// incrementally mutating the stored row. This makes the operation <b>idempotent</b>: re-running it for the
+	/// same persisted trades yields the same position, so no residual or repeated path can double-apply a trade
+	/// (the historical trigger/standalone double-count hazard, LEGACY_LAYER.md:L74-L89, is structurally
+	/// eliminated). Because the recompute reads the just-inserted trade through the shared transaction, the
+	/// caller must INSERT the trade into <c>dbo.Trades</c> before calling this method within the same transaction.
+	/// </para>
+	/// <para>
+	/// Concurrency: the position key is locked with <c>UPDLOCK, HOLDLOCK</c> for the duration of the caller's
+	/// transaction, serializing concurrent recalculations of the same portfolio/security and blocking a racing
+	/// first INSERT of the unique (portfolio_id, security_id) key (CWE-362).
+	/// </para>
+	/// </summary>
+	/// <param name="connection">The gateway-owned open connection enrolled in <paramref name="transaction"/>.</param>
+	/// <param name="transaction">The gateway-owned transaction that also covers the <c>dbo.Trades</c> INSERT.</param>
+	/// <param name="orderId">The order whose portfolio/security identifies the position to recompute.</param>
+	/// <param name="cancellationToken">The cancellation token.</param>
+	/// <returns>The recomputed position state that was persisted.</returns>
+	public async Task<PositionRecalcResult> ApplyTradeAsync(SqlConnection connection, SqlTransaction transaction, long orderId, CancellationToken cancellationToken = default)
+	{
+		if (connection is null)
+			throw new ArgumentNullException(nameof(connection));
+
+		if (transaction is null)
+			throw new ArgumentNullException(nameof(transaction));
+
+		// Step 1 - resolve the portfolio/security this order (and therefore the trade) belongs to.
 		int portfolioId;
 		int securityId;
-		Sides side;
 
 		await using (var orderCommand = new SqlCommand(
-			"SELECT portfolio_id, security_id, side FROM dbo.Orders WHERE order_id = @order_id", connection, transaction))
+			"SELECT portfolio_id, security_id FROM dbo.Orders WHERE order_id = @order_id", connection, transaction))
 		{
-			orderCommand.Parameters.AddWithValue("@order_id", orderId);
+			orderCommand.Parameters.Add(BigIntParam("@order_id", orderId));
 
 			await using var orderReader = await orderCommand.ExecuteReaderAsync(CommandBehavior.SingleRow, cancellationToken);
 
@@ -145,38 +208,65 @@ public class PositionRecalculationService
 
 			portfolioId = orderReader.GetInt32(0);
 			securityId = orderReader.GetInt32(1);
-
-			// dbo.Orders.side is CHAR(1) constrained to 'B'/'S'; mirror the SQL CASE (anything not 'B' is Sell).
-			side = orderReader.GetString(2) == "B" ? Sides.Buy : Sides.Sell;
 		}
 
-		// Step 3 - read the existing position; absent means flat (0 qty / 0 avg / 0 realized).
-		var existingQty = 0m;
-		var existingAvgPrice = 0m;
-		var existingRealizedPnl = 0m;
-		var positionExists = false;
+		// Step 2 - take an update/range lock on the position key (held to the end of the caller's
+		// transaction). This serializes concurrent fills of the same instrument and blocks a racing first
+		// INSERT of the unique key. It also tells us whether to UPDATE or INSERT below.
+		bool positionExists;
 
-		await using (var positionCommand = new SqlCommand(
-			"SELECT qty, avg_price, realized_pnl FROM dbo.Positions WHERE portfolio_id = @portfolio_id AND security_id = @security_id", connection, transaction))
+		await using (var lockCommand = new SqlCommand(
+			"SELECT qty FROM dbo.Positions WITH (UPDLOCK, HOLDLOCK) WHERE portfolio_id = @portfolio_id AND security_id = @security_id", connection, transaction))
 		{
-			positionCommand.Parameters.AddWithValue("@portfolio_id", portfolioId);
-			positionCommand.Parameters.AddWithValue("@security_id", securityId);
+			lockCommand.Parameters.Add(IntParam("@portfolio_id", portfolioId));
+			lockCommand.Parameters.Add(IntParam("@security_id", securityId));
 
-			await using var positionReader = await positionCommand.ExecuteReaderAsync(CommandBehavior.SingleRow, cancellationToken);
+			await using var lockReader = await lockCommand.ExecuteReaderAsync(CommandBehavior.SingleRow, cancellationToken);
+			positionExists = await lockReader.ReadAsync(cancellationToken);
+		}
 
-			if (await positionReader.ReadAsync(cancellationToken))
+		// Step 3 - deterministic recompute from the ENTIRE persisted trade set of this portfolio/security,
+		// ordered exactly like the removed trigger's cursor (executed_date, then trade_id). Folding the pure
+		// math from flat is idempotent: the same trades always produce the same position.
+		var qty = 0m;
+		var avgPrice = 0m;
+		var realizedPnl = 0m;
+
+		await using (var tradesCommand = new SqlCommand(
+			"SELECT o.side, t.qty, t.price " +
+			"FROM dbo.Trades t " +
+			"INNER JOIN dbo.Orders o ON o.order_id = t.order_id " +
+			"WHERE o.portfolio_id = @portfolio_id AND o.security_id = @security_id " +
+			"ORDER BY t.executed_date ASC, t.trade_id ASC", connection, transaction))
+		{
+			tradesCommand.Parameters.Add(IntParam("@portfolio_id", portfolioId));
+			tradesCommand.Parameters.Add(IntParam("@security_id", securityId));
+
+			await using var tradesReader = await tradesCommand.ExecuteReaderAsync(cancellationToken);
+
+			while (await tradesReader.ReadAsync(cancellationToken))
 			{
-				existingQty = positionReader.GetDecimal(0);
-				existingAvgPrice = positionReader.GetDecimal(1);
-				existingRealizedPnl = positionReader.GetDecimal(2);
-				positionExists = true;
+				// dbo.Orders.side is CHAR(1) constrained to 'B'/'S'.
+				var side = tradesReader.GetString(0) == "B" ? Sides.Buy : Sides.Sell;
+				var tradeQty = tradesReader.GetDecimal(1);
+				var tradePrice = tradesReader.GetDecimal(2);
+
+				var step = Recalculate(qty, avgPrice, realizedPnl, side, tradeQty, tradePrice);
+
+				qty = step.Quantity;
+				avgPrice = step.AveragePrice;
+				realizedPnl = step.RealizedPnl;
 			}
 		}
 
-		// Step 4 - pure recompute (identical math to dbo.usp_RecalculatePositionOnTrade).
-		var result = Recalculate(existingQty, existingAvgPrice, existingRealizedPnl, positionExists, side, tradeQty, tradePrice);
+		var result = new PositionRecalcResult
+		{
+			Quantity = qty,
+			AveragePrice = avgPrice,
+			RealizedPnl = realizedPnl,
+		};
 
-		// Step 5 - persist. unrealized_pnl is set to 0 on insert and is never maintained here; it stays an
+		// Step 4 - persist. unrealized_pnl is set to 0 on insert and is never maintained here; it stays an
 		// end-of-day mark-to-market concern (see dbo.Positions in Database/001_Schema.sql).
 		var persistSql = positionExists
 			? "UPDATE dbo.Positions SET qty = @q, avg_price = @ap, realized_pnl = @rp, updated_date = SYSUTCDATETIME() WHERE portfolio_id = @portfolio_id AND security_id = @security_id"
@@ -184,15 +274,39 @@ public class PositionRecalculationService
 
 		await using (var persistCommand = new SqlCommand(persistSql, connection, transaction))
 		{
-			persistCommand.Parameters.AddWithValue("@portfolio_id", portfolioId);
-			persistCommand.Parameters.AddWithValue("@security_id", securityId);
-			persistCommand.Parameters.AddWithValue("@q", result.Quantity);
-			persistCommand.Parameters.AddWithValue("@ap", result.AveragePrice);
-			persistCommand.Parameters.AddWithValue("@rp", result.RealizedPnl);
+			persistCommand.Parameters.Add(IntParam("@portfolio_id", portfolioId));
+			persistCommand.Parameters.Add(IntParam("@security_id", securityId));
+			persistCommand.Parameters.Add(DecimalParam("@q", result.Quantity));
+			persistCommand.Parameters.Add(DecimalParam("@ap", result.AveragePrice));
+			persistCommand.Parameters.Add(DecimalParam("@rp", result.RealizedPnl));
 
 			await persistCommand.ExecuteNonQueryAsync(cancellationToken);
 		}
 
+		return result;
+	}
+
+	/// <summary>
+	/// Self-contained convenience overload for standalone callers (e.g. an out-of-band reconciliation): opens
+	/// its own connection and transaction, delegates to
+	/// <see cref="ApplyTradeAsync(SqlConnection, SqlTransaction, long, CancellationToken)"/>, and commits. The
+	/// gateway does NOT use this overload on the trade-recording path — it uses the connection/transaction
+	/// overload so the trade insertion and position update are one atomic unit.
+	/// </summary>
+	/// <param name="orderId">The order whose portfolio/security identifies the position to recompute.</param>
+	/// <param name="cancellationToken">The cancellation token.</param>
+	/// <returns>The recomputed position state that was persisted.</returns>
+	public async Task<PositionRecalcResult> ApplyTradeAsync(long orderId, CancellationToken cancellationToken = default)
+	{
+		await using var connection = CreateConnection();
+		await connection.OpenAsync(cancellationToken);
+
+		await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(cancellationToken);
+
+		var result = await ApplyTradeAsync(connection, transaction, orderId, cancellationToken);
+
 		await transaction.CommitAsync(cancellationToken);
+
+		return result;
 	}
 }

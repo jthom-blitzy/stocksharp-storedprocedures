@@ -111,25 +111,67 @@ public class RiskLimitSet
 	public TimeSpan? MaxOrderFreqWindow => MaxOrderFreqWindowSeconds is int s ? TimeSpan.FromSeconds(s) : null;
 
 	/// <summary>
-	/// Gets a value indicating whether none of the seven order/position/commission ceilings is enforced.
+	/// The single, canonical "is this ceiling enforced?" rule, shared by every consumer of a
+	/// <see cref="RiskLimitSet"/> (the pre-trade gate <see cref="PreTradeRiskService"/> and the
+	/// circuit-breaker seed on <see cref="RiskManager"/>). A ceiling counts as enforced only when it
+	/// is non-null <b>and</b> strictly positive; a <see langword="null"/> value OR a non-positive
+	/// value (<c>0</c> or below) means "not enforced". This is the exact NULL/0 convention documented
+	/// for the <c>dbo.RiskLimits</c> table (see <c>Database/001_Schema.sql</c>) and used by the
+	/// existing <c>RiskRule</c> classes, expressed in one place so no consumer can drift from it.
+	/// </summary>
+	/// <param name="ceiling">The raw ceiling value read from the limit set.</param>
+	/// <returns><see langword="true"/> when the ceiling is enforced (non-null and <c>&gt; 0</c>).</returns>
+	public static bool IsCeilingEnforced(decimal? ceiling) => ceiling is decimal c && c > 0m;
+
+	/// <summary>The enforced order-price ceiling, or <see langword="null"/> when not enforced (null/non-positive).</summary>
+	public decimal? EffectiveMaxOrderPrice => IsCeilingEnforced(MaxOrderPrice) ? MaxOrderPrice : null;
+
+	/// <summary>The enforced order-quantity ceiling, or <see langword="null"/> when not enforced (null/non-positive).</summary>
+	public decimal? EffectiveMaxOrderQty => IsCeilingEnforced(MaxOrderQty) ? MaxOrderQty : null;
+
+	/// <summary>The enforced order-notional-value ceiling, or <see langword="null"/> when not enforced (null/non-positive).</summary>
+	public decimal? EffectiveMaxOrderValue => IsCeilingEnforced(MaxOrderValue) ? MaxOrderValue : null;
+
+	/// <summary>The enforced post-fill position-size ceiling, or <see langword="null"/> when not enforced (null/non-positive).</summary>
+	public decimal? EffectiveMaxPositionSize => IsCeilingEnforced(MaxPositionSize) ? MaxPositionSize : null;
+
+	/// <summary>The enforced daily-volume ceiling, or <see langword="null"/> when not enforced (null/non-positive).</summary>
+	public decimal? EffectiveMaxDailyVolume => IsCeilingEnforced(MaxDailyVolume) ? MaxDailyVolume : null;
+
+	/// <summary>The enforced cumulative-commission ceiling, or <see langword="null"/> when not enforced (null/non-positive).</summary>
+	public decimal? EffectiveMaxCommissionTotal => IsCeilingEnforced(MaxCommissionTotal) ? MaxCommissionTotal : null;
+
+	/// <summary>
+	/// Gets a value indicating whether the order-frequency limit is enforced. The count and window are
+	/// validated <b>as a pair</b>: the limit is enforced only when <see cref="MaxOrderFreqCount"/> and
+	/// <see cref="MaxOrderFreqWindowSeconds"/> are <b>both</b> present and strictly positive. A partial
+	/// configuration (only one of the two set), a zero, or a negative value disables the check rather
+	/// than producing a nonsensical always-reject or divide-by-window state.
+	/// </summary>
+	public bool IsFrequencyEnforced =>
+		MaxOrderFreqCount is int c && c > 0 &&
+		MaxOrderFreqWindowSeconds is int w && w > 0;
+
+	/// <summary>
+	/// Gets a value indicating whether none of the order/position/commission/frequency limits is enforced.
 	/// </summary>
 	/// <remarks>
-	/// This is <see langword="true"/> only when <see cref="MaxOrderPrice"/>, <see cref="MaxOrderQty"/>,
-	/// <see cref="MaxOrderValue"/>, <see cref="MaxPositionSize"/>, <see cref="MaxDailyVolume"/>,
-	/// <see cref="MaxOrderFreqCount"/> and <see cref="MaxCommissionTotal"/> are all <see langword="null"/>.
+	/// This is <see langword="true"/> only when every ceiling is "not enforced" under the single
+	/// canonical <see cref="IsCeilingEnforced(decimal?)"/> rule (null OR non-positive) and the
+	/// frequency pair is not enforced (<see cref="IsFrequencyEnforced"/> is <see langword="false"/>).
 	/// It deliberately excludes <see cref="MaxOrderFreqWindowSeconds"/> and <see cref="CommissionRate"/>,
 	/// which are not ceilings. This mirrors the branch of <c>dbo.usp_ValidatePreTradeRisk</c> where every
-	/// threshold is NULL, so there is nothing to enforce and the order is accepted immediately;
+	/// threshold is NULL/0, so there is nothing to enforce and the order is accepted immediately;
 	/// <c>PreTradeRiskService</c> uses it to short-circuit straight to ACCEPT.
 	/// </remarks>
 	public bool IsUnlimited =>
-		MaxOrderPrice is null &&
-		MaxOrderQty is null &&
-		MaxOrderValue is null &&
-		MaxPositionSize is null &&
-		MaxDailyVolume is null &&
-		MaxOrderFreqCount is null &&
-		MaxCommissionTotal is null;
+		!IsCeilingEnforced(MaxOrderPrice) &&
+		!IsCeilingEnforced(MaxOrderQty) &&
+		!IsCeilingEnforced(MaxOrderValue) &&
+		!IsCeilingEnforced(MaxPositionSize) &&
+		!IsCeilingEnforced(MaxDailyVolume) &&
+		!IsCeilingEnforced(MaxCommissionTotal) &&
+		!IsFrequencyEnforced;
 
 	/// <summary>
 	/// Selects the single most-specific active limit set for the given scope, mirroring the
@@ -138,7 +180,12 @@ public class RiskLimitSet
 	/// <see cref="EffectiveDate"/>. Only <see cref="IsActive"/> rows whose scope keys match
 	/// (or are null/wildcard) are considered.
 	/// </summary>
-	/// <param name="candidates">The candidate limit sets (e.g. the rows loaded from dbo.RiskLimits). Cannot be null.</param>
+	/// <param name="candidates">
+	/// The candidate limit sets (e.g. the rows loaded from dbo.RiskLimits). Cannot be null; any
+	/// <see langword="null"/> element is skipped defensively rather than throwing, so a sparse or
+	/// partially-populated candidate collection produces a well-defined result instead of a
+	/// <see cref="NullReferenceException"/>.
+	/// </param>
 	/// <param name="portfolioId">The portfolio identifier to match.</param>
 	/// <param name="securityId">The security identifier to match.</param>
 	/// <returns>The most-specific matching set, or null when none applies.</returns>
@@ -148,7 +195,8 @@ public class RiskLimitSet
 			throw new ArgumentNullException(nameof(candidates));
 
 		return candidates
-			.Where(c => c.IsActive
+			.Where(c => c is not null
+				&& c.IsActive
 				&& (c.PortfolioId == portfolioId || c.PortfolioId is null)
 				&& (c.SecurityId == securityId || c.SecurityId is null))
 			.OrderBy(c => c.PortfolioId is not null && c.SecurityId is not null ? 0
