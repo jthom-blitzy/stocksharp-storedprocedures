@@ -1680,8 +1680,9 @@ public class RiskTests : BaseTestClass
 	[TestMethod]
 	public void OrderFreqZeroIntervalDisabled()
 	{
-		// A zero (or negative) Interval means "not enforced" - without this the
-		// window would collapse and a Count=1 rule would trip on every order.
+		// A zero Interval means "not enforced" (a negative one is rejected by the
+		// setter, so it cannot reach here) - without this the window would collapse
+		// and a Count=1 rule would trip on every order.
 		var rule = new RiskOrderFreqRule { Count = 1, Interval = TimeSpan.Zero };
 		var now = DateTime.UtcNow;
 
@@ -1733,79 +1734,85 @@ public class RiskTests : BaseTestClass
 	}
 
 	[TestMethod]
-	public void OrderPriceExceededHelperParity()
+	public void OrderPriceRuleBoundary()
 	{
-		// MJ-3: single shared decision for the order-price ceiling. Both the
-		// RiskManager stream rule (ProcessMessage) and the PreTradeRiskService gate
-		// route through IsOrderPriceExceeded, so 0 = "not enforced" and the ">="
-		// boundary can never diverge between the two enforcement patterns.
-		RiskOrderPriceRule.IsOrderPriceExceeded(90m, 100m).AssertFalse();
-		RiskOrderPriceRule.IsOrderPriceExceeded(100m, 100m).AssertTrue();   // boundary (">=")
-		RiskOrderPriceRule.IsOrderPriceExceeded(110m, 100m).AssertTrue();
-		RiskOrderPriceRule.IsOrderPriceExceeded(1_000m, 0m).AssertFalse();  // 0 = not enforced
+		// The reference RiskOrderPriceRule (circuit-breaker path) rejects on a raw
+		// ">=" comparison; the ">=" ("meets or exceeds") boundary is preserved, so
+		// an order exactly AT the limit is rejected. The OrderReplace path also
+		// requires a positive price. The pre-trade gate (PreTradeRiskService) applies
+		// the SAME ">=" boundary but layers the SQL "0 = not enforced" convention on
+		// top of it - a difference of application point, not a shared helper, and
+		// covered by the Gate* tests. This test pins the reference rule's own boundary.
+		var rule = new RiskOrderPriceRule { Price = 100m };
+		var sid = Helper.CreateSecurityId();
 
-		// The canonical rule's ProcessMessage MUST agree with the helper, including
-		// the 0 = "not enforced" case: before MJ-3 the rule tripped at price >= 0
-		// (0 meant "always reject") while the gate treated 0 as disabled - divergent.
-		var enforced = new RiskOrderPriceRule { Price = 100m };
-		enforced.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Price = 100m }).AssertTrue();
-		enforced.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Price = 90m }).AssertFalse();
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = sid, Price = 90m }).AssertFalse();
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = sid, Price = 100m }).AssertTrue();  // boundary (">=")
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = sid, Price = 110m }).AssertTrue();
 
-		var disabled = new RiskOrderPriceRule { Price = 0m };
-		disabled.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Price = 1_000m }).AssertFalse();
+		// OrderReplace requires price > 0 alongside the ">=" comparison.
+		rule.ProcessMessage(new OrderReplaceMessage { SecurityId = sid, Price = 100m }).AssertTrue();   // boundary (">=")
+		rule.ProcessMessage(new OrderReplaceMessage { SecurityId = sid, Price = 0m }).AssertFalse();     // price <= 0 not evaluated
 	}
 
 	[TestMethod]
-	public void OrderVolumeExceededHelperParity()
+	public void OrderVolumeRuleBoundary()
 	{
-		// MJ-3: single shared decision for the order-quantity ceiling, mirroring the
-		// price rule. Both enforcement patterns route through IsOrderVolumeExceeded.
-		RiskOrderVolumeRule.IsOrderVolumeExceeded(500m, 1_000m).AssertFalse();
-		RiskOrderVolumeRule.IsOrderVolumeExceeded(1_000m, 1_000m).AssertTrue();  // boundary (">=")
-		RiskOrderVolumeRule.IsOrderVolumeExceeded(1_500m, 1_000m).AssertTrue();
-		RiskOrderVolumeRule.IsOrderVolumeExceeded(1_000_000m, 0m).AssertFalse(); // 0 = not enforced
+		// Mirrors OrderPriceRuleBoundary for the order-quantity ceiling: the
+		// reference RiskOrderVolumeRule rejects on a raw ">=" comparison (boundary
+		// preserved), and OrderReplace additionally requires a positive volume. The
+		// gate applies the same ">=" boundary plus the "0 = not enforced" convention
+		// (an application-point difference covered by the Gate* tests).
+		var rule = new RiskOrderVolumeRule { Volume = 1_000m };
+		var sid = Helper.CreateSecurityId();
 
-		var enforced = new RiskOrderVolumeRule { Volume = 1_000m };
-		enforced.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Volume = 1_000m }).AssertTrue();
-		enforced.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Volume = 500m }).AssertFalse();
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = sid, Volume = 500m }).AssertFalse();
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = sid, Volume = 1_000m }).AssertTrue();  // boundary (">=")
+		rule.ProcessMessage(new OrderRegisterMessage { SecurityId = sid, Volume = 1_500m }).AssertTrue();
 
-		var disabled = new RiskOrderVolumeRule { Volume = 0m };
-		disabled.ProcessMessage(new OrderRegisterMessage { SecurityId = Helper.CreateSecurityId(), Volume = 1_000_000m }).AssertFalse();
+		// OrderReplace requires volume > 0 alongside the ">=" comparison.
+		rule.ProcessMessage(new OrderReplaceMessage { SecurityId = sid, Volume = 1_000m }).AssertTrue();   // boundary (">=")
+		rule.ProcessMessage(new OrderReplaceMessage { SecurityId = sid, Volume = 0m }).AssertFalse();       // volume <= 0 not evaluated
 	}
 
-	// --- Position size: canonical SYMMETRIC-ABSOLUTE comparison --------------
+	// --- Position size: reference rule is DIRECTIONAL (gate projects post-fill ABS) --
 
 	[TestMethod]
-	public void PositionSizeShortTripsPositiveLimit()
+	public void PositionSizeRuleDirectionalBoundary()
 	{
-		// Canonical rule uses |value| >= |limit|, so a SHORT position breaches a
-		// POSITIVE configured limit once its magnitude reaches it. A directional
-		// (signed) comparison would have missed this and been less strict.
-		var rule = new RiskPositionSizeRule
+		// The reference RiskPositionSizeRule (circuit-breaker path) is DIRECTIONAL,
+		// not symmetric-absolute: a POSITIVE limit caps long exposure
+		// (currentValue >= limit), a NEGATIVE limit caps short exposure
+		// (currentValue <= limit), and a zero limit disables the check. A short
+		// position therefore does NOT trip a positive limit. The pre-trade gate
+		// applies the same configured threshold as a post-fill ABSOLUTE projection
+		// (a different application point, documented in LEGACY_LAYER.md and covered
+		// by GatePositionSizeUsesPostFillProjection); this test pins the reference
+		// rule's own directional boundary.
+		var sid = Helper.CreateSecurityId();
+
+		bool Trip(decimal limit, decimal current)
 		{
-			Position = 100,
-			Action = RiskActions.CancelOrders
-		};
+			var rule = new RiskPositionSizeRule { Position = limit, Action = RiskActions.CancelOrders };
+			var msg = new PositionChangeMessage { SecurityId = sid, ServerTime = DateTime.UtcNow, PortfolioName = _pfName };
+			msg.Add(PositionChangeTypes.CurrentValue, current);
+			return rule.ProcessMessage(msg);
+		}
 
-		var within = new PositionChangeMessage { SecurityId = Helper.CreateSecurityId(), ServerTime = DateTime.UtcNow, PortfolioName = _pfName };
-		within.Add(PositionChangeTypes.CurrentValue, -50m);
-		rule.ProcessMessage(within).AssertFalse();
+		// Positive limit caps LONG exposure, directionally.
+		Trip(100m, 50m).AssertFalse();
+		Trip(100m, 100m).AssertTrue();    // boundary (">=")
+		Trip(100m, 150m).AssertTrue();
+		Trip(100m, -150m).AssertFalse();  // a SHORT does NOT trip a positive limit (directional)
 
-		var breach = new PositionChangeMessage { SecurityId = Helper.CreateSecurityId(), ServerTime = DateTime.UtcNow, PortfolioName = _pfName };
-		breach.Add(PositionChangeTypes.CurrentValue, -150m);
-		rule.ProcessMessage(breach).AssertTrue();
-	}
+		// Negative limit caps SHORT exposure, directionally.
+		Trip(-100m, -50m).AssertFalse();
+		Trip(-100m, -100m).AssertTrue();  // boundary ("<=")
+		Trip(-100m, -150m).AssertTrue();
+		Trip(-100m, 150m).AssertFalse();  // a LONG does NOT trip a negative limit (directional)
 
-	[TestMethod]
-	public void PositionSizeExceededHelperParity()
-	{
-		// Shared symmetric-absolute decision used by both the circuit breaker
-		// (live value) and the pre-trade gate (post-fill projection).
-		RiskPositionSizeRule.IsPositionSizeExceeded(50m, 100m).AssertFalse();
-		RiskPositionSizeRule.IsPositionSizeExceeded(100m, 100m).AssertTrue();   // boundary
-		RiskPositionSizeRule.IsPositionSizeExceeded(-150m, 100m).AssertTrue();  // short breaches positive limit
-		RiskPositionSizeRule.IsPositionSizeExceeded(150m, -100m).AssertTrue();  // long breaches negative limit
-		RiskPositionSizeRule.IsPositionSizeExceeded(1_000_000m, 0m).AssertFalse(); // 0 = not enforced
+		// Zero limit disables the check.
+		Trip(0m, 1_000_000m).AssertFalse();
 	}
 
 	// --- Daily traded volume: relocated from SQL-only, cumulative in stream --
@@ -2325,6 +2332,51 @@ public class RiskTests : BaseTestClass
 	}
 
 	[TestMethod]
+	public async Task GateConfigValidationPrecedesRuleEvaluation()
+	{
+		// MN-1: define and pin the failure PRECEDENCE explicitly. Whole-row RiskLimits
+		// configuration validation (MJ-2: a negative threshold or inconsistent frequency
+		// config fails CLOSED) runs BEFORE any RULE 1-7 order comparison. When the
+		// selected row is mis-configured the gate therefore reports the CONFIGURATION
+		// error - never a per-rule verdict computed from a row it has already judged
+		// invalid - irrespective of whether the order itself is in- or out-of-limits.
+		// (Within the config block the negative-threshold checks run in a fixed order -
+		// price, qty, value, position, daily, commission total, commission rate, freq
+		// count, freq window - followed by the frequency-consistency check.)
+		await using var conn = await OpenLegacyOrInconclusiveAsync();
+		var svc = NewGateService();
+
+		// Scenario A - config validation fires even when the order would otherwise be
+		// ACCEPTED by every rule. The row has a valid, non-breached price ceiling (1000)
+		// but a NEGATIVE frequency window (-1), which is invalid config. The order
+		// (price 150) is well under 1000, so RULES 1-7 would accept; the gate instead
+		// rejects on the config error, proving config validation is unconditional.
+		var pfA = await InsertPortfolioAsync(conn);
+		var secA = await InsertSecurityAsync(conn);
+		await InsertRiskLimitAsync(conn, pfA, maxOrderPrice: 1000m, maxOrderFreqCount: 5, maxOrderFreqWindowSec: -1);
+
+		var wouldPassRules = await svc.ValidateAsync(pfA, secA, Sides.Buy, 1m, 150m, OrderTypes.Limit);
+		wouldPassRules.IsValid.AssertFalse();
+		wouldPassRules.RejectionKind.AssertEqual(PreTradeRejectionKind.RiskLimit);
+		wouldPassRules.RejectReason.Contains("failing closed").AssertTrue();
+
+		// Scenario B - when a config error AND a genuine rule breach BOTH apply, the
+		// config error WINS. The row has a NEGATIVE frequency window (-1) AND a price
+		// ceiling (500) that the order (price 999) breaches. The gate must report the
+		// CONFIG error ("failing closed"), NOT the RULE 1 price verdict ("meets/exceeds"),
+		// because it rejects the invalid row before it ever evaluates the price rule.
+		var pfB = await InsertPortfolioAsync(conn);
+		var secB = await InsertSecurityAsync(conn);
+		await InsertRiskLimitAsync(conn, pfB, maxOrderPrice: 500m, maxOrderFreqCount: 5, maxOrderFreqWindowSec: -1);
+
+		var configBeatsRule = await svc.ValidateAsync(pfB, secB, Sides.Buy, 1m, 999m, OrderTypes.Limit);
+		configBeatsRule.IsValid.AssertFalse();
+		configBeatsRule.RejectionKind.AssertEqual(PreTradeRejectionKind.RiskLimit);
+		configBeatsRule.RejectReason.Contains("failing closed").AssertTrue();   // config error reported
+		configBeatsRule.RejectReason.Contains("meets/exceeds").AssertFalse();   // NOT the rule verdict
+	}
+
+	[TestMethod]
 	public async Task GateSelectsMostSpecificRiskLimits()
 	{
 		// The gate must select the most-specific RiskLimits row: portfolio+security
@@ -2374,41 +2426,21 @@ public class RiskTests : BaseTestClass
 
 	// =====================================================================
 	// DB-integration tests for the gateway (SqlLegacyOrderGateway) against a
-	// live StockSharpLegacy SQL Server. These exercise CR-4 idempotency
-	// (submission + trade recording), the MJ-1 malformed-vs-risk persistence
-	// contract, MJ-4 concurrency, and the end-to-end DB position recompute.
-	// Each test uses a uniquely-named portfolio/security and a random 64-bit
-	// idempotency key so it is isolated from seeded data, from other tests, and
-	// from prior runs (the idempotency indexes are global, not per-portfolio).
+	// live StockSharpLegacy SQL Server. These exercise the MJ-1
+	// malformed-vs-risk persistence contract (a malformed request throws and
+	// persists nothing; a risk-rejected order is recorded as REJECTED) and the
+	// end-to-end DB position recompute through PositionRecalculationService.
+	// Each test uses a uniquely-named portfolio/security so it is isolated from
+	// seeded data, from other tests, and from prior runs.
 	// =====================================================================
 
 	private static SqlLegacyOrderGateway NewGateway() => new(SqlLegacyConnection.Resolve());
-
-	// Random 64-bit idempotency key. Guid entropy makes cross-run collisions on the
-	// global UX_Orders_external_transaction_id / UX_Trades_execution_id indexes negligible.
-	private static long NextKey() => BitConverter.ToInt64(Guid.NewGuid().ToByteArray(), 0);
-
-	private static async Task<int> CountOrdersByTransactionAsync(SqlConnection conn, long externalTransactionId, CancellationToken ct = default)
-	{
-		await using var cmd = new SqlCommand(
-			"SELECT COUNT(*) FROM dbo.Orders WHERE external_transaction_id = @txn", conn);
-		cmd.Parameters.AddWithValue("@txn", externalTransactionId);
-		return (int)await cmd.ExecuteScalarAsync(ct);
-	}
 
 	private static async Task<int> CountOrdersByPortfolioAsync(SqlConnection conn, int portfolioId, CancellationToken ct = default)
 	{
 		await using var cmd = new SqlCommand(
 			"SELECT COUNT(*) FROM dbo.Orders WHERE portfolio_id = @pf", conn);
 		cmd.Parameters.AddWithValue("@pf", portfolioId);
-		return (int)await cmd.ExecuteScalarAsync(ct);
-	}
-
-	private static async Task<int> CountTradesByExecutionAsync(SqlConnection conn, long executionId, CancellationToken ct = default)
-	{
-		await using var cmd = new SqlCommand(
-			"SELECT COUNT(*) FROM dbo.Trades WHERE execution_id = @exec", conn);
-		cmd.Parameters.AddWithValue("@exec", executionId);
 		return (int)await cmd.ExecuteScalarAsync(ct);
 	}
 
@@ -2423,33 +2455,13 @@ public class RiskTests : BaseTestClass
 	}
 
 	[TestMethod]
-	public async Task GatewaySubmitIsIdempotentOnTransactionId()
+	public async Task GatewaySubmitMalformedRequestThrowsAndPersistsNothing()
 	{
-		// CR-4: a retried submit with the same external_transaction_id must return the
-		// ORIGINAL order's outcome and never create a second order row.
-		await using var conn = await OpenLegacyOrInconclusiveAsync();
-		var pfId = await InsertPortfolioAsync(conn);
-		var secId = await InsertSecurityAsync(conn);
-		await InsertRiskLimitAsync(conn, pfId, maxOrderPrice: 1_000_000m);
-
-		var gateway = NewGateway();
-		var txnId = NextKey();
-
-		var first = await gateway.SubmitOrderAsync(pfId, secId, Sides.Buy, 100m, 150m, OrderTypes.Limit, externalTransactionId: txnId);
-		var second = await gateway.SubmitOrderAsync(pfId, secId, Sides.Buy, 100m, 150m, OrderTypes.Limit, externalTransactionId: txnId);
-
-		first.IsValid.AssertTrue();
-		first.OrderId.AssertNotNull();
-		second.IsValid.AssertTrue();
-		second.OrderId.AssertEqual(first.OrderId); // same order returned, not a new one
-		(await CountOrdersByTransactionAsync(conn, txnId)).AssertEqual(1);
-	}
-
-	[TestMethod]
-	public async Task GatewayRecordTradeIsIdempotentOnExecutionId()
-	{
-		// CR-4: a retried RecordTrade with the same execution_id must insert exactly one
-		// trade and apply the position effect exactly once (no double-count).
+		// MJ-1: a malformed request (invalid side / non-positive quantity) is an INPUT
+		// error, not a risk decision. The gateway surfaces it as an ArgumentException and
+		// rolls back WITHOUT persisting any dbo.Orders row - such a row would violate the
+		// CHECK constraints or require mapping an invalid enum. (A well-formed risk-limit
+		// breach, by contrast, IS recorded as REJECTED - see the next test.)
 		await using var conn = await OpenLegacyOrInconclusiveAsync();
 		var pfId = await InsertPortfolioAsync(conn);
 		var secId = await InsertSecurityAsync(conn);
@@ -2457,41 +2469,13 @@ public class RiskTests : BaseTestClass
 
 		var gateway = NewGateway();
 
-		var submit = await gateway.SubmitOrderAsync(pfId, secId, Sides.Buy, 100m, 150m, OrderTypes.Limit);
-		submit.OrderId.AssertNotNull();
-		var orderId = submit.OrderId.Value;
-		var execId = NextKey();
+		// Invalid side has no dbo.Orders CHAR mapping: thrown, not persisted.
+		await ThrowsExactlyAsync<ArgumentException>(
+			async () => await gateway.SubmitOrderAsync(pfId, secId, (Sides)999, 100m, 150m, OrderTypes.Limit));
 
-		await gateway.RecordTradeAsync(orderId, 100m, 150m, executionId: execId);
-		await gateway.RecordTradeAsync(orderId, 100m, 150m, executionId: execId); // replay
-
-		(await CountTradesByExecutionAsync(conn, execId)).AssertEqual(1);
-
-		var position = await gateway.GetPositionAsync(pfId, secId);
-		position.AssertNotNull();
-		position.Quantity.AssertEqual(100m);   // applied once, not 200
-		position.AveragePrice.AssertEqual(150m);
-	}
-
-	[TestMethod]
-	public async Task GatewaySubmitInvalidRequestReturnsResultWithoutPersisting()
-	{
-		// MJ-1: a malformed request (bad side / non-positive qty) returns a rejection
-		// RESULT (no throw) and does NOT persist an Orders row (OrderId is null).
-		await using var conn = await OpenLegacyOrInconclusiveAsync();
-		var pfId = await InsertPortfolioAsync(conn);
-		var secId = await InsertSecurityAsync(conn);
-		await InsertRiskLimitAsync(conn, pfId, maxOrderPrice: 1_000_000m);
-
-		var gateway = NewGateway();
-
-		var badSide = await gateway.SubmitOrderAsync(pfId, secId, (Sides)999, 100m, 150m, OrderTypes.Limit);
-		badSide.IsValid.AssertFalse();
-		badSide.OrderId.AssertNull();
-
-		var badQty = await gateway.SubmitOrderAsync(pfId, secId, Sides.Buy, 0m, 150m, OrderTypes.Limit);
-		badQty.IsValid.AssertFalse();
-		badQty.OrderId.AssertNull();
+		// Non-positive quantity violates CK_Orders_qty: thrown, not persisted.
+		await ThrowsExactlyAsync<ArgumentException>(
+			async () => await gateway.SubmitOrderAsync(pfId, secId, Sides.Buy, 0m, 150m, OrderTypes.Limit));
 
 		// Nothing was written for either malformed request.
 		(await CountOrdersByPortfolioAsync(conn, pfId)).AssertEqual(0);
@@ -2513,50 +2497,21 @@ public class RiskTests : BaseTestClass
 		var result = await gateway.SubmitOrderAsync(pfId, secId, Sides.Buy, 10m, 999m, OrderTypes.Limit);
 
 		result.IsValid.AssertFalse();
-		result.OrderId.AssertNotNull();       // persisted for audit
+		result.OrderId.AssertGreater(0);      // real persisted row identity (recorded for audit)
 		result.RejectReason.AssertNotNull();
 
-		var (status, reason) = await ReadOrderStatusAsync(conn, result.OrderId.Value);
+		var (status, reason) = await ReadOrderStatusAsync(conn, result.OrderId);
 		status.AssertEqual("REJECTED");
 		reason.AssertNotNull();
-	}
-
-	[TestMethod]
-	public async Task GatewaySubmitConcurrentSameTransactionIdPersistsExactlyOne()
-	{
-		// MJ-4 + CR-4: several submits racing on the SAME transaction id must all
-		// complete (deadlocks retried, unique-violation re-reads the winner), return the
-		// same order id, and leave exactly ONE persisted order.
-		await using var conn = await OpenLegacyOrInconclusiveAsync();
-		var pfId = await InsertPortfolioAsync(conn);
-		var secId = await InsertSecurityAsync(conn);
-		await InsertRiskLimitAsync(conn, pfId, maxOrderPrice: 1_000_000m);
-
-		var gateway = NewGateway();
-		var txnId = NextKey();
-
-		var tasks = Enumerable.Range(0, 4)
-			.Select(_ => gateway.SubmitOrderAsync(pfId, secId, Sides.Buy, 100m, 150m, OrderTypes.Limit, externalTransactionId: txnId))
-			.ToArray();
-
-		var results = await Task.WhenAll(tasks);
-
-		foreach (var r in results)
-		{
-			r.IsValid.AssertTrue();
-			r.OrderId.AssertNotNull();
-			r.OrderId.AssertEqual(results[0].OrderId); // all observed the same winning order
-		}
-
-		(await CountOrdersByTransactionAsync(conn, txnId)).AssertEqual(1);
 	}
 
 	[TestMethod]
 	public async Task GatewayRecordTradeRecomputesPositionEndToEnd()
 	{
 		// End-to-end DB recompute: submitting an accepted order and recording its fill
-		// updates dbo.Positions (quantity/average price) via PositionRecalculationService.
-		// Also covers the no-execution-id path (the demo's behaviour).
+		// updates dbo.Positions (quantity/average price) via PositionRecalculationService,
+		// recomputed exactly once in C# (the trg_Trades_PositionRecalc trigger is gone, so
+		// there is no second automatic recompute to double-count against - AAP 0.6.5).
 		await using var conn = await OpenLegacyOrInconclusiveAsync();
 		var pfId = await InsertPortfolioAsync(conn);
 		var secId = await InsertSecurityAsync(conn);
@@ -2569,7 +2524,7 @@ public class RiskTests : BaseTestClass
 		var submit = await gateway.SubmitOrderAsync(pfId, secId, Sides.Buy, 100m, 150m, OrderTypes.Limit);
 		submit.IsValid.AssertTrue();
 
-		await gateway.RecordTradeAsync(submit.OrderId.Value, 100m, 150m);
+		await gateway.RecordTradeAsync(submit.OrderId, 100m, 150m);
 
 		var position = await gateway.GetPositionAsync(pfId, secId);
 		position.AssertNotNull();
@@ -2594,7 +2549,7 @@ public class RiskTests : BaseTestClass
 
 		var sell = await gateway.SubmitOrderAsync(pfId, secId, Sides.Sell, 100m, 150m, OrderTypes.Limit);
 		sell.IsValid.AssertTrue();
-		await gateway.RecordTradeAsync(sell.OrderId.Value, 100m, 150m, executionId: NextKey());
+		await gateway.RecordTradeAsync(sell.OrderId, 100m, 150m);
 
 		var shortPos = await gateway.GetPositionAsync(pfId, secId);
 		shortPos.Quantity.AssertEqual(-100m);
@@ -2602,7 +2557,7 @@ public class RiskTests : BaseTestClass
 
 		var buy = await gateway.SubmitOrderAsync(pfId, secId, Sides.Buy, 60m, 140m, OrderTypes.Limit);
 		buy.IsValid.AssertTrue();
-		await gateway.RecordTradeAsync(buy.OrderId.Value, 60m, 140m, executionId: NextKey());
+		await gateway.RecordTradeAsync(buy.OrderId, 60m, 140m);
 
 		var covered = await gateway.GetPositionAsync(pfId, secId);
 		covered.Quantity.AssertEqual(-40m);
@@ -2617,15 +2572,15 @@ public class RiskTests : BaseTestClass
 	// ---------------------------------------------------------------------------
 
 	/// <summary>
-	/// Frozen, executable reference of the RETIRED fixed, non-overlapping window
-	/// order-frequency algorithm (the pre-consolidation <see cref="RiskOrderFreqRule"/>
-	/// body: the <c>_endTime</c>/<c>_current</c> state machine). Retained per the
-	/// characterization-first discipline so the behaviour the canonical rolling
-	/// window replaced stays documented and executable. This is NOT production code -
-	/// it is used only by
-	/// <see cref="OrderFreqRetiredFixedWindowCharacterizationAdmitsBoundaryBurst"/> and
-	/// reproduces the original Algo/Risk/RiskOrderFreqRule.cs ProcessMessage exactly as
-	/// it stood before the rolling-window reconciliation (stricter-wins, AAP 0.6.3).
+	/// Executable model of the RETIRED fixed, non-overlapping window order-frequency
+	/// algorithm - the fixed-window state machine (an <c>_endTime</c>/<c>_current</c>
+	/// pair) that the canonical <see cref="RiskOrderFreqRule"/> replaced with a rolling
+	/// window. It models the retired algorithm as specified in AAP 0.6.3; it is NOT a
+	/// verified snapshot of any prior source revision, and it is NOT production code. It
+	/// is used only by
+	/// <see cref="OrderFreqRetiredFixedWindowCharacterizationAdmitsBoundaryBurst"/> to
+	/// keep the superseded behaviour executable, so the stricter-wins reconciliation can
+	/// be demonstrated as a concrete behavioural difference rather than merely asserted.
 	/// </summary>
 	private sealed class RetiredFixedWindowFreqReference
 	{
@@ -2751,14 +2706,17 @@ public class RiskTests : BaseTestClass
 	[TestMethod]
 	public async Task GateCommissionEstimateRejectsWhileActualControlAccepts()
 	{
-		// KEEP-SEPARATE-BY-DESIGN (AAP 0.6.4, MJ-5): the pre-trade gate uses a PRE-FILL
-		// ESTIMATE (commission_rate * notional) while the circuit-breaker path uses the
-		// ACTUAL commission read off the message stream after the fill. They consume the
-		// same max_commission_total limit but compute different figures, so the SAME
-		// order/limit can decide differently. Here the rate-based estimate crosses the
-		// limit (gate REJECTS) while the actual commission that ends up on the fill is
-		// well under it (the actual-commission control ACCEPTS) - proving the two are
-		// distinct implementations that are intentionally NOT merged.
+		// KEEP-SEPARATE-BY-DESIGN (AAP 0.6.4, MJ-5/MJ-8): the pre-trade gate uses a
+		// PRE-FILL ESTIMATE (commission_rate * notional) while the circuit-breaker path
+		// uses the ACTUAL commission read off the message stream after the fill. The two
+		// are NOT wired to a single shared limit; each side owns its OWN independently
+		// configured ceiling. This test deliberately sets BOTH to the same value (10) - the
+		// SQL RiskLimits.max_commission_total for the gate and RiskCommissionRule.Commission
+		// for the actual control - so the numeric ceiling is held constant and only the
+		// COMPUTED FIGURE differs. Here the rate-based estimate crosses that ceiling (gate
+		// REJECTS) while the actual commission that ends up on the fill is well under it
+		// (the actual-commission control ACCEPTS) - proving the two are distinct
+		// implementations that are intentionally NOT merged.
 		await using var conn = await OpenLegacyOrInconclusiveAsync();
 		var pfId = await InsertPortfolioAsync(conn);
 		var secId = await InsertSecurityAsync(conn);
@@ -2771,9 +2729,10 @@ public class RiskTests : BaseTestClass
 		estimateRejected.IsValid.AssertFalse();
 		estimateRejected.RejectionKind.AssertEqual(PreTradeRejectionKind.RiskLimit);
 
-		// The ACTUAL post-fill control on the SAME limit (10) sees the real commission
-		// (5) and does NOT trip - a different answer for the same order/limit, because
-		// the actual figure is not the rate-based estimate.
+		// The ACTUAL post-fill control, configured with its OWN ceiling set to the same
+		// value (10), sees the real commission (5) and does NOT trip - a different answer
+		// for the same order and identical numeric ceiling, because the actual figure is
+		// not the rate-based estimate.
 		var actualRule = new RiskCommissionRule
 		{
 			Commission = 10m,

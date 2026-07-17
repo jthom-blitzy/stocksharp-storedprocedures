@@ -32,9 +32,11 @@ namespace StockSharp.Algo.Risk;
 /// needed to decide the "meets or exceeds" comparison), so memory cannot grow
 /// with the order rate; the events dropped are always the oldest, which would
 /// leave the window first, so the decision never becomes less strict.</item>
-/// <item>A zero (or negative) <see cref="Interval"/> means "not enforced",
-/// consistent with the NULL/0 = disabled convention the SQL gate applies to a
-/// zero <c>max_order_freq_window_sec</c>.</item>
+/// <item>A zero <see cref="Interval"/> means "not enforced", consistent with the
+/// NULL/0 = disabled convention the SQL gate applies to a zero
+/// <c>max_order_freq_window_sec</c>. A NEGATIVE interval is not a disable switch -
+/// it is invalid configuration and the <see cref="Interval"/> setter rejects it
+/// with an <see cref="ArgumentOutOfRangeException"/> (MN-3).</item>
 /// </list>
 /// </remarks>
 [Display(
@@ -44,10 +46,12 @@ namespace StockSharp.Algo.Risk;
 	GroupName = LocalizedStrings.OrdersKey)]
 public class RiskOrderFreqRule : RiskRule
 {
-	// Rolling-window state: timestamps of the most recent orders that fall
-	// within the [now - Interval, now] window (see ProcessMessage). Guarded by
-	// _sync and bounded to Count entries so the state cannot grow unbounded.
-	private readonly Queue<DateTime> _recent = new();
+	// Rolling-window state: timestamps of the most recent orders that fall within
+	// the [now - Interval, now] window (see ProcessMessage). A List (not a Queue) so
+	// expired timestamps can be removed from ANY position via RemoveAll, keeping
+	// eviction correct even when messages arrive out of order (MJ-2). Guarded by _sync
+	// and bounded to Count entries so the state cannot grow unbounded.
+	private readonly List<DateTime> _recent = new();
 	private readonly object _sync = new();
 
 	/// <summary>
@@ -146,9 +150,11 @@ public class RiskOrderFreqRule : RiskRule
 				if (time == default)
 					return false;
 
-				// A zero/negative interval is "not enforced" - the same NULL/0 =
-				// disabled convention the SQL gate applies to a zero window. Without
-				// this guard a Count=1 rule would trip on every timestamped order.
+				// A zero Interval means "not enforced" - the same NULL/0 = disabled
+				// convention the SQL gate applies to a zero window. A negative Interval
+				// cannot occur here: the Interval setter rejects it, so this guard is
+				// effectively "Interval == 0" and is written defensively as "<= 0"
+				// (MN-3). Without it a Count=1 rule would trip on every timestamped order.
 				if (Interval <= TimeSpan.Zero)
 					return false;
 
@@ -159,25 +165,40 @@ public class RiskOrderFreqRule : RiskRule
 				// exactly like the SQL ">=" predicate. Rolling is strictly stricter near
 				// a boundary, so under the stricter-wins hard constraint it is canonical.
 				// All state is mutated under _sync (the manager may run concurrently),
-				// and the queue is bounded to Count entries (the fewest needed to decide
+				// and the list is bounded to Count entries (the fewest needed to decide
 				// the comparison) so it cannot grow with the order rate.
 				lock (_sync)
 				{
-					var lowerBound = time - Interval;
+					// Guard against DateTime underflow: subtracting a large Interval from
+					// an early timestamp would throw. When the window would extend before
+					// DateTime.MinValue, clamp the lower bound to MinValue so every
+					// retained timestamp counts (MJ-7).
+					var lowerBound = Interval >= time - DateTime.MinValue
+						? DateTime.MinValue
+						: time - Interval;
 
-					while (_recent.Count > 0 && _recent.Peek() < lowerBound)
-						_recent.Dequeue();
+					// Evict every timestamp strictly older than the inclusive lower bound.
+					// RemoveAll (not head-only dequeue) removes a stale timestamp from ANY
+					// position, so eviction stays correct when messages arrive out of
+					// order (MJ-2).
+					_recent.RemoveAll(t => t < lowerBound);
 
 					// orders already in the window, excluding the incoming one
 					var priorCountInWindow = _recent.Count;
 
 					// keep the incoming/triggering order counted (matches SQL "+ 1")
-					_recent.Enqueue(time);
+					_recent.Add(time);
 
-					// bound retained state: dropping the oldest never loosens the
-					// decision (the oldest leaves the window first)
-					while (_recent.Count > Count)
-						_recent.Dequeue();
+					// Bound retained state to Count entries so it cannot grow with the
+					// order rate. When trimming, drop the OLDEST timestamps by time (sort
+					// ascending, then remove from the front): the oldest leave the window
+					// first, so dropping them never loosens a future decision, and sorting
+					// makes the "oldest" selection correct for out-of-order arrivals (MJ-2).
+					if (_recent.Count > Count)
+					{
+						_recent.Sort();
+						_recent.RemoveRange(0, _recent.Count - Count);
+					}
 
 					// canonical, shared ">=" comparison (never ">")
 					return IsFrequencyExceeded(priorCountInWindow, Count);

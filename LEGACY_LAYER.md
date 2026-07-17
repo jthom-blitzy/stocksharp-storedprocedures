@@ -9,9 +9,12 @@ decision.
 
 If you are new to this codebase and looking for "the" risk check: there is
 now exactly one definition per rule. A rule may be *enforced* through more
-than one pattern (see below), but its threshold and comparison live in a
-single `IRiskRule` subclass, so the patterns cannot disagree about what the
-rule means.
+than one pattern (see below); the canonical threshold value and its `>=`
+("meets or exceeds") boundary are defined once, so the patterns stay aligned
+on what each limit is. Where the same rule is applied at different points -
+notably resulting position size and cumulative commission - the two patterns
+can still reach different per-order results *by design*; those cases are
+called out explicitly below.
 
 ## History — why this file used to be a divergence warning
 
@@ -94,22 +97,28 @@ two different questions:
    for `dbo.usp_ValidatePreTradeRisk`, and it is what
    `SqlLegacyOrderGateway.SubmitOrderAsync` calls.
 
-The two patterns differ **only in the input each supplies** to the shared rule
-classes - the circuit breaker feeds live stream/position state, the gate feeds
-a prospective order (and, for the stateful rules, an aggregate or projection it
-reads from SQL Server) - **never in the rule's threshold or comparison**. Where
-a rule genuinely exists in both, both call the same comparison helper (for
-example `RiskOrderPriceRule.IsOrderPriceExceeded`,
-`RiskOrderFreqRule.IsFrequencyExceeded`,
-`RiskPositionSizeRule.IsPositionSizeExceeded`,
-`RiskDailyVolumeRule.IsDailyVolumeExceeded`), so the enable/disable convention
-and the boundary can never diverge.
+The two patterns share each rule's **canonical threshold and `>=` boundary**,
+but they apply it at different points and with different inputs - the circuit
+breaker feeds live stream/position state, the gate feeds a prospective order
+(and, for the stateful rules, an aggregate or projection it reads from SQL
+Server). For frequency, daily volume and order notional value the shared
+decision is a single method both call (`RiskOrderFreqRule.IsFrequencyExceeded`,
+`RiskDailyVolumeRule.IsDailyVolumeExceeded`, and `RiskOrderValueRule`'s
+`ProcessMessage`); for the order price and quantity ceilings the gate applies
+the same `>=` comparison to the prospective order while the circuit breaker
+evaluates the live order stream through the rule's `ProcessMessage`. Because
+they are applied at different points, the two patterns can reach different
+per-order results **by design** - resulting position size and cumulative
+commission are the documented cases below - but the canonical threshold value
+and the `>=` boundary for a merged rule never drift. The gate additionally
+honours the SQL `NULL`/`0` = "not enforced" convention, so a zero limit
+disables the corresponding check at the gate.
 
 **SQL is now pure data storage.** `Database/001_Schema.sql` remains
 tables/constraints/indexes only; `RiskLimits` still *stores* the ceilings, but
 the comparison and the accept/reject decision are defined in C#.
 `Database/002_StoredProcedures.sql` installs no business logic at all - it
-idempotently drops the three retired procedures
+drops the three retired procedures with `DROP ... IF EXISTS`
 (`usp_ValidatePreTradeRisk`, `usp_RecalculatePositionOnTrade`,
 `usp_SubmitOrder`) so no stale logic is left installed on an upgrade, and the
 file is kept only so the `001` -> `002` -> `003` -> `004` run order stays
@@ -141,8 +150,8 @@ stated.
 | Order quantity ceiling | `RiskOrderVolumeRule` (`qty/Volume >= limit`) | **MERGE** | Identical semantics; only the `qty` (SQL) vs `Volume`/`Quantity` (C#) naming differed, reconciled in docs. |
 | Order notional value (qty x price) | `RiskOrderValueRule` (new) | **RELOCATE** | Existed only in SQL (`max_order_value`); promoted to a first-class C# rule - there was no C# counterpart to merge. |
 | Order frequency | `RiskOrderFreqRule` (rolling window) | **MERGE (rolling wins)** | Different algorithm; the rolling `COUNT(*)` is strictly stricter near a boundary, so it is canonical under the stricter-wins constraint. |
-| Resulting position size | `RiskPositionSizeRule` | **SHARED DEFINITION, TWO APPLICATION POINTS** | Same threshold and comparison; the gate feeds a *post-fill projection*, the circuit breaker feeds the *live* value. A by-design timing difference, not a divergence. |
-| Cumulative commission | `RiskCommissionRule` / `RiskOrderCommissionRule` (actual, post-fill) **and** the gate's pre-fill estimate | **KEEP SEPARATE BY DESIGN** | Same `max_commission_total` limit, two computations on figures available at different times. **They will not always agree, and that is intentional** - they are not forced into one implementation. |
+| Resulting position size | `RiskPositionSizeRule` | **SHARED DEFINITION, TWO APPLICATION POINTS** | Same threshold; the gate compares a *post-fill absolute projection* while the circuit breaker checks the *live signed* position directionally. A by-design timing/framing difference, not an accidental divergence. |
+| Cumulative commission | `RiskCommissionRule` / `RiskOrderCommissionRule` (actual, post-fill) **and** the gate's pre-fill estimate | **KEEP SEPARATE BY DESIGN** | Same commission-ceiling *concept*, but each side owns its own configured limit (no shared wiring); two computations on figures available at different times. **They will not always agree, and that is intentional** - they are not forced into one implementation. |
 | Daily traded volume | `RiskDailyVolumeRule` (new) | **RELOCATE** | Existed only in SQL (`max_daily_volume`); promoted to a first-class C# rule. |
 | Position lifetime / P&L limit / slippage | `RiskPositionTimeRule` / `RiskPnLRule` / `RiskSlippageRule` | **NO CHANGE (C#-only)** | Need live state the pre-trade gate does not have; outside the reconciliation surface, noted for completeness. |
 
@@ -187,13 +196,16 @@ route through the one comparison.
 
 Two rows in the matrix share a limit value but must **not** be naively merged.
 
-**Position size** is one definition applied at two points.
-`RiskPositionSizeRule` (and its `IsPositionSizeExceeded` helper - a symmetric
-absolute-value ceiling) owns the threshold and comparison. The circuit breaker
-feeds it the *current* position from the live stream. The pre-trade gate feeds
-it a *post-fill projection* - the current position plus the signed order
-quantity (`current + signed order qty`) - because a gate has to decide before
-the fill exists. Same rule, two inputs; dropping the projection would loosen
+**Position size** is one threshold applied at two points, with a deliberately
+different framing at each. `RiskPositionSizeRule` owns the canonical limit
+value and, on the circuit-breaker path, compares the *current* live position
+**directionally** (a positive limit caps long exposure, a negative limit caps
+short exposure). The pre-trade gate cannot wait for the fill, so it compares a
+*post-fill projection* - the current position plus the signed order quantity
+(`current + signed order qty`) - against the limit's **absolute magnitude**,
+exactly as the retired SQL `usp_ValidatePreTradeRisk` did
+(`ABS(@current + @signed_qty) >= @max_position_size`). The threshold is shared;
+the framing differs by design, and dropping the gate's projection would loosen
 the gate and violate the stricter-wins constraint, so the projection is
 mandatory. (Daily traded volume follows the same "one definition, two
 application points" shape: the circuit breaker keeps a running daily
@@ -208,10 +220,13 @@ commission reported on an `ExecutionMessage` *after* a fill. The pre-trade gate
 cannot see an actual commission - the trade does not exist yet - so it computes
 a **pre-fill estimate** (`existing_notional * rate + qty * est_price * rate`,
 using `RiskLimits.commission_rate` against the order price, or the security's
-last traded price for a market order). Both consume the same
-`max_commission_total` limit, but they operate on fundamentally different
-figures available at fundamentally different times. **These two computations
-will not always agree, and that disagreement is intentional** - forcing them
+last traded price for a market order). Each side is configured with its own
+commission ceiling - the gate reads `RiskLimits.max_commission_total` from SQL,
+while the C# commission rules carry their own configured limit - and there is
+no shared runtime wiring binding the two to a single value; they also operate
+on fundamentally different figures available at fundamentally different times.
+**These two computations will not always agree, and that disagreement is
+intentional** - forcing them
 into one implementation would either blind the gate (no pre-fill number) or
 misreport the circuit breaker (a guess instead of the real figure). The gate
 keeps the estimate; the circuit-breaker path keeps the actual.
@@ -233,10 +248,7 @@ trigger any more; recompute is a single, explicit C# call.
 that inserted the trade, so there is one unambiguous source of recompute. The
 service handles signed-quantity accumulation, weighted-average price on
 same-sign/flat accumulation, and realized P&L on the closed portion for the
-partial-close, exact-close, and full-close-and-flip cases. Replay safety is
-provided separately by the `Trades.execution_id` idempotency key: a duplicate
-key skips both the insert and the recompute, so a retried fill is applied
-exactly once end-to-end.
+partial-close, exact-close, and full-close-and-flip cases.
 
 As before, `unrealized_pnl` on `Positions` is left untouched by the recompute:
 it needs a live market price, which the recompute path does not have. It is
@@ -267,11 +279,14 @@ loosens nor tightens behaviour by accident:
   these are validated in the gate before any threshold check (a malformed
   request is returned without persisting anything). Only `OrderTypes.Limit`
   and `.Market` map to a stored `order_type`.
-- **Decimal scale.** All qty/price/value inputs and aggregates are normalized
-  to the schema's `DECIMAL(18,4)` scale (commission rate to `DECIMAL(9,6)`)
-  with round-half-away-from-zero before any comparison, matching how SQL Server
-  coerced the corresponding procedure variables - so a value SQL would have
-  rounded up to the limit is still rejected here.
+- **Decimal scale.** The gate validates that every qty/price/value input lies
+  within the schema's `DECIMAL(18,4)` range and then compares the **raw**
+  decimal values - it does **not** round before comparing, so it matches the
+  un-modified canonical rule classes exactly (an out-of-range input fails
+  closed). `PositionRecalculationService` rounds its *results* to `DECIMAL(18,4)`
+  (commission rate to `DECIMAL(9,6)`) for **persistence** only - to match the
+  column scale the retired proc wrote - never as part of an accept/reject
+  comparison.
 
 ## Half-migrated persistence
 
@@ -293,9 +308,9 @@ the risk consolidation and is unrelated to it.
   longer diverges - but the column/property **name** difference was left as-is
   and reconciled only in docs, because the column name is baked into the schema.
 - `Orders.external_transaction_id` correlates a row back to the in-memory
-  `Order.TransactionId`. It doubles as the submission idempotency key (a
-  filtered unique index makes a retried submit replay-safe), but it is nullable
-  and was never back-filled for rows inserted before it was added.
+  `Order.TransactionId`. It is a plain (non-unique) correlation column, not an
+  idempotency key - it is nullable and was never back-filled for rows inserted
+  before it was added.
 - Only `OrderTypes.Limit`/`.Market` map to `dbo.Orders.order_type`; sending a
   conditional/stop order through `SqlLegacyOrderGateway` throws
   `NotSupportedException`. Conditional orders were out of scope for this pass.
@@ -328,15 +343,17 @@ not just reviewed by eye:
 - recording a trade against an accepted order updates the position
   (quantity / average price / realized P&L) through the single
   `PositionRecalculationService` call the gateway makes per `RecordTradeAsync`
-  - there is no auto-recompute trigger, and supplying an execution key makes a
-  retried fill idempotent;
+  - there is no auto-recompute trigger, so the position is recomputed exactly
+  once end-to-end in C#;
 - the order's status-change audit row is still written by
   `trg_Orders_StatusAudit`, the one trigger that remains in SQL.
 
 Because this layer previously had no automated tests - its correctness was
 demonstrated only through the runnable sample and manual container runs - the
-consolidation also added net-new coverage in `Tests/RiskTests.cs`:
-characterization tests that captured the original behaviour and parity tests
-that prove each rule now either matches its chosen canonical behaviour or
-correctly preserves an intentionally-distinct one (the frequency-boundary,
-position-size timing, and commission estimate-vs-actual cases in particular).
+consolidation also added net-new coverage in `Tests/RiskTests.cs`. These
+include characterization tests that pin the pre-consolidation behaviour of the
+reconciled rules and parity tests that exercise each rule's chosen canonical
+behaviour (or its intentionally-distinct one), with the frequency-boundary,
+position-size timing, and commission estimate-vs-actual cases called out
+specifically. The suite is not an exhaustive proof of every path; it targets
+the reconciliation decisions this document records.

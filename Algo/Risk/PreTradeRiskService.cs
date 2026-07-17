@@ -16,38 +16,57 @@ using Microsoft.Data.SqlClient;
 /// the two patterns differ only in the input they supply.
 /// </para>
 /// <para>
-/// The pure-threshold ceilings run the canonical rule classes directly on the
-/// prospective order (<see cref="RiskOrderPriceRule"/>, <see cref="RiskOrderVolumeRule"/>,
-/// <see cref="RiskOrderValueRule"/>). The stateful rules delegate to the canonical
-/// rules' shared decision helpers -
-/// <see cref="RiskOrderFreqRule.IsFrequencyExceeded"/>,
-/// <see cref="RiskPositionSizeRule.IsPositionSizeExceeded"/> and
-/// <see cref="RiskDailyVolumeRule.IsDailyVolumeExceeded"/> - fed an aggregate or
-/// projection read from SQL Server (rolling order count, hypothetical post-fill
-/// position, today's accepted/filled volume). Those same helpers back the
-/// <see cref="RiskManager"/> stream path, so the gate and the circuit breaker can
-/// never disagree on a shared rule.
+/// The order value (notional) ceiling runs the canonical <see cref="RiskOrderValueRule"/>
+/// directly on the prospective order. Frequency and daily volume defer to the
+/// canonical rules' shared decision helpers -
+/// <see cref="RiskOrderFreqRule.IsFrequencyExceeded"/> and
+/// <see cref="RiskDailyVolumeRule.IsDailyVolumeExceeded"/> - fed an aggregate read
+/// from SQL Server (a rolling order count, today's accepted/filled volume). The
+/// price and quantity ceilings apply the same canonical "&gt;=" comparison the
+/// stream <see cref="RiskOrderPriceRule"/>/<see cref="RiskOrderVolumeRule"/> use,
+/// and the resulting-position-size ceiling applies the same
+/// <see cref="RiskPositionSizeRule"/> threshold to a post-fill projection. The gate
+/// and the <see cref="RiskManager"/> circuit breaker therefore reference the same
+/// rule definitions; they apply them to different inputs by design (a prospective
+/// order and SQL aggregates here, live stream/position state there), which is why a
+/// shared rule can legitimately produce a different answer on each path even though
+/// its threshold and comparison are defined once.
 /// </para>
 /// <para>
 /// Cumulative commission is the single rule kept deliberately separate (AAP 0.6.4):
 /// the gate can only estimate cost before the fill exists, so it applies
 /// RiskLimits.commission_rate to the order/last price, whereas the circuit-breaker
 /// commission rules read the actual figure off the post-fill ExecutionMessage.
+/// The two paths are configured independently - the gate reads thresholds from the
+/// SQL RiskLimits row, the circuit-breaker rules from their own serialized settings -
+/// so they are not, and are not claimed to be, kept in lock-step.
 /// </para>
 /// <para>
 /// Strictness conventions preserved verbatim: every comparison uses the
 /// "&gt;=" ("meets or exceeds") boundary; a NULL or exactly-zero threshold means
 /// "not enforced"; a negative threshold is invalid configuration and fails closed
-/// (rejects) rather than silently disabling the control. All qty/price/value inputs
-/// and aggregates are normalized to the schema's DECIMAL(18,4) scale (commission_rate
-/// to DECIMAL(9,6)) with round-half-away-from-zero before any comparison, matching
-/// how SQL Server coerced the corresponding procedure variables.
+/// (rejects) rather than silently disabling the control. Comparisons use the raw
+/// decimal values (no scale coercion) so the gate and the un-rounded stream rules
+/// agree on the same economic value (MJ-3); inputs are only range-checked against the
+/// schema's DECIMAL(18,4) magnitude and rejected deterministically if they could not
+/// persist (MJ-7).
+/// </para>
+/// <para>
+/// Configuration-error precedence (MN-1): the whole selected RiskLimits row is
+/// validated up front, so a negative/misconfigured threshold OR an inconsistent
+/// frequency pair fails closed BEFORE the ordered RULES 1-7 run. When the row is
+/// well-formed, the first failing rule (in RULE 1-7 order) supplies the reason,
+/// matching the retired proc's first-failure-wins ordering.
 /// </para>
 /// <para>
 /// The primary <see cref="ValidateAsync(SqlConnection, SqlTransaction, int, int, Sides, decimal, decimal?, OrderTypes, string, CancellationToken)"/>
 /// overload runs on a caller-supplied connection and transaction so the caller can
-/// perform validation and the resulting order insert as one atomic, appropriately
-/// isolated unit - closing the check-to-insert race the standalone SQL gate had.
+/// perform the read-decide-insert sequence as one atomic, appropriately isolated unit.
+/// Under SERIALIZABLE this makes each order's validation and insert atomic and
+/// serializes concurrent inserts into the frequency window; it does NOT reserve
+/// position or commission exposure across separate in-flight orders (a submitted
+/// order does not mutate the position or trade aggregates), so it is not a
+/// cross-order reservation (CR-5).
 /// </para>
 /// </remarks>
 public class PreTradeRiskService
@@ -72,13 +91,23 @@ public class PreTradeRiskService
 
 	private SqlConnection CreateConnection() => new(_connectionString);
 
-	// SQL Server coerced every RiskLimits money/qty column and the procedure
-	// variables to DECIMAL(18,4), and commission_rate to DECIMAL(9,6), rounding
-	// half away from zero on assignment. The gate normalizes to the same scale so
-	// a value SQL rounded up to the limit (e.g. 0.99995 -> 1.0000) is rejected here
-	// exactly as it was in the proc, honouring the stricter-wins hard constraint.
-	private static decimal Round4(decimal value) => Math.Round(value, 4, MidpointRounding.AwayFromZero);
-	private static decimal Round6(decimal value) => Math.Round(value, 6, MidpointRounding.AwayFromZero);
+	// Largest magnitude representable by the schema's DECIMAL(18,4) money/qty columns
+	// (18 total digits, 4 after the point). A prospective order carrying a value outside
+	// this range could never persist and could overflow intermediate arithmetic, so the
+	// gate rejects it deterministically rather than letting SQL Server throw on INSERT
+	// or a decimal operation throw mid-comparison (MJ-7).
+	private const decimal _maxDecimal18_4 = 99999999999999.9999m;
+
+	// True when a value fits the schema's DECIMAL(18,4) magnitude and can therefore be
+	// compared and persisted without an overflow or conversion failure.
+	private static bool IsWithinDecimal18_4(decimal value)
+		=> value >= -_maxDecimal18_4 && value <= _maxDecimal18_4;
+
+	// Round to the schema's DECIMAL(18,4) scale, used ONLY to detect a sub-scale
+	// quantity that would coerce to zero on persistence (never for a risk comparison -
+	// comparisons run on raw decimals so the gate agrees with the un-rounded stream
+	// rules, MJ-3).
+	private static decimal ToSchemaScale(decimal value) => Math.Round(value, 4, MidpointRounding.AwayFromZero);
 
 	// Rejection/audit text must be byte-identical regardless of host culture.
 	private static string Inv(FormattableString reason) => FormattableString.Invariant(reason);
@@ -141,15 +170,30 @@ public class PreTradeRiskService
 		if (side != Sides.Buy && side != Sides.Sell)
 			return RejectInvalid(Inv($"Invalid side: {side}"));
 
-		// Coerce qty to the schema scale first (the proc parameter was DECIMAL(18,4)),
-		// then apply the positive-quantity pre-check on the coerced value so a sub-tick
-		// quantity that rounds to zero is rejected exactly as SQL rejected it.
-		qty = Round4(qty);
+		// Range-check qty against the schema's DECIMAL(18,4) magnitude BEFORE any
+		// comparison or arithmetic, so an out-of-range value is rejected
+		// deterministically rather than overflowing a product or failing at INSERT (MJ-7).
+		if (!IsWithinDecimal18_4(qty))
+			return RejectInvalid(Inv($"Order qty {qty} is outside the supported DECIMAL(18,4) range"));
 
+		// Positive-quantity pre-check on the RAW value (SQL L73-85). Comparisons below
+		// use raw decimals to agree with the un-rounded stream rules (MJ-3).
 		if (qty <= 0)
 			return RejectInvalid("Invalid qty");
 
-		var normPrice = price.HasValue ? Round4(price.Value) : (decimal?)null;
+		// A quantity below the schema's minimum representable step would coerce to 0 at
+		// DECIMAL(18,4) and violate CK_Orders_qty on INSERT; reject it here as malformed
+		// input rather than let persistence fail (MJ-7). This is an input guard only -
+		// the risk comparisons still run on the raw qty.
+		if (ToSchemaScale(qty) <= 0)
+			return RejectInvalid(Inv($"Order qty {qty} is below the minimum representable scale"));
+
+		// Raw price (no scale coercion, MJ-3); range-checked for the same overflow/
+		// persistence safety as qty (MJ-7).
+		var normPrice = price;
+
+		if (normPrice.HasValue && !IsWithinDecimal18_4(normPrice.Value))
+			return RejectInvalid(Inv($"Order price {normPrice.Value} is outside the supported DECIMAL(18,4) range"));
 
 		// --- order-type-aware price validation (CR-3) ----------------------
 		// The retired SQL proc carried @order_type but only checked "@price IS NOT
@@ -200,7 +244,8 @@ public class PreTradeRiskService
 				CASE WHEN portfolio_id IS NOT NULL AND security_id IS NOT NULL THEN 0
 					 WHEN portfolio_id IS NOT NULL THEN 1
 					 ELSE 2 END,
-				effective_date DESC
+				effective_date DESC,
+				risk_limit_id DESC
 			""", connection)
 		{
 			Transaction = transaction,
@@ -225,10 +270,16 @@ public class PreTradeRiskService
 			}
 		}
 
-		// no configured limits at all => nothing to enforce (SQL L120-127)
+		// no configured limits at all => nothing to enforce (SQL L120-127). BOTH
+		// frequency fields must be included: a row carrying ONLY
+		// max_order_freq_window_sec (count NULL) must NOT take this early return -
+		// otherwise the window-only frequency configuration is silently dropped and the
+		// control fails OPEN (CR-3). Including maxOrderFreqWindowSec here routes such a
+		// row into the frequency-consistency validation below, which fails it closed.
 		if (maxOrderPrice is null && maxOrderQty is null && maxOrderValue is null
 			&& maxPositionSize is null && maxDailyVolume is null
-			&& maxOrderFreqCount is null && maxCommissionTotal is null)
+			&& maxOrderFreqCount is null && maxOrderFreqWindowSec is null
+			&& maxCommissionTotal is null)
 		{
 			return Accept();
 		}
@@ -280,31 +331,38 @@ public class PreTradeRiskService
 			Price = normPrice ?? 0m,
 		};
 
-		// RULE 1 - order price ceiling (SQL L129-134): the gate routes through the
-		// canonical RiskOrderPriceRule.IsOrderPriceExceeded helper - the SAME 0 = "not
-		// enforced" + ">=" comparison the RiskManager stream path uses - so the two
-		// enforcement patterns can never diverge on the enable/disable convention (MJ-3).
-		// Negative configuration already failed closed in the validation block above (MJ-2).
-		if (normPrice.HasValue && maxOrderPrice.HasValue)
+		// RULE 1 - order price ceiling (SQL L129-134). The canonical price rule is the
+		// stream RiskOrderPriceRule (a reference/verification-only file that must not be
+		// modified); the gate applies that rule's SAME threshold and ">=" ("meets or
+		// exceeds") boundary here, inline, to the prospective order. The comparison runs
+		// on the RAW price (no scale coercion) so the gate and the un-rounded stream rule
+		// agree on the same economic value (MJ-3). The shared NULL/0 = "not enforced"
+		// convention (AAP 0.6.6) is honoured by the null/!=0 guard; a negative
+		// max_order_price already failed closed in the validation block above (MJ-2).
+		if (normPrice.HasValue && maxOrderPrice is not null && maxOrderPrice.Value != 0)
 		{
-			if (RiskOrderPriceRule.IsOrderPriceExceeded(normPrice.Value, maxOrderPrice.Value))
+			if (normPrice.Value >= maxOrderPrice.Value)
 				return Reject(Inv($"Order price {normPrice.Value} meets/exceeds limit {maxOrderPrice.Value}"));
 		}
 
-		// RULE 2 - order qty ceiling (SQL L136-141): the gate routes through the
-		// canonical RiskOrderVolumeRule.IsOrderVolumeExceeded helper - the SAME
-		// 0 = "not enforced" + ">=" comparison the RiskManager stream path uses (MJ-3).
+		// RULE 2 - order qty ceiling (SQL L136-141). Same shape as RULE 1: the gate
+		// applies the canonical stream RiskOrderVolumeRule's threshold and ">=" boundary
+		// inline, on the RAW qty (MJ-3), honouring NULL/0 = "not enforced" (AAP 0.6.6).
 		// Negative configuration already failed closed in the validation block above (MJ-2).
-		if (maxOrderQty.HasValue)
+		if (maxOrderQty is not null && maxOrderQty.Value != 0)
 		{
-			if (RiskOrderVolumeRule.IsOrderVolumeExceeded(qty, maxOrderQty.Value))
+			if (qty >= maxOrderQty.Value)
 				return Reject(Inv($"Order qty {qty} meets/exceeds limit {maxOrderQty.Value}"));
 		}
 
 		// RULE 3 - notional value ceiling (SQL L143-148): canonical RiskOrderValueRule,
-		// relocated from SQL-only max_order_value. qty*price >= limit (full-precision
-		// product vs the scale-4 limit, exactly as SQL compared @qty*@price). Negative
-		// configuration already failed closed in the validation block above (MJ-2).
+		// relocated from SQL-only max_order_value. The gate runs the SAME rule the stream
+		// path uses (raw qty*price >= limit, MJ-3). The boundary range-check above bounds
+		// qty and price to DECIMAL(18,4) magnitude (each <= ~1e14), so their product
+		// (<= ~1e28) stays within the decimal range and the notional multiplication
+		// cannot overflow for any order that reached this point (MJ-7). A 0/NULL limit is
+		// "not enforced" (AAP 0.6.6); negative config already failed closed in the
+		// validation block above (MJ-2).
 		if (normPrice.HasValue && maxOrderValue.HasValue && maxOrderValue.Value != 0)
 		{
 			if (new RiskOrderValueRule { OrderValue = maxOrderValue.Value }.ProcessMessage(orderMessage))
@@ -341,12 +399,22 @@ public class PreTradeRiskService
 				return Reject(Inv($"Order frequency {recentCount + 1} in {maxOrderFreqWindowSec.Value}s meets/exceeds limit {maxOrderFreqCount.Value}"));
 		}
 
-		// RULE 5 - resulting position size (SQL L177-192): shared RiskPositionSizeRule
-		// definition applied at the POST-FILL projection (current + signed order qty).
-		// The decision uses RiskPositionSizeRule.IsPositionSizeExceeded (symmetric ABS
-		// ceiling, SQL semantics) - the SAME helper the circuit breaker applies to the
-		// live position. Dropping the projection would loosen the gate and violate the
-		// stricter-wins hard constraint (AAP 0.6.2/0.6.4).
+		// RULE 5 - resulting position size (SQL L177-192). The threshold value is the
+		// shared RiskPositionSizeRule limit, but the gate and the circuit breaker apply
+		// it at DIFFERENT points, by design (AAP 0.6.4 - "same definition, two
+		// application points"):
+		//   - the gate projects the POST-FILL position (current + signed order qty) and
+		//     rejects when its ABSOLUTE size meets/exceeds the limit, exactly as the
+		//     retired SQL proc did: ABS(@current + @signed_qty) >= @max_position_size;
+		//   - the stream RiskPositionSizeRule (reference/verification-only, unchanged)
+		//     compares the LIVE signed position DIRECTIONALLY against a signed limit.
+		// These can legitimately disagree because they read different state at different
+		// times; dropping the gate's post-fill projection would loosen the pre-trade
+		// control and violate the stricter-wins hard constraint (AAP 0.6.2). The
+		// comparison runs on the RAW projected value (no scale coercion, MJ-3). A
+		// negative max_position_size already failed closed above - the gate rejects a
+		// negative configuration outright rather than absolutising it the way the stream
+		// helper once did (MJ-5).
 		if (maxPositionSize.HasValue && maxPositionSize.Value != 0)
 		{
 			decimal currentQty;
@@ -366,9 +434,11 @@ public class PreTradeRiskService
 			}
 
 			var signedDelta = side == Sides.Buy ? qty : -qty;
-			var projected = Round4(currentQty + signedDelta);
+			var projected = currentQty + signedDelta;
 
-			if (RiskPositionSizeRule.IsPositionSizeExceeded(projected, maxPositionSize.Value))
+			// SQL symmetric-absolute ceiling: ABS(projected) >= max_position_size. The
+			// configured limit is already guaranteed non-negative by the validation block.
+			if (Math.Abs(projected) >= maxPositionSize.Value)
 				return Reject(Inv($"Resulting position {projected} meets/exceeds limit {maxPositionSize.Value}"));
 		}
 
@@ -379,12 +449,13 @@ public class PreTradeRiskService
 		// windows: the gate can only estimate before the trade exists, so it uses
 		// RiskLimits.commission_rate against the order price (or the security's last
 		// traded price for a market order). Kept separate by design (AAP 0.6.4); the
-		// circuit-breaker path keeps the actual figure. ">=" preserved. The estimate is
-		// coerced to DECIMAL(18,4) with a single final rounding, exactly as SQL assigned
-		// the @estCommission variable.
+		// circuit-breaker path keeps the actual figure. Each configuration owns its own
+		// limit value independently - they are NOT kept in lock-step (MJ-8). ">="
+		// preserved. The estimate is compared on the RAW decimal value (no scale
+		// coercion, MJ-3), matching how the canonical rules compare.
 		if (maxCommissionTotal.HasValue && maxCommissionTotal.Value != 0)
 		{
-			var rate = Round6(commissionRate ?? _defaultCommissionRate);
+			var rate = commissionRate ?? _defaultCommissionRate;
 			var estPrice = normPrice;
 
 			if (estPrice is null)
@@ -395,7 +466,7 @@ public class PreTradeRiskService
 					FROM dbo.Trades t
 					JOIN dbo.Orders o ON o.order_id = t.order_id
 					WHERE o.security_id = @security_id
-					ORDER BY t.executed_date DESC
+					ORDER BY t.executed_date DESC, t.trade_id DESC
 					""", connection)
 				{
 					Transaction = transaction,
@@ -403,7 +474,7 @@ public class PreTradeRiskService
 				lastPriceCmd.Parameters.AddWithValue("@security_id", securityId);
 
 				var rawPrice = await lastPriceCmd.ExecuteScalarAsync(cancellationToken);
-				estPrice = rawPrice is decimal lp ? Round4(lp) : (decimal?)null;
+				estPrice = rawPrice is decimal lp ? lp : (decimal?)null;
 			}
 
 			decimal existingNotional;
@@ -422,10 +493,25 @@ public class PreTradeRiskService
 				notionalCmd.Parameters.AddWithValue("@portfolio_id", portfolioId);
 
 				var rawNotional = await notionalCmd.ExecuteScalarAsync(cancellationToken);
-				existingNotional = rawNotional is decimal n ? Round4(n) : 0m;
+				existingNotional = rawNotional is decimal n ? n : 0m;
 			}
 
-			var estCommission = Round4(existingNotional * rate + qty * (estPrice ?? 0m) * rate);
+			// Overflow-safe arithmetic (MJ-7). existingNotional is an UNBOUNDED SUM over
+			// every portfolio trade, so the estimate multiplication/addition is the one
+			// genuine overflow risk in the gate. A decimal that cannot be represented
+			// cannot be shown to be within the limit, so the stricter-wins hard
+			// constraint (AAP 0.6.2) requires a deterministic reject rather than an
+			// unhandled throw or a silently admitted order.
+			decimal estCommission;
+
+			try
+			{
+				estCommission = existingNotional * rate + qty * (estPrice ?? 0m) * rate;
+			}
+			catch (OverflowException)
+			{
+				return Reject(Inv($"Estimated cumulative commission exceeds the representable decimal range and cannot be shown within limit {maxCommissionTotal.Value}"));
+			}
 
 			if (estCommission >= maxCommissionTotal.Value)
 				return Reject(Inv($"Estimated cumulative commission {estCommission} meets/exceeds limit {maxCommissionTotal.Value}"));
@@ -464,10 +550,23 @@ public class PreTradeRiskService
 				dailyCmd.Parameters.AddWithValue("@security_id", securityId);
 
 				var rawToday = await dailyCmd.ExecuteScalarAsync(cancellationToken);
-				todayQty = rawToday is decimal d ? Round4(d) : 0m;
+				todayQty = rawToday is decimal d ? d : 0m;
 			}
 
-			var effectiveDaily = Round4(todayQty + qty);
+			// Overflow-safe arithmetic (MJ-7). todayQty is a SUM over today's accepted/
+			// filled orders; adding the new qty could in principle exceed the decimal
+			// range. Fail closed on overflow (stricter-wins, AAP 0.6.2) rather than
+			// throw or silently admit. The comparison runs on RAW decimals (MJ-3).
+			decimal effectiveDaily;
+
+			try
+			{
+				effectiveDaily = todayQty + qty;
+			}
+			catch (OverflowException)
+			{
+				return Reject(Inv($"Daily traded volume exceeds the representable decimal range and cannot be shown within limit {maxDailyVolume.Value}"));
+			}
 
 			if (RiskDailyVolumeRule.IsDailyVolumeExceeded(effectiveDaily, maxDailyVolume.Value))
 				return Reject(Inv($"Daily volume {effectiveDaily} meets/exceeds limit {maxDailyVolume.Value}"));

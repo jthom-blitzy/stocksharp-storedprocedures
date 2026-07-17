@@ -64,17 +64,46 @@ public class RiskOrderValueRule : RiskRule
 			case MessageTypes.OrderRegister:
 			{
 				var orderReg = (OrderRegisterMessage)message;
-				return orderReg.Volume * orderReg.Price >= OrderValue;
+				return IsNotionalExceeded(orderReg.Volume, orderReg.Price);
 			}
 
 			case MessageTypes.OrderReplace:
 			{
 				var orderReplace = (OrderReplaceMessage)message;
-				return orderReplace.Price > 0 && orderReplace.Volume * orderReplace.Price >= OrderValue;
+
+				// Notional needs BOTH dimensions, so guard price AND volume symmetrically
+				// (MJ-4): an incomplete replace that leaves either unset (<= 0) carries no
+				// well-defined notional and is not evaluated HERE. Such an order is still
+				// bounded by the per-dimension RiskOrderPriceRule / RiskOrderVolumeRule
+				// ceilings, and order SUBMISSION is gated authoritatively by
+				// PreTradeRiskService, which always supplies a concrete
+				// OrderRegisterMessage (never a replace). The earlier code guarded only
+				// price, letting a volume-less replace slip the notional ceiling - the
+				// symmetric guard closes that (stricter-wins, AAP 0.6.2).
+				return orderReplace.Price > 0 && orderReplace.Volume > 0
+					&& IsNotionalExceeded(orderReplace.Volume, orderReplace.Price);
 			}
 
 			default:
 				return false;
+		}
+	}
+
+	// Notional (Volume * Price) can overflow DECIMAL for extreme values on the stream
+	// path (unlike the gate, streamed messages are not range-checked). An overflow means
+	// the notional is astronomically large and so exceeds any configured OrderValue, so
+	// the rule trips - failing closed under stricter-wins (AAP 0.6.2) rather than letting
+	// the multiplication throw and disrupt the circuit breaker or silently admit the
+	// order (MJ-7). ">=" ("meets or exceeds") is preserved.
+	private bool IsNotionalExceeded(decimal volume, decimal price)
+	{
+		try
+		{
+			return volume * price >= OrderValue;
+		}
+		catch (OverflowException)
+		{
+			return true;
 		}
 	}
 

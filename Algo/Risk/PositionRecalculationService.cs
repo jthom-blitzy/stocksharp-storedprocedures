@@ -21,19 +21,21 @@ using Microsoft.Data.SqlClient;
 /// trade row and its position effect commit or roll back together.
 /// </para>
 /// <para>
-/// A single call within one atomic transaction guarantees each trade is applied once
-/// <em>for that insert</em>, but it cannot by itself make a RETRY safe: re-running the
-/// same logical fill would insert a second trade and apply the delta again. Replay
-/// safety is therefore provided by the Trades.execution_id idempotency key
-/// (001_Schema.sql): the gateway records a trade under that key, and a duplicate key
-/// skips both the insert and this recompute, so a retried fill is applied exactly
-/// once end-to-end. The former standalone mutator overload was removed because it
-/// mutated the position with no trade row and no key to detect such a replay (CR-4).
+/// The gateway calls this service exactly once per trade insert, in the same
+/// transaction as the insert, so a trade and its position effect are one atomic unit.
+/// There is no auto-recompute trigger and no standalone mutator overload, so there is
+/// no second recompute path to double-count a single fill against (AAP 0.6.5). This
+/// service does not itself provide replay/idempotency protection: each call applies
+/// the trade it is given, and it is the caller's responsibility not to record the same
+/// logical fill twice.
 /// </para>
 /// <para>
 /// The position row is read under WITH (UPDLOCK, HOLDLOCK) so concurrent fills for
 /// the same portfolio/security serialize and simultaneous first fills cannot race on
-/// the unique key. Writes use explicit DECIMAL(18,4) parameters and assert the
+/// the unique key. Trade inputs and the computed quantity/average-price/realized-P&amp;L
+/// outputs are validated against the schema's DECIMAL(18,4) range, so an out-of-range
+/// value fails closed with a clear error instead of overflowing the arithmetic or the
+/// column on write (MJ-7). Writes use explicit DECIMAL(18,4) parameters and assert the
 /// affected-row count, so a missing/duplicate row surfaces as an error rather than a
 /// silent no-op. unrealized_pnl is deliberately left untouched (it needs a live
 /// market price - see dbo.Positions in 001_Schema.sql); a freshly inserted row
@@ -42,27 +44,22 @@ using Microsoft.Data.SqlClient;
 /// </remarks>
 public class PositionRecalculationService
 {
-	private readonly string _connectionString;
-
-	/// <summary>
-	/// Initializes a new instance of the <see cref="PositionRecalculationService"/>.
-	/// </summary>
-	/// <param name="connectionString">SQL Server connection string for the StockSharpLegacy database.</param>
-	public PositionRecalculationService(string connectionString)
-	{
-		if (connectionString.IsEmpty())
-			throw new ArgumentNullException(nameof(connectionString));
-
-		_connectionString = connectionString;
-	}
-
-	private SqlConnection CreateConnection() => new(_connectionString);
-
 	// Every RiskLimits/Positions/Trades money/qty column and every variable in the
 	// original proc was DECIMAL(18,4), rounded half away from zero on assignment. The
 	// pure method normalizes inputs and rounds outputs to the same scale so, e.g., a
 	// weighted average of 5/3 persists as 1.6667 exactly as the proc stored it.
 	private static decimal Round4(decimal value) => Math.Round(value, 4, MidpointRounding.AwayFromZero);
+
+	// Largest magnitude representable by DECIMAL(18,4) (18 digits, 4 after the point).
+	// A trade input or a computed position value outside this range could never persist
+	// and could overflow intermediate arithmetic, so the recompute fails closed with a
+	// clear error rather than letting SQL Server throw on write or a decimal operation
+	// throw mid-computation (MJ-7).
+	private const decimal _maxDecimal18_4 = 99999999999999.9999m;
+
+	// True when a value fits the schema's DECIMAL(18,4) magnitude.
+	private static bool IsWithinDecimal18_4(decimal value)
+		=> value >= -_maxDecimal18_4 && value <= _maxDecimal18_4;
 
 	// Explicit DECIMAL(18,4) parameter so ADO.NET sends the value at the schema's
 	// precision/scale rather than inferring a type that could shift the stored value.
@@ -102,6 +99,15 @@ public class PositionRecalculationService
 		if (tradePrice <= 0)
 			throw new ArgumentOutOfRangeException(nameof(tradePrice), tradePrice, "Trade price must be positive.");
 
+		// Range-check inputs against DECIMAL(18,4) so an out-of-range fill fails closed
+		// here rather than overflowing the average-cost / P&L arithmetic below or the
+		// Positions columns on write (MJ-7).
+		if (!IsWithinDecimal18_4(tradeQty))
+			throw new ArgumentOutOfRangeException(nameof(tradeQty), tradeQty, "Trade quantity is outside the supported DECIMAL(18,4) range.");
+
+		if (!IsWithinDecimal18_4(tradePrice))
+			throw new ArgumentOutOfRangeException(nameof(tradePrice), tradePrice, "Trade price is outside the supported DECIMAL(18,4) range.");
+
 		// Explicit Buy/Sell mapping - never silently treat an unexpected side as a sell.
 		var tradeSignedQty = side switch
 		{
@@ -111,10 +117,20 @@ public class PositionRecalculationService
 		};
 
 		// Existing values already originate from DECIMAL(18,4) columns; normalize
-		// defensively so the computation runs on the same values SQL Server stored.
+		// defensively so the computation runs on the same values SQL Server stored, and
+		// range-check them for the same overflow safety as the trade inputs (MJ-7).
 		existingQty = Round4(existingQty);
 		existingAvgPrice = Round4(existingAvgPrice);
 		existingRealizedPnl = Round4(existingRealizedPnl);
+
+		if (!IsWithinDecimal18_4(existingQty))
+			throw new ArgumentOutOfRangeException(nameof(existingQty), existingQty, "Existing quantity is outside the supported DECIMAL(18,4) range.");
+
+		if (!IsWithinDecimal18_4(existingAvgPrice))
+			throw new ArgumentOutOfRangeException(nameof(existingAvgPrice), existingAvgPrice, "Existing average price is outside the supported DECIMAL(18,4) range.");
+
+		if (!IsWithinDecimal18_4(existingRealizedPnl))
+			throw new ArgumentOutOfRangeException(nameof(existingRealizedPnl), existingRealizedPnl, "Existing realized P&L is outside the supported DECIMAL(18,4) range.");
 
 		decimal newQty, newAvgPrice;
 		var newRealizedPnl = existingRealizedPnl;
@@ -148,19 +164,36 @@ public class PositionRecalculationService
 		}
 
 		// Round to the stored DECIMAL(18,4) scale exactly as each proc variable was.
-		return (Round4(newQty), Round4(newAvgPrice), Round4(newRealizedPnl));
+		var resultQty = Round4(newQty);
+		var resultAvgPrice = Round4(newAvgPrice);
+		var resultRealizedPnl = Round4(newRealizedPnl);
+
+		// A computed value that cannot be represented at DECIMAL(18,4) (e.g. a realized
+		// P&L that overflows the column after an extreme fill) must fail closed with a
+		// clear error rather than throw obscurely when the Positions row is written (MJ-7).
+		if (!IsWithinDecimal18_4(resultQty))
+			throw new OverflowException(FormattableString.Invariant($"Recomputed position quantity {resultQty} exceeds the supported DECIMAL(18,4) range."));
+
+		if (!IsWithinDecimal18_4(resultAvgPrice))
+			throw new OverflowException(FormattableString.Invariant($"Recomputed average price {resultAvgPrice} exceeds the supported DECIMAL(18,4) range."));
+
+		if (!IsWithinDecimal18_4(resultRealizedPnl))
+			throw new OverflowException(FormattableString.Invariant($"Recomputed realized P&L {resultRealizedPnl} exceeds the supported DECIMAL(18,4) range."));
+
+		return (resultQty, resultAvgPrice, resultRealizedPnl);
 	}
 
-	// NOTE (CR-4): the standalone RecalculateAsync(orderId, qty, price) convenience
-	// overload was intentionally removed. It opened its own transaction and mutated
-	// the stored position from raw (qty, price) arguments WITHOUT inserting - or even
-	// identifying - a Trade row, so nothing tied the mutation to a specific execution.
-	// Calling it twice (a retry, or a manual re-run) applied the same position delta
-	// twice with no way to detect the replay - a silent double-count. The only
-	// supported way to drive a recompute is now the transaction-aware overload below,
-	// which the gateway invokes exactly once inside the same transaction that inserts
-	// the trade, under the Trades.execution_id idempotency key. The pure, side-effect-
-	// free Recalculate(...) above remains available for computation and unit tests.
+	// NOTE: there is intentionally no standalone RecalculateAsync(orderId, qty, price)
+	// overload that opens its own transaction and mutates the stored position from raw
+	// (qty, price) arguments. Such an overload would apply a position delta without
+	// inserting - or even identifying - a Trade row, reviving exactly the double-count
+	// hazard this refactor removes: the old trg_Trades_PositionRecalc trigger recomputed
+	// on every Trades insert while the proc was ALSO callable standalone, so running both
+	// applied one fill twice (see LEGACY_LAYER.md / AAP 0.6.5). The only supported way to
+	// drive a recompute is the transaction-aware overload below, which the gateway
+	// invokes exactly once inside the same transaction that inserts the trade. The pure,
+	// side-effect-free Recalculate(...) above remains available for computation and unit
+	// tests.
 
 	/// <summary>
 	/// Reads the order and its current position, recomputes from the given trade and
@@ -168,8 +201,8 @@ public class PositionRecalculationService
 	/// the same transaction that inserts the trade, so the trade and its position
 	/// effect are one atomic unit. This is the single recompute entry point per trade
 	/// (the old auto-recompute trigger no longer exists); the gateway calls it exactly
-	/// once per trade insert, and the Trades.execution_id idempotency key ensures a
-	/// retried trade neither re-inserts nor re-applies its position effect.
+	/// once per trade insert (AAP 0.6.5), so there is no second recompute path to
+	/// double-count a single fill against.
 	/// </summary>
 	/// <param name="connection">Open SQL Server connection.</param>
 	/// <param name="transaction">Transaction that also performs the trade insert.</param>

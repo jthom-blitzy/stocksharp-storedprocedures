@@ -59,22 +59,22 @@ class Program
 		var order2 = await gateway.SubmitOrderAsync(portfolioId, securityId, Sides.Buy, 10m, 999.00m, OrderTypes.Limit);
 		Console.WriteLine($"  -> order_id={order2.OrderId} is_valid={order2.IsValid} reject_reason={order2.RejectReason ?? "(none)"}");
 		Console.WriteLine("     Note: this rejection comes from the C# PreTradeRiskService (Algo/Risk), the");
-		Console.WriteLine("     per-order pre-trade gate. Risk rules are now defined once as canonical");
-		Console.WriteLine("     IRiskRule classes; the RiskManager circuit breaker and this pre-trade gate");
-		Console.WriteLine("     are two distinct patterns that share those canonical definitions (the same");
-		Console.WriteLine("     intended comparisons) where a rule exists in both.");
+		Console.WriteLine("     per-order pre-trade gate that replaced SQL usp_ValidatePreTradeRisk. Each risk");
+		Console.WriteLine("     rule is defined as a canonical IRiskRule class; the RiskManager circuit breaker");
+		Console.WriteLine("     and this pre-trade gate are two distinct patterns that apply those definitions");
+		Console.WriteLine("     where a rule exists in both, though at different points, so their per-rule");
+		Console.WriteLine("     results can legitimately differ by design (see LEGACY_LAYER.md).");
 		Console.WriteLine();
 
 		if (!order1.IsValid)
 			return;
 
 		// --- record a fill against the accepted order; RecordTradeAsync inserts the
-		//     trade and then calls PositionRecalculationService once, inside one
-		//     transaction, to recompute dbo.Positions. There is no auto-recompute
-		//     trigger; passing an execution key would additionally make a retried
-		//     fill idempotent (the fill is applied exactly once end-to-end). ---
+		//     trade and then calls PositionRecalculationService exactly once, inside
+		//     one transaction, to recompute dbo.Positions. There is no auto-recompute
+		//     trigger, so the position is recomputed once end-to-end in C# (AAP 0.6.5). ---
 		Console.WriteLine("Recording a trade: 100 @ 150.00 against order #1...");
-		await gateway.RecordTradeAsync(order1.OrderId.Value, 100m, 150.00m);
+		await gateway.RecordTradeAsync(order1.OrderId, 100m, 150.00m);
 
 		var position = await gateway.GetPositionAsync(portfolioId, securityId);
 		Console.WriteLine($"  -> position after recompute: qty={position.Quantity} avg_price={position.AveragePrice} realized_pnl={position.RealizedPnL}");

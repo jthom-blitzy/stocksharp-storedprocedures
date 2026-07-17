@@ -1,9 +1,10 @@
 /*
 	StockSharpLegacy - seed data
 	----------------------------------------
-	Minimal reference data so the schema and stored procs are exercisable
-	without wiring up the full C# app first. Safe to re-run: guarded by
-	existence checks against the unique keys.
+	Minimal reference data so the schema and the C# risk/position layer
+	(Algo/Risk, via SqlLegacyOrderGateway) are exercisable without wiring up
+	the full C# app first. Safe to re-run: guarded by existence checks against
+	the unique keys.
 */
 
 USE StockSharpLegacy;

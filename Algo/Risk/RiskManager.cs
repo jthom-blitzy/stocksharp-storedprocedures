@@ -10,34 +10,37 @@ namespace StockSharp.Algo.Risk;
 /// <see cref="RiskMessageAdapter"/>. Its mechanics are unchanged by the risk
 /// consolidation; only the SOURCE of each rule's threshold and comparison moved.
 ///
-/// The consolidation makes each risk rule's threshold-and-comparison the single
-/// source of truth, owned by one <see cref="IRiskRule"/> subclass and reused by
-/// both enforcement patterns rather than re-encoded in each. The two patterns
-/// are distinct and never merged: this stream-based circuit breaker (which
-/// reacts to live state and takes account-level action) and the per-order
+/// The consolidation gives each risk rule a single owning <see cref="IRiskRule"/>
+/// subclass that defines its threshold-and-comparison semantics (the
+/// <c>">="</c> "meets or exceeds" convention). The two enforcement patterns are
+/// distinct and never merged: this stream-based circuit breaker (which reacts to
+/// live state and takes account-level action) and the per-order
 /// <see cref="PreTradeRiskService"/> pre-trade gate (which accepts or rejects a
-/// single prospective order). They consume the SAME definition but supply
-/// different inputs by design - the circuit breaker feeds live stream/position
-/// state, the gate feeds a prospective order and SQL-sourced aggregates:
+/// single prospective order). They apply the SAME rule definitions but at
+/// different points and with different inputs, so their per-rule results can
+/// legitimately differ:
 /// <list type="bullet">
-/// <item>Order price and quantity: one shared comparison
-/// (<see cref="RiskOrderPriceRule.IsOrderPriceExceeded"/> /
-/// <see cref="RiskOrderVolumeRule.IsOrderVolumeExceeded"/>) that owns the
-/// <c>0 = "not enforced"</c> and <c>">="</c> convention; both the circuit
-/// breaker (via <c>ProcessMessage</c>) and the gate call it, so the enable/disable
-/// and comparison semantics do not diverge. Order notional value uses the shared
-/// <see cref="RiskOrderValueRule"/> class (same convention) in both patterns.</item>
-/// <item>Order frequency (<see cref="RiskOrderFreqRule"/>), resulting position
-/// size (<see cref="RiskPositionSizeRule"/>) and daily traded volume
-/// (<see cref="RiskDailyVolumeRule"/>): the decision is one shared comparison
-/// (<c>IsFrequencyExceeded</c> / <c>IsPositionSizeExceeded</c> /
-/// <c>IsDailyVolumeExceeded</c>); the circuit breaker feeds live streaming state
-/// while the gate feeds a projection/aggregate read from SQL Server.</item>
-/// <item>Cumulative commission is INTENTIONALLY two implementations - the actual
-/// post-fill figure here (off <see cref="Messages.ExecutionMessage"/>) versus the
-/// gate's pre-fill estimate - because the data is available at different times.
-/// This is a documented, by-design difference, not a divergence (see
-/// LEGACY_LAYER.md).</item>
+/// <item>Order price, quantity and notional value: the circuit breaker evaluates
+/// each incoming order message through <see cref="RiskOrderPriceRule"/>,
+/// <see cref="RiskOrderVolumeRule"/> and <see cref="RiskOrderValueRule"/> via
+/// their <c>ProcessMessage</c>; the gate applies the same <c>">="</c> comparison
+/// to a prospective order. The gate additionally honours the SQL
+/// <c>NULL/0 = "not enforced"</c> convention when a configured limit is absent
+/// (AAP 0.6.6), so a zero limit disables the check at the gate.</item>
+/// <item>Resulting position size (<see cref="RiskPositionSizeRule"/>) is a shared
+/// definition applied at two points: this circuit breaker checks the live signed
+/// position directionally, while the gate projects the hypothetical post-fill
+/// position and compares its absolute magnitude - a by-design timing/framing
+/// difference, not an accidental divergence (see LEGACY_LAYER.md).</item>
+/// <item>Order frequency (<see cref="RiskOrderFreqRule"/>) and daily traded
+/// volume (<see cref="RiskDailyVolumeRule"/>): the circuit breaker feeds live
+/// streaming state while the gate feeds an aggregate read from SQL Server.</item>
+/// <item>Cumulative commission is INTENTIONALLY two implementations, each with
+/// its OWN independently configured limit: the actual post-fill figure here (off
+/// <see cref="Messages.ExecutionMessage"/>) versus the gate's pre-fill estimate.
+/// They are NOT wired to a single shared configuration value - the limits are
+/// owned separately because the underlying data is available at different times.
+/// This is a documented, by-design difference (see LEGACY_LAYER.md).</item>
 /// </list>
 /// </remarks>
 public class RiskManager : BaseLogReceiver, IRiskManager
