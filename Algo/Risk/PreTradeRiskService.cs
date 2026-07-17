@@ -211,10 +211,19 @@ public class PreTradeRiskService
 			return RejectInvalid(Inv($"Unsupported order type: {orderType}"));
 
 		// A supplied price must be strictly positive for ANY order type; a
-		// non-positive value (including a sub-tick price that rounds to zero at the
-		// schema scale) is malformed and must never be silently accepted.
+		// non-positive value is malformed and must never be silently accepted.
 		if (normPrice.HasValue && normPrice.Value <= 0)
 			return RejectInvalid(Inv($"Invalid non-positive price {normPrice.Value}"));
+
+		// P10-F10: a strictly-positive price BELOW the schema's minimum representable step
+		// coerces to 0 at DECIMAL(18,4) on INSERT (e.g. 0.00004 -> 0.0000). Without this
+		// guard such a price passes the "<= 0" check above, is ACCEPTED, then persists as a
+		// meaningless zero that slips underneath every positive ceiling and destroys the
+		// order's economic meaning. Mirror the qty sub-scale guard: reject it as malformed
+		// INPUT before any risk evaluation or persistence. The risk comparisons below still
+		// run on the RAW price (MJ-3); this is an input/persistence guard only.
+		if (normPrice.HasValue && ToSchemaScale(normPrice.Value) <= 0)
+			return RejectInvalid(Inv($"Order price {normPrice.Value} is below the minimum representable scale"));
 
 		// A LIMIT order MUST carry a price: without one there is no ceiling to test
 		// and the notional/commission estimates are undefined. A MARKET order may
@@ -270,23 +279,10 @@ public class PreTradeRiskService
 			}
 		}
 
-		// no configured limits at all => nothing to enforce (SQL L120-127). BOTH
-		// frequency fields must be included: a row carrying ONLY
-		// max_order_freq_window_sec (count NULL) must NOT take this early return -
-		// otherwise the window-only frequency configuration is silently dropped and the
-		// control fails OPEN (CR-3). Including maxOrderFreqWindowSec here routes such a
-		// row into the frequency-consistency validation below, which fails it closed.
-		if (maxOrderPrice is null && maxOrderQty is null && maxOrderValue is null
-			&& maxPositionSize is null && maxDailyVolume is null
-			&& maxOrderFreqCount is null && maxOrderFreqWindowSec is null
-			&& maxCommissionTotal is null)
-		{
-			return Accept();
-		}
-
-		// --- RiskLimits configuration validation (MJ-2) --------------------
-		// Validate the ENTIRE selected row up front, BEFORE any per-rule enable/
-		// disable guard runs. A negative threshold, commission rate, frequency count
+		// --- RiskLimits configuration validation (MJ-2, P4-F4) --------------------
+		// Validate the ENTIRE selected row up front, BEFORE the no-limits early return
+		// (relocated below this block for P4-F4) and before any per-rule enable/disable
+		// guard runs. A negative threshold, commission rate, frequency count
 		// or frequency window is invalid configuration and must FAIL CLOSED (reject)
 		// - never silently disable a control. Previously a negative frequency window
 		// was swallowed by the per-rule ">0" guard (the whole frequency check was
@@ -321,6 +317,24 @@ public class PreTradeRiskService
 		var freqWindowSet = maxOrderFreqWindowSec is not null && maxOrderFreqWindowSec.Value != 0;
 		if (freqCountSet != freqWindowSet)
 			return Reject(Inv($"Inconsistent frequency config: count={maxOrderFreqCount}, window_sec={maxOrderFreqWindowSec}; failing closed"));
+
+		// No configured limits at all => nothing to enforce (SQL L120-127). This early
+		// return now runs AFTER the whole-row configuration validation above (P4-F4), so by
+		// this point every populated field is known non-negative and the frequency pair is
+		// consistent. A row that is entirely NULL - or that carries ONLY a valid
+		// commission_rate (inert without a max_commission_total) - legitimately has nothing
+		// to enforce and is accepted here. Previously this ran BEFORE validation, so an
+		// all-NULL row whose only populated field was a NEGATIVE commission_rate slipped
+		// through and was wrongly accepted. Both frequency fields remain in the condition so
+		// a window-only (count NULL) row is not treated as "no limits" - though it is now
+		// also caught by the frequency-consistency check above (CR-3).
+		if (maxOrderPrice is null && maxOrderQty is null && maxOrderValue is null
+			&& maxPositionSize is null && maxDailyVolume is null
+			&& maxOrderFreqCount is null && maxOrderFreqWindowSec is null
+			&& maxCommissionTotal is null)
+		{
+			return Accept();
+		}
 
 		// Prospective-order message fed to the canonical pure-threshold rules: the
 		// gate executes the SAME rule comparison the RiskManager circuit breaker uses.

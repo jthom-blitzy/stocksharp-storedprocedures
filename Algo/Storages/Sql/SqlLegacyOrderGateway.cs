@@ -76,11 +76,34 @@ public class SqlLegacyOrderGateway
 		// currency isn't modeled on BusinessEntities.Portfolio the way it is on
 		// dbo.Portfolios, so newly auto-created rows always land on the column
 		// default ('USD') regardless of what the security/portfolio actually trades in
-		await using var insert = new SqlCommand(
-			"INSERT INTO dbo.Portfolios (name) OUTPUT INSERTED.portfolio_id VALUES (@name)", connection);
-		insert.Parameters.AddWithValue("@name", portfolio.Name);
+		try
+		{
+			await using var insert = new SqlCommand(
+				"INSERT INTO dbo.Portfolios (name) OUTPUT INSERTED.portfolio_id VALUES (@name)", connection);
+			insert.Parameters.AddWithValue("@name", portfolio.Name);
 
-		return (int)await insert.ExecuteScalarAsync(cancellationToken);
+			return (int)await insert.ExecuteScalarAsync(cancellationToken);
+		}
+		catch (SqlException ex) when (IsUniqueViolation(ex))
+		{
+			// P10-F11: the SELECT-then-INSERT above is check-then-act, so two concurrent
+			// callers can both miss the row and race to INSERT the same portfolio name.
+			// UQ_Portfolios_name makes the loser fail with a duplicate-key violation
+			// (2627/2601) instead of creating a second row - recover by re-reading the row the
+			// winner just committed and returning its id, so the method stays idempotent under
+			// concurrency rather than surfacing a raw provider error to the caller.
+			await using var reselect = new SqlCommand(
+				"SELECT portfolio_id FROM dbo.Portfolios WHERE name = @name", connection);
+			reselect.Parameters.AddWithValue("@name", portfolio.Name);
+
+			if (await reselect.ExecuteScalarAsync(cancellationToken) is int winnerId)
+				return winnerId;
+
+			// The winning row is only absent here if it was deleted again between the failed
+			// INSERT and this read; there is nothing to recover, so surface a sanitized domain
+			// error rather than the raw provider exception.
+			throw SanitizedConstraintError(ex, "portfolio creation");
+		}
 	}
 
 	/// <summary>
@@ -110,13 +133,35 @@ public class SqlLegacyOrderGateway
 				return existingId;
 		}
 
-		await using var insert = new SqlCommand(
-			"INSERT INTO dbo.Securities (security_code, board_code, security_type) OUTPUT INSERTED.security_id VALUES (@code, @board, @type)", connection);
-		insert.Parameters.AddWithValue("@code", security.Code);
-		insert.Parameters.AddWithValue("@board", (object)boardCode ?? DBNull.Value);
-		insert.Parameters.AddWithValue("@type", (object)security.Type?.ToString() ?? DBNull.Value);
+		try
+		{
+			await using var insert = new SqlCommand(
+				"INSERT INTO dbo.Securities (security_code, board_code, security_type) OUTPUT INSERTED.security_id VALUES (@code, @board, @type)", connection);
+			insert.Parameters.AddWithValue("@code", security.Code);
+			insert.Parameters.AddWithValue("@board", (object)boardCode ?? DBNull.Value);
+			insert.Parameters.AddWithValue("@type", (object)security.Type?.ToString() ?? DBNull.Value);
 
-		return (int)await insert.ExecuteScalarAsync(cancellationToken);
+			return (int)await insert.ExecuteScalarAsync(cancellationToken);
+		}
+		catch (SqlException ex) when (IsUniqueViolation(ex))
+		{
+			// P10-F12: same check-then-act race as EnsurePortfolioAsync. UQ_Securities_code_board
+			// turns the losing concurrent INSERT into a duplicate-key violation; recover by
+			// re-selecting the winner's row (by code + board, NULL-safe) and returning its id so
+			// the method is idempotent under concurrency.
+			await using var reselect = new SqlCommand(
+				"""
+				SELECT security_id FROM dbo.Securities
+				WHERE security_code = @code AND (board_code = @board OR (@board IS NULL AND board_code IS NULL))
+				""", connection);
+			reselect.Parameters.AddWithValue("@code", security.Code);
+			reselect.Parameters.AddWithValue("@board", (object)boardCode ?? DBNull.Value);
+
+			if (await reselect.ExecuteScalarAsync(cancellationToken) is int winnerId)
+				return winnerId;
+
+			throw SanitizedConstraintError(ex, "security creation");
+		}
 	}
 
 	/// <summary>
@@ -216,7 +261,20 @@ public class SqlLegacyOrderGateway
 			insert.Parameters.AddWithValue("@reject_reason", (object)validation.RejectReason ?? DBNull.Value);
 			insert.Parameters.AddWithValue("@external_transaction_id", (object)externalTransactionId ?? DBNull.Value);
 
-			orderId = (long)await insert.ExecuteScalarAsync(cancellationToken);
+			try
+			{
+				orderId = (long)await insert.ExecuteScalarAsync(cancellationToken);
+			}
+			catch (SqlException ex) when (IsConstraintViolation(ex))
+			{
+				// P4-F6: a constraint violation on the Orders insert (a bad @portfolio_id /
+				// @security_id foreign key, or a CHECK) is translated to a sanitized domain
+				// error so the raw SqlException text - which embeds the constraint / table /
+				// database names - is never surfaced to the caller (it is retained on the
+				// InnerException for logs). The SERIALIZABLE transaction disposes and rolls back
+				// on the way out, so no partial row is persisted.
+				throw SanitizedConstraintError(ex, "order submission");
+			}
 		}
 
 		await transaction.CommitAsync(cancellationToken);
@@ -248,6 +306,41 @@ public class SqlLegacyOrderGateway
 
 		await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(IsolationLevel.Serializable, cancellationToken);
 
+		// P4-F3: a fill may only be recorded against an order that is in a FILLABLE state.
+		// Read the order's status inside this SERIALIZABLE transaction FIRST - the read takes a
+		// key lock on the order row that is held to commit, so the status cannot change between
+		// this check and the Trades insert below. That gives check-to-insert atomicity WITHOUT
+		// an application lock: unlike SubmitOrderAsync this method does only point reads by
+		// primary key (no per-portfolio range scans), so the RangeS-S/RangeI-N cycle that made
+		// SubmitOrderAsync need sp_getapplock cannot form here. A REJECTED, CANCELLED or
+		// still-PENDING order must NOT drive a trade or a position change: the request is
+		// rejected atomically (no trade row, no recompute) and the transaction rolls back on the
+		// way out. This is a data-integrity guard, not a risk decision - it holds no thresholds.
+		string status;
+
+		await using (var statusCmd = new SqlCommand(
+			"SELECT status FROM dbo.Orders WHERE order_id = @order_id", connection)
+		{
+			Transaction = transaction,
+		})
+		{
+			statusCmd.Parameters.AddWithValue("@order_id", orderId);
+
+			if (await statusCmd.ExecuteScalarAsync(cancellationToken) is string existingStatus)
+				status = existingStatus;
+			else
+				throw new InvalidOperationException(FormattableString.Invariant(
+					$"Cannot record a trade: order {orderId} does not exist."));
+		}
+
+		// Only an order that was accepted (or is already partially/fully filled) can receive a
+		// fill; anything else is an invalid state transition. The surfaced Message names only
+		// the order id and its business status (a domain value the caller owns) - never a
+		// schema object - so there is no information-disclosure concern here.
+		if (status is not ("ACCEPTED" or "PARTFILLED" or "FILLED"))
+			throw new InvalidOperationException(FormattableString.Invariant(
+				$"Cannot record a trade: order {orderId} is not in a fillable state (status '{status}')."));
+
 		await using (var insert = new SqlCommand(
 			"INSERT INTO dbo.Trades (order_id, qty, price) VALUES (@order_id, @qty, @price)", connection)
 		{
@@ -258,7 +351,19 @@ public class SqlLegacyOrderGateway
 			insert.Parameters.Add(new SqlParameter("@qty", SqlDbType.Decimal) { Precision = 18, Scale = 4, Value = qty });
 			insert.Parameters.Add(new SqlParameter("@price", SqlDbType.Decimal) { Precision = 18, Scale = 4, Value = price });
 
-			var affected = await insert.ExecuteNonQueryAsync(cancellationToken);
+			int affected;
+
+			try
+			{
+				affected = await insert.ExecuteNonQueryAsync(cancellationToken);
+			}
+			catch (SqlException ex) when (IsConstraintViolation(ex))
+			{
+				// P4-F6: sanitize a constraint violation on the Trades insert (e.g.
+				// FK_Trades_Orders, or a CK on qty/price) - the transaction rolls back on the
+				// way out, so no partial trade or recompute is persisted.
+				throw SanitizedConstraintError(ex, "trade recording");
+			}
 
 			if (affected != 1)
 				throw new InvalidOperationException(FormattableString.Invariant(
@@ -317,6 +422,35 @@ public class SqlLegacyOrderGateway
 		_ => throw new NotSupportedException($"Order side '{side}' has no dbo.Orders.side mapping (Buy/Sell only)."),
 	};
 
+	// --- Provider-error sanitization (P4-F6) --------------------------------------------
+	// SQL Server surfaces constraint / data-integrity failures as a SqlException whose
+	// Message embeds internal identifiers - constraint names (FK_/CK_/UQ_), table and column
+	// names, and the database name. Leaking that text to a caller is an information-disclosure
+	// gap, so the helpers below recognise the EXPECTED provider error numbers and translate
+	// them to a stable, domain-level InvalidOperationException. The raw SqlException is kept as
+	// the InnerException, so full detail is still available to server-side diagnostics/logs but
+	// is NOT part of the surfaced Message. Transient / connectivity errors are deliberately NOT
+	// matched here: they propagate unchanged so the callers' reachability semantics (and the
+	// test harness's OpenLegacyOrInconclusiveAsync fallback) are unaffected.
+
+	// Unique-constraint / unique-index violation (duplicate key): 2627 (constraint), 2601 (index).
+	private static bool IsUniqueViolation(SqlException ex)
+		=> ex.Number is 2627 or 2601;
+
+	// Data-integrity violations that embed schema object names: FK / CHECK (547), NOT NULL
+	// (515), string-or-binary truncation (8152 legacy, 2628 newer), and numeric overflow on
+	// convert (8115). Unique violations are included so any insert that hits one is sanitized
+	// too (the Ensure* paths handle their OWN unique races before this can be reached).
+	private static bool IsConstraintViolation(SqlException ex)
+		=> ex.Number is 547 or 515 or 8152 or 2628 or 8115 || IsUniqueViolation(ex);
+
+	// Wraps an expected constraint SqlException in a sanitized domain exception. The public
+	// Message names only the logical operation - never a constraint, table, column or the
+	// database - while the original SqlException is retained on InnerException for logs.
+	private static InvalidOperationException SanitizedConstraintError(SqlException ex, string operation)
+		=> new(FormattableString.Invariant(
+			$"The {operation} was rejected because it violates a data-integrity constraint."), ex);
+
 	// Acquires an EXCLUSIVE, transaction-scoped application lock keyed on the portfolio so
 	// the read-decide-insert critical section in SubmitOrderAsync runs one-at-a-time per
 	// portfolio. This removes the SERIALIZABLE RangeS-S (pre-trade range reads) vs RangeI-N
@@ -353,14 +487,31 @@ public class SqlLegacyOrderGateway
 		};
 		command.Parameters.Add(resultCode);
 
-		await command.ExecuteNonQueryAsync(cancellationToken);
+		try
+		{
+			await command.ExecuteNonQueryAsync(cancellationToken);
+		}
+		catch (SqlException ex) when (cancellationToken.IsCancellationRequested)
+		{
+			// P4-F5: when the CancellationToken fires while ExecuteNonQueryAsync is waiting on
+			// the (@LockTimeout = -1) lock, Microsoft.Data.SqlClient asks the server to cancel
+			// the running batch, which can surface as a SqlException ("Operation cancelled by
+			// user.") rather than a clean OperationCanceledException. Normalize it so a
+			// caller-requested cancellation is ALWAYS observed as an OperationCanceledException,
+			// regardless of whether the wait was interrupted before the batch started running
+			// (clean OCE, already correct) or after (raw SqlException, translated here). The raw
+			// SqlException is preserved as the inner exception for diagnostics.
+			throw new OperationCanceledException(
+				"The per-portfolio submit lock wait was canceled.", ex, cancellationToken);
+		}
 
 		// sp_getapplock return codes: 0 = granted, 1 = granted after waiting (both success);
 		// negative = failure (-1 timeout, -2 canceled, -3 deadlock victim, -999 bad
-		// parameter / other). With an infinite @LockTimeout a wait-timeout (-1) cannot occur
-		// and a cancellation surfaces as an OperationCanceledException from
-		// ExecuteNonQueryAsync before we reach here, so any negative code is an unexpected
-		// acquisition failure worth surfacing.
+		// parameter / other). With an infinite @LockTimeout a wait-timeout (-1) cannot occur,
+		// and a caller cancellation is normalized to an OperationCanceledException (either
+		// raised directly by ExecuteNonQueryAsync or translated from a SqlException by the catch
+		// above) before we reach here, so any negative code is an unexpected acquisition failure
+		// worth surfacing.
 		var code = resultCode.Value is int value ? value : -999;
 
 		if (code < 0)

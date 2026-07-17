@@ -24,14 +24,17 @@ namespace StockSharp.Algo.Risk;
 /// each incoming order message through <see cref="RiskOrderPriceRule"/>,
 /// <see cref="RiskOrderVolumeRule"/> and <see cref="RiskOrderValueRule"/> via
 /// their <c>ProcessMessage</c>; the gate applies the same <c>">="</c> comparison
-/// to a prospective order. The gate additionally honours the SQL
-/// <c>NULL/0 = "not enforced"</c> convention when a configured limit is absent
-/// (AAP 0.6.6), so a zero limit disables the check at the gate.</item>
+/// to a prospective order. All of these canonical rules honour the SQL
+/// <c>NULL/0 = "not enforced"</c> convention (AAP 0.6.6): a zero limit disables the
+/// check IDENTICALLY on BOTH the circuit-breaker and the gate paths - the rule
+/// classes short-circuit a zero threshold before any comparison (P6-F7).</item>
 /// <item>Resulting position size (<see cref="RiskPositionSizeRule"/>) is a shared
-/// definition applied at two points: this circuit breaker checks the live signed
-/// position directionally, while the gate projects the hypothetical post-fill
-/// position and compares its absolute magnitude - a by-design timing/framing
-/// difference, not an accidental divergence (see LEGACY_LAYER.md).</item>
+/// definition applied at two points with the SAME comparison: both this circuit
+/// breaker (on the live value) and the gate (on the hypothetical post-fill
+/// projection) compare the ABSOLUTE magnitude against the limit (P6-F8). The only
+/// difference is the application point - the live value vs. the post-fill
+/// projection - a by-design timing/framing difference, not a difference in
+/// strictness or comparison (see LEGACY_LAYER.md).</item>
 /// <item>Order frequency (<see cref="RiskOrderFreqRule"/>) and daily traded
 /// volume (<see cref="RiskDailyVolumeRule"/>): the circuit breaker feeds live
 /// streaming state while the gate feeds an aggregate read from SQL Server.</item>

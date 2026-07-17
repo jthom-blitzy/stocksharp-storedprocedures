@@ -2175,10 +2175,11 @@ public class RiskTests : BaseTestClass
 		// The reference RiskOrderPriceRule (circuit-breaker path) rejects on a raw
 		// ">=" comparison; the ">=" ("meets or exceeds") boundary is preserved, so
 		// an order exactly AT the limit is rejected. The OrderReplace path also
-		// requires a positive price. The pre-trade gate (PreTradeRiskService) applies
-		// the SAME ">=" boundary but layers the SQL "0 = not enforced" convention on
-		// top of it - a difference of application point, not a shared helper, and
-		// covered by the Gate* tests. This test pins the reference rule's own boundary.
+		// requires a positive price. Per P6-F7 this rule now ALSO honours the shared
+		// "0 = not enforced" convention (AAP 0.6.6), so the circuit breaker and the
+		// pre-trade gate disable a zero limit IDENTICALLY - the two paths apply the
+		// SAME ">=" boundary AND the SAME zero-disable, differing only in application
+		// point. This test pins the reference rule's own boundary and zero-disable.
 		var rule = new RiskOrderPriceRule { Price = 100m };
 		var sid = Helper.CreateSecurityId();
 
@@ -2189,6 +2190,12 @@ public class RiskTests : BaseTestClass
 		// OrderReplace requires price > 0 alongside the ">=" comparison.
 		rule.ProcessMessage(new OrderReplaceMessage { SecurityId = sid, Price = 100m }).AssertTrue();   // boundary (">=")
 		rule.ProcessMessage(new OrderReplaceMessage { SecurityId = sid, Price = 0m }).AssertFalse();     // price <= 0 not evaluated
+
+		// P6-F7: a zero limit means "not enforced" - no positive order trips it, on
+		// EITHER message path (previously 0 tripped every order via ">= 0").
+		var disabled = new RiskOrderPriceRule { Price = 0m };
+		disabled.ProcessMessage(new OrderRegisterMessage { SecurityId = sid, Price = 1_000_000m }).AssertFalse();
+		disabled.ProcessMessage(new OrderReplaceMessage { SecurityId = sid, Price = 1_000_000m }).AssertFalse();
 	}
 
 	[TestMethod]
@@ -2196,9 +2203,10 @@ public class RiskTests : BaseTestClass
 	{
 		// Mirrors OrderPriceRuleBoundary for the order-quantity ceiling: the
 		// reference RiskOrderVolumeRule rejects on a raw ">=" comparison (boundary
-		// preserved), and OrderReplace additionally requires a positive volume. The
-		// gate applies the same ">=" boundary plus the "0 = not enforced" convention
-		// (an application-point difference covered by the Gate* tests).
+		// preserved), and OrderReplace additionally requires a positive volume. Per
+		// P6-F7 this rule now ALSO honours the "0 = not enforced" convention (AAP
+		// 0.6.6), so the circuit breaker and the gate disable a zero limit IDENTICALLY
+		// (same ">=" boundary AND same zero-disable, differing only in application point).
 		var rule = new RiskOrderVolumeRule { Volume = 1_000m };
 		var sid = Helper.CreateSecurityId();
 
@@ -2209,22 +2217,28 @@ public class RiskTests : BaseTestClass
 		// OrderReplace requires volume > 0 alongside the ">=" comparison.
 		rule.ProcessMessage(new OrderReplaceMessage { SecurityId = sid, Volume = 1_000m }).AssertTrue();   // boundary (">=")
 		rule.ProcessMessage(new OrderReplaceMessage { SecurityId = sid, Volume = 0m }).AssertFalse();       // volume <= 0 not evaluated
+
+		// P6-F7: a zero limit means "not enforced" - no positive order trips it, on
+		// EITHER message path (previously 0 tripped every order via ">= 0").
+		var disabled = new RiskOrderVolumeRule { Volume = 0m };
+		disabled.ProcessMessage(new OrderRegisterMessage { SecurityId = sid, Volume = 1_000_000m }).AssertFalse();
+		disabled.ProcessMessage(new OrderReplaceMessage { SecurityId = sid, Volume = 1_000_000m }).AssertFalse();
 	}
 
 	// --- Position size: reference rule is DIRECTIONAL (gate projects post-fill ABS) --
 
 	[TestMethod]
-	public void PositionSizeRuleDirectionalBoundary()
+	public void PositionSizeRuleAbsoluteBoundary()
 	{
-		// The reference RiskPositionSizeRule (circuit-breaker path) is DIRECTIONAL,
-		// not symmetric-absolute: a POSITIVE limit caps long exposure
-		// (currentValue >= limit), a NEGATIVE limit caps short exposure
-		// (currentValue <= limit), and a zero limit disables the check. A short
-		// position therefore does NOT trip a positive limit. The pre-trade gate
-		// applies the same configured threshold as a post-fill ABSOLUTE projection
-		// (a different application point, documented in LEGACY_LAYER.md and covered
-		// by GatePositionSizeUsesPostFillProjection); this test pins the reference
-		// rule's own directional boundary.
+		// P6-F8: the reference RiskPositionSizeRule (circuit-breaker path) is now
+		// SYMMETRIC-ABSOLUTE, matching the pre-trade gate's Math.Abs(projected) >= limit.
+		// It caps ABSOLUTE exposure: |currentValue| >= |limit| trips regardless of side,
+		// so a SHORT trips a positive cap just as a LONG does. A zero limit still disables
+		// the check (NULL/0 = not enforced, AAP 0.6.6). This is the SAME comparison the gate
+		// uses (AAP 0.6.1 "same threshold AND comparison"); the two paths differ only in
+		// application point (live value vs. post-fill projection, covered by
+		// GatePositionSizeUsesPostFillProjection). The previous DIRECTIONAL comparison was
+		// looser on the short side and violated stricter-wins (AAP 0.6.2).
 		var sid = Helper.CreateSecurityId();
 
 		bool Trip(decimal limit, decimal current)
@@ -2235,20 +2249,67 @@ public class RiskTests : BaseTestClass
 			return rule.ProcessMessage(msg);
 		}
 
-		// Positive limit caps LONG exposure, directionally.
+		// A positive limit caps ABSOLUTE exposure on BOTH sides.
 		Trip(100m, 50m).AssertFalse();
 		Trip(100m, 100m).AssertTrue();    // boundary (">=")
 		Trip(100m, 150m).AssertTrue();
-		Trip(100m, -150m).AssertFalse();  // a SHORT does NOT trip a positive limit (directional)
+		Trip(100m, -150m).AssertTrue();   // P6-F8: a SHORT now trips a positive cap (|-150| >= 100)
+		Trip(100m, -50m).AssertFalse();   // magnitude below the cap does not trip
+		Trip(100m, -100m).AssertTrue();   // boundary on the short side (|-100| >= 100)
 
-		// Negative limit caps SHORT exposure, directionally.
+		// A negatively-configured limit is compared by magnitude too (|limit| = 100), so it
+		// behaves identically to a +100 cap - the SIGN of the configured limit no longer
+		// changes which side is capped.
 		Trip(-100m, -50m).AssertFalse();
-		Trip(-100m, -100m).AssertTrue();  // boundary ("<=")
+		Trip(-100m, -100m).AssertTrue();  // boundary (|-100| >= 100)
 		Trip(-100m, -150m).AssertTrue();
-		Trip(-100m, 150m).AssertFalse();  // a LONG does NOT trip a negative limit (directional)
+		Trip(-100m, 150m).AssertTrue();   // P6-F8: a LONG now trips a negative-configured cap (|150| >= 100)
 
 		// Zero limit disables the check.
 		Trip(0m, 1_000_000m).AssertFalse();
+	}
+
+	[TestMethod]
+	public void ManagerZeroLimitsDoNotActivate()
+	{
+		// P6-F7 (manager-level regression): a RiskManager holding price/volume rules
+		// configured with a ZERO threshold must NOT trip on a positive order - zero means
+		// "not enforced" (AAP 0.6.6). Before the fix RiskOrderPriceRule/RiskOrderVolumeRule
+		// returned true for every order against a 0 limit, so the circuit breaker wrongly
+		// activated its configured action (e.g. StopTrading / CancelOrders).
+		var manager = new RiskManager();
+		manager.Rules.Add(new RiskOrderPriceRule { Price = 0m, Action = RiskActions.StopTrading });
+		manager.Rules.Add(new RiskOrderVolumeRule { Volume = 0m, Action = RiskActions.CancelOrders });
+
+		var order = new OrderRegisterMessage
+		{
+			SecurityId = Helper.CreateSecurityId(),
+			Price = 1_000_000m,
+			Volume = 1_000_000m,
+		};
+
+		manager.ProcessRules(order).ToArray().Length.AssertEqual(0); // neither zero-limit rule enforces
+	}
+
+	[TestMethod]
+	public void ManagerPositionSizeShortTripsPositiveLimit()
+	{
+		// P6-F8 (manager-level regression): with the canonical symmetric-absolute
+		// comparison, a LIVE SHORT position now trips a POSITIVE position-size cap on the
+		// circuit-breaker path, exactly as the pre-trade gate's absolute projection does.
+		// Before the fix the directional comparison let a -150 live position slip under a
+		// +100 cap.
+		var manager = new RiskManager();
+		manager.Rules.Add(new RiskPositionSizeRule { Position = 100m, Action = RiskActions.CancelOrders });
+
+		var posMsg = new PositionChangeMessage
+		{
+			SecurityId = Helper.CreateSecurityId(),
+			ServerTime = DateTime.UtcNow,
+			PortfolioName = _pfName,
+		}.Add(PositionChangeTypes.CurrentValue, -150m);
+
+		manager.ProcessRules(posMsg).ToArray().Length.AssertEqual(1); // |-150| >= 100 => trips
 	}
 
 	// --- Daily traded volume: relocated from SQL-only, cumulative in stream --
@@ -2760,6 +2821,55 @@ public class RiskTests : BaseTestClass
 	}
 
 	[TestMethod]
+	public async Task GateRejectsSubStepPositivePrice()
+	{
+		// P10-F10: a strictly-positive price below the DECIMAL(18,4) minimum step (0.00004)
+		// coerces to 0.0000 on persistence. The gate must reject it as a MALFORMED INPUT
+		// (InvalidRequest) BEFORE any risk evaluation or persistence - never accept it and
+		// silently store a zero price. The neighboring 0.00005 rounds to 0.0001 and remains
+		// a valid, representable positive price that is still accepted (no over-rejection).
+		await using var conn = await OpenLegacyOrInconclusiveAsync();
+		var pfId = await InsertPortfolioAsync(conn);
+		var secId = await InsertSecurityAsync(conn);
+		var svc = NewGateService();
+
+		var subStep = await svc.ValidateAsync(pfId, secId, Sides.Buy, 1m, 0.00004m, OrderTypes.Limit);
+		subStep.IsValid.AssertFalse();
+		subStep.RejectionKind.AssertEqual(PreTradeRejectionKind.InvalidRequest);
+
+		// A MARKET order carrying the same sub-step reference price is equally malformed.
+		var subStepMarket = await svc.ValidateAsync(pfId, secId, Sides.Buy, 1m, 0.00004m, OrderTypes.Market);
+		subStepMarket.IsValid.AssertFalse();
+		subStepMarket.RejectionKind.AssertEqual(PreTradeRejectionKind.InvalidRequest);
+
+		// The smallest representable positive price (0.00005 -> 0.0001) is still accepted.
+		var representable = await svc.ValidateAsync(pfId, secId, Sides.Buy, 1m, 0.00005m, OrderTypes.Limit);
+		representable.IsValid.AssertTrue();
+	}
+
+	[TestMethod]
+	public async Task GateFailsClosedOnNegativeRateOnlyRow()
+	{
+		// P4-F4: a RiskLimits row where EVERY threshold is NULL and ONLY commission_rate is
+		// negative previously took the no-limits early return (accepted) BEFORE rate
+		// validation ran. With whole-row configuration validation now relocated to run
+		// BEFORE the early return, the negative rate fails CLOSED like every other negative
+		// config value.
+		await using var conn = await OpenLegacyOrInconclusiveAsync();
+		var pfId = await InsertPortfolioAsync(conn);
+		var secId = await InsertSecurityAsync(conn);
+
+		// Every limit NULL (defaults); only a negative commission_rate populated.
+		await InsertRiskLimitAsync(conn, pfId, commissionRate: -0.5m);
+
+		var result = await NewGateService().ValidateAsync(pfId, secId, Sides.Buy, 1m, 150m, OrderTypes.Limit);
+
+		result.IsValid.AssertFalse();
+		result.RejectionKind.AssertEqual(PreTradeRejectionKind.RiskLimit);
+		result.RejectReason.Contains("failing closed").AssertTrue();
+	}
+
+	[TestMethod]
 	public async Task GateConfigValidationPrecedesRuleEvaluation()
 	{
 		// MN-1: define and pin the failure PRECEDENCE explicitly. Whole-row RiskLimits
@@ -2910,6 +3020,34 @@ public class RiskTests : BaseTestClass
 	}
 
 	[TestMethod]
+	public async Task GatewaySubmitSubStepPriceThrowsAndPersistsNothing()
+	{
+		// P10-F10 (persistence layer): a strictly-positive sub-step price (0.00004) coerces
+		// to 0.0000 at DECIMAL(18,4). The gate now classifies it as a malformed INPUT
+		// (InvalidRequest), so the gateway surfaces an ArgumentException and persists NO
+		// dbo.Orders row - it must never store a zero price that would slip under every
+		// ceiling. The neighboring representable price 0.00005 (-> 0.0001) is accepted and
+		// persisted normally, proving there is no over-rejection.
+		await using var conn = await OpenLegacyOrInconclusiveAsync();
+		var pfId = await InsertPortfolioAsync(conn);
+		var secId = await InsertSecurityAsync(conn);
+		await InsertRiskLimitAsync(conn, pfId, maxOrderPrice: 1_000_000m);
+
+		var gateway = NewGateway();
+
+		await ThrowsExactlyAsync<ArgumentException>(
+			async () => await gateway.SubmitOrderAsync(pfId, secId, Sides.Buy, 1m, 0.00004m, OrderTypes.Limit));
+
+		// Nothing was written for the malformed sub-step price.
+		(await CountOrdersByPortfolioAsync(conn, pfId)).AssertEqual(0);
+
+		// The smallest representable positive price (0.00005 -> 0.0001) is accepted and persisted.
+		var ok = await gateway.SubmitOrderAsync(pfId, secId, Sides.Buy, 1m, 0.00005m, OrderTypes.Limit);
+		ok.IsValid.AssertTrue();
+		(await CountOrdersByPortfolioAsync(conn, pfId)).AssertEqual(1);
+	}
+
+	[TestMethod]
 	public async Task GatewaySubmitRiskRejectedPersistsRejectedRow()
 	{
 		// MJ-1: a well-formed order that breaches a risk limit is RECORDED as REJECTED
@@ -2991,6 +3129,234 @@ public class RiskTests : BaseTestClass
 		covered.Quantity.AssertEqual(-40m);
 		covered.AveragePrice.AssertEqual(150m);
 		covered.RealizedPnL.AssertEqual(600m);
+	}
+
+	private static async Task<int> CountTradesByOrderAsync(SqlConnection conn, long orderId, CancellationToken ct = default)
+	{
+		await using var cmd = new SqlCommand("SELECT COUNT(*) FROM dbo.Trades WHERE order_id = @id", conn);
+		cmd.Parameters.AddWithValue("@id", orderId);
+		return (int)await cmd.ExecuteScalarAsync(ct);
+	}
+
+	private static async Task<int> CountPortfoliosByNameAsync(SqlConnection conn, string name, CancellationToken ct = default)
+	{
+		await using var cmd = new SqlCommand("SELECT COUNT(*) FROM dbo.Portfolios WHERE name = @name", conn);
+		cmd.Parameters.AddWithValue("@name", name);
+		return (int)await cmd.ExecuteScalarAsync(ct);
+	}
+
+	private static async Task<int> CountSecuritiesByCodeAsync(SqlConnection conn, string code, CancellationToken ct = default)
+	{
+		await using var cmd = new SqlCommand("SELECT COUNT(*) FROM dbo.Securities WHERE security_code = @code", conn);
+		cmd.Parameters.AddWithValue("@code", code);
+		return (int)await cmd.ExecuteScalarAsync(ct);
+	}
+
+	[TestMethod]
+	public async Task GatewayRecordTradeAgainstNonFillableOrderThrowsAndPersistsNothing()
+	{
+		// P4-F3: a fill may only be recorded against a FILLABLE order (ACCEPTED / PARTFILLED /
+		// FILLED). Recording against a REJECTED order - or an order id that does not exist - is
+		// an invalid state transition: the gateway throws and writes NOTHING (no trade row, no
+		// position), because the order status is read-and-locked inside the same SERIALIZABLE
+		// transaction as the would-be Trades insert. A well-formed ACCEPTED order still fills
+		// normally, proving the guard does not over-reject.
+		await using var conn = await OpenLegacyOrInconclusiveAsync();
+		var pfId = await InsertPortfolioAsync(conn);
+		var secId = await InsertSecurityAsync(conn);
+		await InsertRiskLimitAsync(conn, pfId, maxOrderPrice: 500m);
+
+		var gateway = NewGateway();
+
+		// A well-formed limit breach (price 999 > 500) is persisted as REJECTED (audit trail).
+		var rejected = await gateway.SubmitOrderAsync(pfId, secId, Sides.Buy, 10m, 999m, OrderTypes.Limit);
+		rejected.IsValid.AssertFalse();
+		rejected.OrderId.AssertGreater(0);
+
+		// Recording a fill against that REJECTED order is refused atomically.
+		await ThrowsExactlyAsync<InvalidOperationException>(
+			async () => await gateway.RecordTradeAsync(rejected.OrderId, 10m, 999m));
+
+		// No trade row and no position resulted from the refused fill.
+		(await CountTradesByOrderAsync(conn, rejected.OrderId)).AssertEqual(0);
+		(await gateway.GetPositionAsync(pfId, secId)).AssertNull();
+
+		// A non-existent order id is likewise refused.
+		await ThrowsExactlyAsync<InvalidOperationException>(
+			async () => await gateway.RecordTradeAsync(long.MaxValue, 10m, 100m));
+
+		// A well-formed ACCEPTED order (price 100 < 500) still fills - no over-rejection.
+		var accepted = await gateway.SubmitOrderAsync(pfId, secId, Sides.Buy, 10m, 100m, OrderTypes.Limit);
+		accepted.IsValid.AssertTrue();
+		await gateway.RecordTradeAsync(accepted.OrderId, 10m, 100m);
+		(await CountTradesByOrderAsync(conn, accepted.OrderId)).AssertEqual(1);
+	}
+
+	[TestMethod]
+	public async Task GatewayEnsurePortfolioIsConcurrencySafe()
+	{
+		// P10-F11: EnsurePortfolioAsync does SELECT-then-INSERT, so concurrent callers can race
+		// to create the same portfolio name. UQ_Portfolios_name turns the losers into duplicate-
+		// key violations that the gateway now catches and recovers from by re-reading the winner.
+		// Firing many concurrent Ensure calls for the SAME name must yield exactly ONE row, all
+		// calls returning the SAME id, and NO surfaced exception.
+		await using var conn = await OpenLegacyOrInconclusiveAsync();
+
+		var name = "ITPF_CC_" + Guid.NewGuid().ToString("N");
+		var gateway = NewGateway();
+
+		const int concurrency = 24;
+		var tasks = new Task<int>[concurrency];
+		for (var i = 0; i < concurrency; i++)
+			tasks[i] = Task.Run(() => gateway.EnsurePortfolioAsync(new Portfolio { Name = name }));
+
+		var ids = await Task.WhenAll(tasks);
+
+		// Every concurrent caller observed the same winning id...
+		foreach (var id in ids)
+			id.AssertEqual(ids[0]);
+
+		// ...and exactly one row exists for that name.
+		(await CountPortfoliosByNameAsync(conn, name)).AssertEqual(1);
+	}
+
+	[TestMethod]
+	public async Task GatewayEnsureSecurityIsConcurrencySafe()
+	{
+		// P10-F12: same check-then-act race as EnsurePortfolioAsync, guarded by
+		// UQ_Securities_code_board. Concurrent Ensure calls for the same code + board yield
+		// exactly one row, one shared id, and no surfaced exception.
+		await using var conn = await OpenLegacyOrInconclusiveAsync();
+
+		var code = "ITSEC_CC_" + Guid.NewGuid().ToString("N");
+		var gateway = NewGateway();
+
+		const int concurrency = 24;
+		var tasks = new Task<int>[concurrency];
+		for (var i = 0; i < concurrency; i++)
+			tasks[i] = Task.Run(() => gateway.EnsureSecurityAsync(
+				new Security { Code = code, Board = ExchangeBoard.Test }));
+
+		var ids = await Task.WhenAll(tasks);
+
+		foreach (var id in ids)
+			id.AssertEqual(ids[0]);
+
+		(await CountSecuritiesByCodeAsync(conn, code)).AssertEqual(1);
+	}
+
+	[TestMethod]
+	public async Task GatewaySubmitConstraintViolationSurfacesSanitizedError()
+	{
+		// P4-F6: a provider constraint violation must be surfaced as a sanitized domain
+		// exception - never a raw SqlException whose text embeds constraint / table / database
+		// names. The raw SqlException is retained on InnerException for server-side diagnostics.
+		await using var conn = await OpenLegacyOrInconclusiveAsync();
+
+		var gateway = NewGateway();
+
+		// (1) Orders-insert path: a well-formed order referencing a non-existent portfolio /
+		// security trips FK_Orders_Portfolios/_Securities.
+		const int badPf = int.MaxValue;
+		const int badSec = int.MaxValue - 1;
+
+		InvalidOperationException submitEx = null;
+		try
+		{
+			await gateway.SubmitOrderAsync(badPf, badSec, Sides.Buy, 1m, 150m, OrderTypes.Limit);
+		}
+		catch (InvalidOperationException ex)
+		{
+			submitEx = ex;
+		}
+
+		submitEx.AssertNotNull();
+		submitEx.Message.Contains("data-integrity constraint").AssertTrue();
+		submitEx.Message.Contains("FK_").AssertFalse();   // no constraint name leaked
+		submitEx.Message.Contains("dbo.").AssertFalse();  // no table/database name leaked
+		(submitEx.InnerException is SqlException).AssertTrue(); // raw detail retained for logs
+		(await CountOrdersByPortfolioAsync(conn, badPf)).AssertEqual(0); // nothing persisted
+
+		// (2) Trades-insert path: recording a fill with a non-positive qty against a real
+		// ACCEPTED order trips CK_Trades_qty and is sanitized the same way.
+		var pfId = await InsertPortfolioAsync(conn);
+		var secId = await InsertSecurityAsync(conn);
+		await InsertRiskLimitAsync(conn, pfId, maxOrderPrice: 1_000_000m);
+		var accepted = await gateway.SubmitOrderAsync(pfId, secId, Sides.Buy, 10m, 150m, OrderTypes.Limit);
+		accepted.IsValid.AssertTrue();
+
+		InvalidOperationException tradeEx = null;
+		try
+		{
+			await gateway.RecordTradeAsync(accepted.OrderId, 0m, 150m);
+		}
+		catch (InvalidOperationException ex)
+		{
+			tradeEx = ex;
+		}
+
+		tradeEx.AssertNotNull();
+		tradeEx.Message.Contains("data-integrity constraint").AssertTrue();
+		(tradeEx.InnerException is SqlException).AssertTrue();
+		(await CountTradesByOrderAsync(conn, accepted.OrderId)).AssertEqual(0); // rolled back
+	}
+
+	[TestMethod]
+	public async Task GatewaySubmitCancellationDuringLockWaitSurfacesOperationCanceled()
+	{
+		// P4-F5: while SubmitOrderAsync waits on the per-portfolio application lock
+		// (@LockTimeout = -1), a caller cancellation must surface as an OperationCanceledException
+		// - never a raw SqlException. Hold the SAME lock on a separate connection so the gateway
+		// blocks in the wait, then cancel the token: the observed exception must be an
+		// OperationCanceledException and must NOT be a SqlException.
+		await using var conn = await OpenLegacyOrInconclusiveAsync();
+		var pfId = await InsertPortfolioAsync(conn);
+		var secId = await InsertSecurityAsync(conn);
+		await InsertRiskLimitAsync(conn, pfId, maxOrderPrice: 1_000_000m);
+
+		// Hold the exact application lock the gateway will request, on a separate connection.
+		await using var holder = new SqlConnection(SqlLegacyConnection.Resolve());
+		await holder.OpenAsync();
+		await using var holderTx = (SqlTransaction)await holder.BeginTransactionAsync(IsolationLevel.Serializable);
+		await using (var lockCmd = new SqlCommand("sys.sp_getapplock", holder)
+		{
+			Transaction = holderTx,
+			CommandType = CommandType.StoredProcedure,
+		})
+		{
+			lockCmd.Parameters.AddWithValue("@Resource", FormattableString.Invariant($"SqlLegacyOrderGateway/SubmitOrder/portfolio/{pfId}"));
+			lockCmd.Parameters.AddWithValue("@LockMode", "Exclusive");
+			lockCmd.Parameters.AddWithValue("@LockOwner", "Transaction");
+			lockCmd.Parameters.AddWithValue("@LockTimeout", 0); // acquire immediately (nothing else holds it)
+			var rc = new SqlParameter { ParameterName = "@Result", SqlDbType = SqlDbType.Int, Direction = ParameterDirection.ReturnValue };
+			lockCmd.Parameters.Add(rc);
+			await lockCmd.ExecuteNonQueryAsync();
+			((int)rc.Value >= 0).AssertTrue(); // the test now holds the lock
+		}
+
+		var gateway = NewGateway();
+
+		using var cts = new CancellationTokenSource();
+		cts.CancelAfter(TimeSpan.FromMilliseconds(750));
+
+		Exception captured = null;
+		try
+		{
+			await gateway.SubmitOrderAsync(pfId, secId, Sides.Buy, 1m, 150m, OrderTypes.Limit, cancellationToken: cts.Token);
+		}
+		catch (Exception ex)
+		{
+			captured = ex;
+		}
+
+		// A caller-requested cancellation is ALWAYS an OperationCanceledException, never a raw
+		// SqlException (which would leak provider detail and defeat cooperative cancellation).
+		captured.AssertNotNull();
+		(captured is OperationCanceledException).AssertTrue();
+		(captured is SqlException).AssertFalse();
+
+		// Release the held lock so the connection/txn dispose cleanly.
+		await holderTx.RollbackAsync();
 	}
 
 	// ---------------------------------------------------------------------------

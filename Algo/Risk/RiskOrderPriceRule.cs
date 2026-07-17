@@ -43,6 +43,16 @@ public class RiskOrderPriceRule : RiskRule
 	/// <inheritdoc />
 	public override bool ProcessMessage(Message message)
 	{
+		// P6-F7 reconciliation (AAP 0.6.6): a zero (or NULL-sourced) threshold means the
+		// control is NOT ENFORCED - the shared "NULL/0 = not enforced" convention the SQL
+		// pre-trade gate and the sibling canonical rules (RiskOrderValueRule,
+		// RiskDailyVolumeRule, RiskPositionSizeRule) already honour. Without this guard a
+		// Price of 0 tripped on every positive order (orderReg.Price >= 0 is always true),
+		// silently activating the circuit-breaker action. The ">=" ("meets or exceeds")
+		// boundary is preserved unchanged for every genuinely configured (non-zero) limit.
+		if (Price == 0)
+			return false;
+
 		switch (message.Type)
 		{
 			case MessageTypes.OrderRegister:

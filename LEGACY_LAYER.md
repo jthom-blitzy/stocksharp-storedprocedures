@@ -110,9 +110,12 @@ evaluates the live order stream through the rule's `ProcessMessage`. Because
 they are applied at different points, the two patterns can reach different
 per-order results **by design** - resulting position size and cumulative
 commission are the documented cases below - but the canonical threshold value
-and the `>=` boundary for a merged rule never drift. The gate additionally
-honours the SQL `NULL`/`0` = "not enforced" convention, so a zero limit
-disables the corresponding check at the gate.
+and the `>=` boundary for a merged rule never drift. Both patterns honour the
+SQL `NULL`/`0` = "not enforced" convention: a null or exactly-zero threshold
+disables the corresponding check on the gate **and** on the circuit-breaker
+path - the price, quantity and position-size rules each early-return "not
+triggered" on a zero limit - so a zero limit can never trip a control on either
+side.
 
 **SQL is now pure data storage.** `Database/001_Schema.sql` remains
 tables/constraints/indexes only; `RiskLimits` still *stores* the ceilings, but
@@ -150,7 +153,7 @@ stated.
 | Order quantity ceiling | `RiskOrderVolumeRule` (`qty/Volume >= limit`) | **MERGE** | Identical semantics; only the `qty` (SQL) vs `Volume`/`Quantity` (C#) naming differed, reconciled in docs. |
 | Order notional value (qty x price) | `RiskOrderValueRule` (new) | **RELOCATE** | Existed only in SQL (`max_order_value`); promoted to a first-class C# rule - there was no C# counterpart to merge. |
 | Order frequency | `RiskOrderFreqRule` (rolling window) | **MERGE (rolling wins)** | Different algorithm; the rolling `COUNT(*)` is strictly stricter near a boundary, so it is canonical under the stricter-wins constraint. |
-| Resulting position size | `RiskPositionSizeRule` | **SHARED DEFINITION, TWO APPLICATION POINTS** | Same threshold; the gate compares a *post-fill absolute projection* while the circuit breaker checks the *live signed* position directionally. A by-design timing/framing difference, not an accidental divergence. |
+| Resulting position size | `RiskPositionSizeRule` | **SHARED DEFINITION, TWO APPLICATION POINTS** | Same threshold **and** the same absolute-magnitude `>=` comparison on both sides; the only difference is the *input* - the gate feeds a post-fill projection (`current + signed order qty`), the circuit breaker feeds the live position. A by-design input/timing difference, not a difference in the comparison. |
 | Cumulative commission | `RiskCommissionRule` / `RiskOrderCommissionRule` (actual, post-fill) **and** the gate's pre-fill estimate | **KEEP SEPARATE BY DESIGN** | Same commission-ceiling *concept*, but each side owns its own configured limit (no shared wiring); two computations on figures available at different times. **They will not always agree, and that is intentional** - they are not forced into one implementation. |
 | Daily traded volume | `RiskDailyVolumeRule` (new) | **RELOCATE** | Existed only in SQL (`max_daily_volume`); promoted to a first-class C# rule. |
 | Position lifetime / P&L limit / slippage | `RiskPositionTimeRule` / `RiskPnLRule` / `RiskSlippageRule` | **NO CHANGE (C#-only)** | Need live state the pre-trade gate does not have; outside the reconciliation surface, noted for completeness. |
@@ -196,18 +199,23 @@ route through the one comparison.
 
 Two rows in the matrix share a limit value but must **not** be naively merged.
 
-**Position size** is one threshold applied at two points, with a deliberately
-different framing at each. `RiskPositionSizeRule` owns the canonical limit
-value and, on the circuit-breaker path, compares the *current* live position
-**directionally** (a positive limit caps long exposure, a negative limit caps
-short exposure). The pre-trade gate cannot wait for the fill, so it compares a
+**Position size** is one threshold, one comparison, applied at two points that
+differ only in their *input*. `RiskPositionSizeRule` owns the canonical limit
+value and compares against the limit's **absolute magnitude**
+(`Math.Abs(position) >= Math.Abs(limit)`) on **both** paths, so a limit of 100
+caps exposure to 100 whether the book is long **or** short, and a zero limit
+disables the check. On the circuit-breaker path it evaluates the *current* live
+position; the pre-trade gate cannot wait for the fill, so it evaluates a
 *post-fill projection* - the current position plus the signed order quantity
-(`current + signed order qty`) - against the limit's **absolute magnitude**,
-exactly as the retired SQL `usp_ValidatePreTradeRisk` did
-(`ABS(@current + @signed_qty) >= @max_position_size`). The threshold is shared;
-the framing differs by design, and dropping the gate's projection would loosen
-the gate and violate the stricter-wins constraint, so the projection is
-mandatory. (Daily traded volume follows the same "one definition, two
+(`current + signed order qty`) - exactly as the retired SQL
+`usp_ValidatePreTradeRisk` did (`ABS(@current + @signed_qty) >= @max_position_size`).
+The threshold and the comparison are shared; only the input differs by design,
+and dropping the gate's projection would loosen the gate and violate the
+stricter-wins constraint, so the projection is mandatory. (The absolute-magnitude
+comparison on the circuit-breaker path is the canonical form: an earlier
+directional variant, which only capped the side matching the limit's sign and so
+let a short slip under a positive cap, has been retired so the single definition
+is applied identically everywhere.) (Daily traded volume follows the same "one definition, two
 application points" shape: the circuit breaker keeps a running daily
 accumulator, while the gate reads today's authoritative accepted/filled volume
 from SQL and adds the prospective order - both call the single
@@ -230,6 +238,14 @@ intentional** - forcing them
 into one implementation would either blind the gate (no pre-fill number) or
 misreport the circuit breaker (a guess instead of the real figure). The gate
 keeps the estimate; the circuit-breaker path keeps the actual.
+
+One estimate edge is kept deliberately for parity: a **market** order with no
+supplied price, on a security with no last-traded price to fall back on,
+contributes a **zero** new-order estimate (so it can be accepted on the
+new-order term alone), exactly matching the retired SQL's `ISNULL(@est_price, 0)`
+handling. This is a documented parity limitation, not a bypass - moving to a
+conservative fallback or an outright rejection would be a deliberate product
+decision, so it is preserved rather than silently changed.
 
 ### Position recompute and the (eliminated) double-count hazard
 
@@ -255,6 +271,58 @@ it needs a live market price, which the recompute path does not have. It is
 refreshed by the EOD mark-to-market batch (not part of this layer). Treat that
 column as stale/EOD-only, not real-time, if you read it.
 
+### The pre-trade gate checks committed state, not reserved state (no cross-order reservation)
+
+The gate validates each order against the **committed** SQL state at validation
+time: the live `Positions.qty` for the position-size projection, and the summed
+**actual fills** in `dbo.Trades` for the commission estimate. It does **not**
+reserve the exposure of accepted-but-unfilled orders, so two or more orders that
+are each validated before any of them commits are all measured against the same
+pre-existing state. Under a burst of concurrent submissions this means the
+*aggregate* accepted-but-unfilled exposure can exceed a ceiling even though no
+single order does (e.g. four BUY 30s can each pass a `max_position_size` of 100,
+for 120 accepted-but-unfilled).
+
+This is deliberate, and it matches the layer it replaces, rule for rule:
+
+- The retired `usp_ValidatePreTradeRisk` **RULE 5** read the **committed**
+  position (`SELECT @currentQty = qty FROM dbo.Positions`) and projected only
+  *this* order onto it
+  (`ABS(ISNULL(@currentQty, 0) + @signedDelta) >= @max_position_size`) - it never
+  counted other in-flight orders.
+- **RULE 6** read the commission base from **actual fills**
+  (`SUM(t.qty * t.price) FROM dbo.Trades`) - likewise blind to
+  accepted-but-unfilled orders.
+
+The canonical C# gate is a faithful port of exactly that behaviour, so it is at
+least as strict as **both** originals: the stricter-wins constraint governs each
+rule's per-order *comparison* (which is preserved verbatim), and since neither
+original reserved, the canonical form is not looser than either. AAP §0.6.4
+spells the projected-position semantics out as *"current + signed order
+quantity"* - a single-order projection, explicitly **not** an aggregate
+reservation - and the minimal-change clause (§0.7.2) scopes this pass to
+relocation and reconciliation, not to adding a brand-new cross-order
+reservation/settlement feature. True reservation would need a reserved-exposure
+ledger keyed by order, released on fill **or** cancel, plus a matching commission
+reservation - none of which existed on either side to reconcile. It is therefore
+recorded here as a known, by-design limitation and left for a separate,
+deliberate enhancement rather than being introduced silently under a
+consolidation pass.
+
+The two stateful rules that *do* accumulate across accepted orders continue to,
+because their **originals** read from `dbo.Orders` (status-filtered), not from
+positions or fills: order **frequency** (a rolling `COUNT(*)` of recent orders)
+and **daily traded volume** (today's accepted/filled qty plus the new order).
+Those are per-portfolio aggregates by original design and are unaffected by the
+non-reservation of position and commission.
+
+Separately, the gateway records a fill **only** against an order in a
+**fillable** state (`ACCEPTED` / `PARTFILLED` / `FILLED`): `RecordTradeAsync`
+reads and row-locks the order's status inside the same serializable transaction
+as the trade insert, so a `REJECTED`, `CANCELLED` or still-`PENDING` order can
+never drive a phantom trade or position change - the request is refused
+atomically, writing neither a trade row nor a position effect.
+
 ### Cross-cutting strictness conventions
 
 These subtle conventions are preserved verbatim so consolidation neither
@@ -266,7 +334,10 @@ loosens nor tightens behaviour by accident:
   everywhere.
 - **`NULL`/`0` means "not enforced".** A null or exactly-zero threshold
   disables that check - the same convention the SQL `RiskLimits` rows and the
-  C# rules always shared.
+  C# rules share. This holds on **both** enforcement paths: the pre-trade gate
+  skips a zero/absent limit, and the circuit-breaker rules (price, quantity and
+  position size) each early-return "not triggered" on a zero threshold rather
+  than treating `0` as an infinitely-strict ceiling.
 - **A negative threshold is invalid configuration and fails closed.** Rather
   than silently disabling a control, the pre-trade gate rejects (fails closed)
   on a negative limit; a half-configured frequency limit (one of
@@ -310,7 +381,12 @@ the risk consolidation and is unrelated to it.
 - `Orders.external_transaction_id` correlates a row back to the in-memory
   `Order.TransactionId`. It is a plain (non-unique) correlation column, not an
   idempotency key - it is nullable and was never back-filled for rows inserted
-  before it was added.
+  before it was added. `RecordTradeAsync` likewise has **no replay protection**:
+  calling it twice for the same fill inserts two `dbo.Trades` rows and applies
+  the position effect twice, by design. Duplicate fills are deliberately **not**
+  inferred from value equality (two genuine fills can legitimately share the same
+  qty/price); if replay protection is ever required it must come from an explicit
+  external trade id plus a unique constraint, not from guessing.
 - Only `OrderTypes.Limit`/`.Market` map to `dbo.Orders.order_type`; sending a
   conditional/stop order through `SqlLegacyOrderGateway` throws
   `NotSupportedException`. Conditional orders were out of scope for this pass.
@@ -357,3 +433,15 @@ behaviour (or its intentionally-distinct one), with the frequency-boundary,
 position-size timing, and commission estimate-vs-actual cases called out
 specifically. The suite is not an exhaustive proof of every path; it targets
 the reconciliation decisions this document records.
+
+Run this layer's tests with a filter -
+`dotnet test StockSharp_Tests.slnx -c Release --filter FullyQualifiedName~RiskTests` -
+rather than the whole `Tests.csproj`. The full unfiltered suite does **not**
+complete cleanly in the container, but for reasons **outside** this layer and
+outside this refactor's scope: `Tests/PathsTests.cs` makes container-specific
+path assertions that do not hold here, and `Tests/AsyncMessageChannelTests.Close_StopsProcessing`
+reproducibly hangs. Both live in unchanged platform code
+(`Configuration/Paths.cs`, `Messages/AsyncMessageChannel.cs` and their tests)
+that the minimal-change scope explicitly does not touch; they are pre-existing
+and environmental, not regressions from this work. The `RiskTests` class - which
+covers everything this document describes - runs green on its own.
