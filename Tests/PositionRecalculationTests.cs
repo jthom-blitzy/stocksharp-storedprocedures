@@ -348,14 +348,14 @@ public class PositionRecalculationTests : BaseTestClass
 	// configured. Each scenario seeds only what it needs with unique natural keys (including unique trade
 	// ids), and tears everything down in a finally so the shared dev/CI database stays clean across re-runs.
 	//
-	// Single-apply note (F5, F2): the position-recalc DB trigger was removed and there is NO durable ledger
-	// table. The AUTHORITATIVE single-apply guarantee is STRUCTURAL - the gateway assigns a fresh trade_id
-	// per committed trade (INSERT ... RETURNING) inside one atomic transaction, so each committed trade is
-	// applied exactly once and a rolled-back attempt persists nothing. The service adds an in-process
-	// best-effort HashSet guard on top (recorded only AFTER the apply's DB work succeeds). Because that guard
-	// is deliberately process-local, a concurrent same-trade duplicate on the SAME instance is NOT asserted
-	// to dedupe (it cannot arise in production - the gateway never reuses a trade_id); the invariant is
-	// covered instead by the structural real-Trades-row path, the sequential same-instance guard, and the
+	// Single-apply note (C3, F5/F2): the position-recalc DB trigger was removed, and exactly-once application
+	// is now enforced DURABLY. ApplyAsync claims the persisted trade by flipping trades.position_applied
+	// FALSE -> TRUE with a conditional UPDATE in the SAME transaction as the position write, so a repeat,
+	// retry, restart, or second-instance replay of an already-applied trade_id updates 0 rows and is an
+	// idempotent no-op. This is a persisted, cross-instance guarantee (not the former process-local HashSet),
+	// so a DIRECT ApplyAsync must target a REAL persisted trade_id - the tests below INSERT a trades row first
+	// (mirroring the gateway's INSERT ... RETURNING trade_id). The invariant is covered by the real-Trades-row
+	// gateway path, the sequential same-trade_id no-op, the cross-instance/gateway duplicate no-op, and the
 	// concurrent DIFFERENT-trades accumulation below.
 	// ========================================================================================================
 
@@ -515,8 +515,9 @@ public class PositionRecalculationTests : BaseTestClass
 	/// <summary>
 	/// F15 - concurrency / lost-update invariant. Two DIFFERENT trades on the SAME (portfolio, security),
 	/// recorded CONCURRENTLY through the gateway (each its own connection + transaction), must both land: the
-	/// per-(portfolio, security) <c>pg_advisory_xact_lock</c> serialises the read-recompute-write so neither
-	/// update is lost and the position accumulates to qty 200.
+	/// per-portfolio <c>pg_advisory_xact_lock</c> (C4, the single-key lock space shared by order submission
+	/// and recalculation) serialises the read-recompute-write so neither update is lost and the position
+	/// accumulates to qty 200.
 	/// </summary>
 	[TestMethod]
 	public async Task Gateway_ConcurrentDifferentTrades_Accumulate()
@@ -558,10 +559,12 @@ public class PositionRecalculationTests : BaseTestClass
 	}
 
 	/// <summary>
-	/// F5 - sequential single-apply via the in-process guard. The SAME service instance applies the SAME
-	/// trade_id twice (sequentially, each in its own committed transaction). The best-effort in-process guard
-	/// recognises the repeat and makes the second call an idempotent no-op, so the position is opened once
-	/// (qty 100), not double-counted (200).
+	/// C3 - sequential single-apply via the DURABLE guard. A REAL trades row is inserted, then the SAME
+	/// persisted trade_id is applied twice (sequentially, each in its own committed transaction). The durable
+	/// trades.position_applied guard flips FALSE -> TRUE on the first apply and commits it, so the second
+	/// apply updates 0 rows and is an idempotent no-op - the position is opened once (qty 100), not
+	/// double-counted (200). Because the flag is persisted, the guarantee holds across transactions,
+	/// instances, and process restarts, not just within one in-memory service object.
 	/// </summary>
 	[TestMethod]
 	public async Task ApplyAsync_SequentialSameTrade_SingleApply_NoDoubleCount()
@@ -581,10 +584,11 @@ public class PositionRecalculationTests : BaseTestClass
 			securityId = await InsertSecurityAsync(cn, "sec_" + suffix);
 			var orderId = await InsertOrderAsync(cn, portfolioId, securityId, "B", 100m, 150.00m, "ACCEPTED");
 
-			// The guard is keyed on trade_id and lives on the instance, so BOTH calls must reuse the SAME id
-			// AND the SAME svc for the second to be recognised as a repeat.
+			// The durable guard is keyed on the PERSISTED trade_id (trades.position_applied), so insert a REAL
+			// trade row and reuse its trade_id for BOTH applies; the second sees the committed flag and no-ops.
+			// A fresh service instance suffices - the guarantee lives in the database, not the object.
 			var svc = new PositionRecalculationService();
-			var tradeId = NextTradeId();
+			var tradeId = await InsertTradeAsync(cn, orderId, 100m, 150.00m);
 
 			await using (var t1 = await cn.BeginTransactionAsync(CancellationToken))
 			{
@@ -637,10 +641,14 @@ public class PositionRecalculationTests : BaseTestClass
 			await InsertPositionAsync(cn, portfolioId, securityId,
 				qty: 0m, avgPrice: 0m, realizedPnl: 0m, unrealizedPnl: sentinelUnrealized);
 
+			// Insert a REAL trades row so the durable single-apply guard (C3) can claim it; ApplyAsync flips
+			// its position_applied flag inside the transaction below.
+			var tradeId = await InsertTradeAsync(cn, orderId, 100m, 150.00m);
+
 			var svc = new PositionRecalculationService();
 			await using (var txn = await cn.BeginTransactionAsync(CancellationToken))
 			{
-				await svc.ApplyAsync(cn, txn, orderId, NextTradeId(), 100m, 150.00m, CancellationToken);
+				await svc.ApplyAsync(cn, txn, orderId, tradeId, 100m, 150.00m, CancellationToken);
 				await txn.CommitAsync(CancellationToken);
 			}
 
@@ -649,6 +657,212 @@ public class PositionRecalculationTests : BaseTestClass
 			position.AvgPrice.AssertEqual(150.00m);            // (|0|*0 + 100*150)/100 = 150
 			position.RealizedPnl.AssertEqual(0m);              // opening a position realizes nothing
 			position.UnrealizedPnl.AssertEqual(sentinelUnrealized); // untouched by recalculation
+		}
+		finally
+		{
+			await CleanupAsync(cn, portfolioId, securityId);
+		}
+	}
+
+	/// <summary>
+	/// C3 (multi-instance / restart / retry). The gateway records a trade (INSERT ... RETURNING trade_id, then
+	/// apply, committed with trades.position_applied = TRUE). A SEPARATE, freshly constructed service instance
+	/// - standing in for a different process instance or a post-restart retry - then re-applies the SAME
+	/// persisted trade_id. Because the guard is a persisted flag rather than in-process state, the retry
+	/// updates 0 rows and is an idempotent no-op: the position stays applied exactly once (qty 100, not 200).
+	/// </summary>
+	[TestMethod]
+	public async Task ApplyAsync_CrossInstanceDuplicateSamePersistedTrade_IsDurableNoOp()
+	{
+		await using var cn = await OpenMandatoryAsync();
+
+		if (cn is null)
+			return;
+
+		var suffix = Guid.NewGuid().ToString("N");
+		var portfolioId = 0;
+		var securityId = 0;
+
+		try
+		{
+			portfolioId = await InsertPortfolioAsync(cn, "pf_xinst_" + suffix);
+			securityId = await InsertSecurityAsync(cn, "sec_" + suffix);
+			var orderId = await InsertOrderAsync(cn, portfolioId, securityId, "B", 100m, 150.00m, "ACCEPTED");
+
+			// First application through the gateway: inserts the trade and applies it in one committed txn.
+			var gateway = new SqlLegacyOrderGateway(SqlLegacyConnection.Resolve());
+			await gateway.RecordTradeAsync(orderId, 100m, 150.00m, CancellationToken);
+			var tradeId = await ReadOnlyTradeIdForOrderAsync(cn, orderId);
+			(await ReadTradeAppliedAsync(cn, tradeId)).AssertEqual(true); // durably marked applied
+
+			// A DIFFERENT service instance replays the SAME persisted trade_id (multi-instance / restart / retry).
+			var otherInstance = new PositionRecalculationService();
+			await using (var txn = await cn.BeginTransactionAsync(CancellationToken))
+			{
+				await otherInstance.ApplyAsync(cn, txn, orderId, tradeId, 100m, 150.00m, CancellationToken);
+				await txn.CommitAsync(CancellationToken);
+			}
+
+			(await CountTradesForOrderAsync(cn, orderId)).AssertEqual(1); // still exactly one trade row
+			var position = await gateway.GetPositionAsync(portfolioId, securityId, CancellationToken);
+			IsNotNull(position, "a position must exist after the recorded trade");
+			position.Quantity.AssertEqual(100m);        // applied exactly once across instances - NOT 200
+			position.AveragePrice.AssertEqual(150.00m);
+			position.RealizedPnL.AssertEqual(0m);
+		}
+		finally
+		{
+			await CleanupAsync(cn, portfolioId, securityId);
+		}
+	}
+
+	/// <summary>
+	/// C3 (rollback-then-retry). The durable guard flips trades.position_applied FALSE -> TRUE in the SAME
+	/// transaction as the position write, so a ROLLED-BACK apply undoes BOTH: the flag returns to FALSE and no
+	/// position is persisted. A legitimate retry of the SAME trade_id then SUCCEEDS - it is NOT wrongly
+	/// suppressed by a stale flag. Proves the mark and the effect are atomic, so the guard never blocks a
+	/// reapply of an attempt that never actually committed.
+	/// </summary>
+	[TestMethod]
+	public async Task ApplyAsync_RollbackThenRetrySameTrade_RetryApplies()
+	{
+		await using var cn = await OpenMandatoryAsync();
+
+		if (cn is null)
+			return;
+
+		var suffix = Guid.NewGuid().ToString("N");
+		var portfolioId = 0;
+		var securityId = 0;
+
+		try
+		{
+			portfolioId = await InsertPortfolioAsync(cn, "pf_rbretry_" + suffix);
+			securityId = await InsertSecurityAsync(cn, "sec_" + suffix);
+			var orderId = await InsertOrderAsync(cn, portfolioId, securityId, "B", 100m, 150.00m, "ACCEPTED");
+			var tradeId = await InsertTradeAsync(cn, orderId, 100m, 150.00m);
+			var svc = new PositionRecalculationService();
+
+			// First attempt applies then ROLLS BACK: the position write and the position_applied flip are undone.
+			await using (var t1 = await cn.BeginTransactionAsync(CancellationToken))
+			{
+				await svc.ApplyAsync(cn, t1, orderId, tradeId, 100m, 150.00m, CancellationToken);
+				await t1.RollbackAsync(CancellationToken);
+			}
+
+			(await ReadTradeAppliedAsync(cn, tradeId)).AssertEqual(false); // flag rolled back with the position
+			(await PositionExistsAsync(cn, portfolioId, securityId)).AssertEqual(false); // nothing persisted
+
+			// Retry the SAME trade_id: NOT suppressed - it applies and commits this time.
+			await using (var t2 = await cn.BeginTransactionAsync(CancellationToken))
+			{
+				await svc.ApplyAsync(cn, t2, orderId, tradeId, 100m, 150.00m, CancellationToken);
+				await t2.CommitAsync(CancellationToken);
+			}
+
+			(await ReadTradeAppliedAsync(cn, tradeId)).AssertEqual(true);
+			var position = await ReadPositionAsync(cn, portfolioId, securityId);
+			position.Qty.AssertEqual(100m);        // the retry applied exactly once
+			position.AvgPrice.AssertEqual(150.00m);
+			position.RealizedPnl.AssertEqual(0m);
+		}
+		finally
+		{
+			await CleanupAsync(cn, portfolioId, securityId);
+		}
+	}
+
+	/// <summary>
+	/// C3 / C4 (non-atomic race). Two CONCURRENT applies of the SAME persisted trade_id, each on its own
+	/// connection + transaction, race for the position. The per-portfolio advisory lock serialises them and
+	/// the durable position_applied guard lets exactly ONE win: the other sees the committed flag and no-ops.
+	/// The position is applied exactly once (qty 100, not 200) - no lost update and no double count.
+	/// </summary>
+	[TestMethod]
+	public async Task ApplyAsync_ConcurrentSameTrade_AppliedExactlyOnce()
+	{
+		await using var cn = await OpenMandatoryAsync();
+
+		if (cn is null)
+			return;
+
+		var suffix = Guid.NewGuid().ToString("N");
+		var portfolioId = 0;
+		var securityId = 0;
+
+		try
+		{
+			portfolioId = await InsertPortfolioAsync(cn, "pf_racesame_" + suffix);
+			securityId = await InsertSecurityAsync(cn, "sec_" + suffix);
+			var orderId = await InsertOrderAsync(cn, portfolioId, securityId, "B", 100m, 150.00m, "ACCEPTED");
+			var tradeId = await InsertTradeAsync(cn, orderId, 100m, 150.00m);
+
+			// Apply the SAME trade_id twice concurrently, each on a fresh connection/transaction so they truly
+			// race; the advisory lock + durable guard collapse them to a single apply.
+			async Task ApplyOnFreshConnectionAsync()
+			{
+				await using var c = new NpgsqlConnection(SqlLegacyConnection.Resolve());
+				await c.OpenAsync(CancellationToken);
+				await using var txn = await c.BeginTransactionAsync(CancellationToken);
+				await new PositionRecalculationService().ApplyAsync(c, txn, orderId, tradeId, 100m, 150.00m, CancellationToken);
+				await txn.CommitAsync(CancellationToken);
+			}
+
+			await Task.WhenAll(ApplyOnFreshConnectionAsync(), ApplyOnFreshConnectionAsync());
+
+			(await CountTradesForOrderAsync(cn, orderId)).AssertEqual(1); // still exactly one trade row
+			var position = await ReadPositionAsync(cn, portfolioId, securityId);
+			position.Qty.AssertEqual(100m);        // exactly one apply won the race - NOT 200
+			position.AvgPrice.AssertEqual(150.00m);
+			position.RealizedPnl.AssertEqual(0m);
+		}
+		finally
+		{
+			await CleanupAsync(cn, portfolioId, securityId);
+		}
+	}
+
+	/// <summary>
+	/// C5 (sub-4dp persisted-value parity). A trade recorded with more than 4 decimal places is stored in the
+	/// NUMERIC(18,4) columns ROUNDED to 4dp (round half away from zero), and RecordTradeAsync reads those
+	/// PERSISTED values back (RETURNING qty, price) to drive the recompute - so the position reflects the
+	/// stored 4dp values, never the raw >4dp input. Guards against a position computed from a value that
+	/// disagrees with what the trades row actually holds.
+	/// </summary>
+	[TestMethod]
+	public async Task RecordTrade_SubFourDecimalQtyPrice_PositionMatchesPersistedValues()
+	{
+		await using var cn = await OpenMandatoryAsync();
+
+		if (cn is null)
+			return;
+
+		var suffix = Guid.NewGuid().ToString("N");
+		var portfolioId = 0;
+		var securityId = 0;
+
+		try
+		{
+			portfolioId = await InsertPortfolioAsync(cn, "pf_subdp_" + suffix);
+			securityId = await InsertSecurityAsync(cn, "sec_" + suffix);
+			var orderId = await InsertOrderAsync(cn, portfolioId, securityId, "B", 100m, 150.00m, "ACCEPTED");
+
+			// 100.00006 -> 100.0001 (rounds up), 150.00004 -> 150.0000 (rounds down): unambiguous at 4dp.
+			var gateway = new SqlLegacyOrderGateway(SqlLegacyConnection.Resolve());
+			await gateway.RecordTradeAsync(orderId, 100.00006m, 150.00004m, CancellationToken);
+
+			// The stored trade row holds the 4dp-rounded values.
+			var tradeId = await ReadOnlyTradeIdForOrderAsync(cn, orderId);
+			var (persistedQty, persistedPrice) = await ReadTradeQtyPriceAsync(cn, tradeId);
+			persistedQty.AssertEqual(100.0001m);
+			persistedPrice.AssertEqual(150.0000m);
+
+			// The position was computed from those PERSISTED values, not the raw >4dp input.
+			var position = await gateway.GetPositionAsync(portfolioId, securityId, CancellationToken);
+			IsNotNull(position, "a position must exist after the recorded trade");
+			position.Quantity.AssertEqual(100.0001m);
+			position.AveragePrice.AssertEqual(150.0000m);
+			position.RealizedPnL.AssertEqual(0m);
 		}
 		finally
 		{
@@ -890,12 +1104,17 @@ public class PositionRecalculationTests : BaseTestClass
 					qty: c.ExistingQty, avgPrice: c.ExistingAvgPrice, realizedPnl: c.ExistingRealizedPnl, unrealizedPnl: 0m);
 			}
 
+			// Insert a REAL trades row first (durable single-apply guard, C3): ApplyAsync flips this row's
+			// position_applied flag, so a persisted trade_id must exist. Mirrors the gateway inserting the
+			// trade via INSERT ... RETURNING trade_id immediately before the apply.
+			var tradeId = await InsertTradeAsync(cn, orderId, c.TradeQty, c.TradePrice);
+
 			var svc = new PositionRecalculationService();
 			await using (var txn = await cn.BeginTransactionAsync(CancellationToken))
 			{
 				// The gateway owns the transaction in production; here the test plays that role - begin,
 				// ApplyAsync on (connection, transaction), commit once.
-				await svc.ApplyAsync(cn, txn, orderId, NextTradeId(), c.TradeQty, c.TradePrice, CancellationToken);
+				await svc.ApplyAsync(cn, txn, orderId, tradeId, c.TradeQty, c.TradePrice, CancellationToken);
 				await txn.CommitAsync(CancellationToken);
 			}
 
@@ -1175,9 +1394,57 @@ public class PositionRecalculationTests : BaseTestClass
 	}
 
 	/// <summary>
-	/// Seeds an EXISTING position row so a subsequent apply exercises the UPSERT UPDATE path. Leaves
-	/// <c>cumulative_gross_notional</c> at its default 0; the apply's rollup accumulation is validated by the
-	/// gateway-level Phase 4 coverage, not asserted here.
+	/// Inserts a REAL trades row (RETURNING the generated trade_id) so a direct
+	/// <see cref="PositionRecalculationService.ApplyAsync"/> call can exercise the DURABLE single-apply guard
+	/// (C3): ApplyAsync flips this row's <c>trades.position_applied</c> flag FALSE -&gt; TRUE, so a persisted
+	/// trade_id must exist for the apply to take effect. Auto-commits on <paramref name="connection"/> (no
+	/// explicit transaction) so a subsequent transaction on the same connection sees the committed row -
+	/// mirroring the gateway, which INSERTs the trade immediately before applying it.
+	/// </summary>
+	private async Task<long> InsertTradeAsync(NpgsqlConnection connection, long orderId, decimal qty, decimal price)
+	{
+		await using var command = new NpgsqlCommand(
+			"INSERT INTO trades (order_id, qty, price, executed_date) " +
+			"VALUES (@order_id, @qty, @price, now() at time zone 'utc') RETURNING trade_id", connection);
+		command.Parameters.Add(new NpgsqlParameter("order_id", NpgsqlDbType.Bigint) { Value = orderId });
+		command.Parameters.Add(new NpgsqlParameter("qty", NpgsqlDbType.Numeric) { Value = qty });
+		command.Parameters.Add(new NpgsqlParameter("price", NpgsqlDbType.Numeric) { Value = price });
+		return (long)await command.ExecuteScalarAsync(CancellationToken);
+	}
+
+	/// <summary>Reads the single trades.trade_id recorded for an order (used to re-target a persisted trade in C3 tests).</summary>
+	private async Task<long> ReadOnlyTradeIdForOrderAsync(NpgsqlConnection connection, long orderId)
+	{
+		await using var command = new NpgsqlCommand(
+			"SELECT trade_id FROM trades WHERE order_id = @order_id ORDER BY trade_id LIMIT 1", connection);
+		command.Parameters.Add(new NpgsqlParameter("order_id", NpgsqlDbType.Bigint) { Value = orderId });
+		return (long)await command.ExecuteScalarAsync(CancellationToken);
+	}
+
+	/// <summary>Reads a trade's durable single-apply flag (trades.position_applied), used by C3 idempotency assertions.</summary>
+	private async Task<bool> ReadTradeAppliedAsync(NpgsqlConnection connection, long tradeId)
+	{
+		await using var command = new NpgsqlCommand(
+			"SELECT position_applied FROM trades WHERE trade_id = @trade_id", connection);
+		command.Parameters.Add(new NpgsqlParameter("trade_id", NpgsqlDbType.Bigint) { Value = tradeId });
+		return (bool)await command.ExecuteScalarAsync(CancellationToken);
+	}
+
+	/// <summary>Reads a trade's PERSISTED NUMERIC(18,4) qty/price - used by the C5 sub-4dp persisted-value parity assertion.</summary>
+	private async Task<(decimal Qty, decimal Price)> ReadTradeQtyPriceAsync(NpgsqlConnection connection, long tradeId)
+	{
+		await using var command = new NpgsqlCommand(
+			"SELECT qty, price FROM trades WHERE trade_id = @trade_id", connection);
+		command.Parameters.Add(new NpgsqlParameter("trade_id", NpgsqlDbType.Bigint) { Value = tradeId });
+		await using var reader = await command.ExecuteReaderAsync(CancellationToken);
+		(await reader.ReadAsync(CancellationToken)).AssertTrue();
+		return (reader.GetDecimal(0), reader.GetDecimal(1));
+	}
+
+	/// <summary>
+	/// Seeds an EXISTING position row so a subsequent apply exercises the UPSERT UPDATE path. There is no
+	/// <c>cumulative_gross_notional</c> rollup column (C5): the pre-trade commission gate reads exact
+	/// SUM(t.qty * t.price) straight from the trades rows, so no rollup is seeded or asserted here.
 	/// </summary>
 	private async Task InsertPositionAsync(
 		NpgsqlConnection connection, int portfolioId, int securityId,
@@ -1232,8 +1499,10 @@ public class PositionRecalculationTests : BaseTestClass
 	}
 
 	/// <summary>
-	/// A monotonic in-memory identifier for the service's single-apply guard. It is NOT persisted: the
-	/// position-recalc ledger table was removed (F5), so this only needs to be unique per call within a run.
+	/// A monotonic in-memory trade_id used ONLY where ApplyAsync is expected to THROW at order-resolution
+	/// BEFORE it reaches the durable trades.position_applied guard (e.g. the non-existent-order rollback
+	/// test), so no persisted trade row is required. Tests that expect the apply to SUCCEED must instead
+	/// insert a real trades row via <see cref="InsertTradeAsync"/> and use the returned trade_id (C3).
 	/// </summary>
 	private static long NextTradeId() => Interlocked.Increment(ref _tradeIdSeq);
 

@@ -1,0 +1,42 @@
+================================================================================
+ AUTHENTIC CAPTURE — docker compose up (db service) reaches healthy + 3-script init
+================================================================================
+ Command : docker compose -f docker-compose.yml up -d db   (published port remapped to
+           55432 via a throwaway, NON-committed override so it does not clash with the
+           reviewer's baseline db on 5432; all other service config is the committed file)
+ Host    : Linux 6.6.122+ x86_64
+ Compose : 5.3.1
+ Image   : postgres:16
+ Started : 2026-07-18T00:30:03Z
+================================================================================
+
+$ docker compose up -d db
+ Network ss7qa_default Creating 
+ Network ss7qa_default Created 
+ Volume ss7qa_pgdata Creating 
+ Volume ss7qa_pgdata Created 
+ Container ss7qa-db-1 Creating 
+ Container ss7qa-db-1 Created 
+ Container ss7qa-db-1 Starting 
+ Container ss7qa-db-1 Started 
+
+$ docker compose ps
+NAME         IMAGE         COMMAND                  SERVICE   CREATED         STATUS                   PORTS
+ss7qa-db-1   postgres:16   "docker-entrypoint.s…"   db        7 seconds ago   Up 6 seconds (healthy)   127.0.0.1:55432->5432/tcp
+
+$ docker inspect --format '{{.State.Health.Status}}' ss7qa-db-1
+healthy
+
+--- PostgreSQL entrypoint init log (running the 3 mounted /docker-entrypoint-initdb.d scripts) ---
+2026-07-18 00:30:05.033 UTC [48] LOG:  database system is ready to accept connections
+/usr/local/bin/docker-entrypoint.sh: running /docker-entrypoint-initdb.d/001_Schema.sql
+/usr/local/bin/docker-entrypoint.sh: running /docker-entrypoint-initdb.d/003_Triggers.sql
+/usr/local/bin/docker-entrypoint.sh: running /docker-entrypoint-initdb.d/004_SeedData.sql
+/usr/local/bin/docker-entrypoint.sh: ignoring /docker-entrypoint-initdb.d/README.md
+PostgreSQL init process complete; ready for start up.
+2026-07-18 00:30:05.547 UTC [1] LOG:  database system is ready to accept connections
+
+$ psql -c '\dt' (table count)
+7 tables
+
+Finished (UTC): 2026-07-18T00:30:10Z

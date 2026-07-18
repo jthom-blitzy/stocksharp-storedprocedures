@@ -176,4 +176,25 @@ public static class CanonicalRiskRules
 	/// <returns><see langword="true"/> if the ceiling is enforced and <paramref name="value"/> meets or exceeds it.</returns>
 	public static bool MeetsOrExceeds(decimal value, decimal? ceiling)
 		=> IsCeilingEnabled(ceiling) && value >= ceiling.Value;
+
+	/// <summary>
+	/// The scale (number of decimal places) of the schema's NUMERIC(18,4) money/quantity/price columns.
+	/// </summary>
+	public const int NumericScale = 4;
+
+	/// <summary>
+	/// Normalises a money/quantity/price value to the schema's NUMERIC(18,4) <see cref="NumericScale"/>,
+	/// the SINGLE canonical rounding used by both the pre-trade gate (<see cref="PreTradeRiskService"/>) and
+	/// the data-access gateway. Quantising once, up front, guarantees the value the gate DECIDES on is the
+	/// exact value PostgreSQL PERSISTS into the NUMERIC(18,4) column, so a &gt;4-dp input can never be
+	/// accepted on its full-precision value yet stored at (or above) a ceiling it should have met, and the
+	/// gateway never binds a raw value that diverges from the validated one (decision == persistence).
+	/// Away-from-zero rounding is never LESS strict than truncation (hard strictness NFR, AAP 0.6.4), and it
+	/// is idempotent - re-quantising an already-4-dp value is a no-op - so applying it in several places is
+	/// safe. Uses <see cref="decimal"/> throughout; never <c>double</c>/<c>float</c>.
+	/// </summary>
+	/// <param name="value">The raw value to normalise.</param>
+	/// <returns><paramref name="value"/> rounded to <see cref="NumericScale"/> decimals, away from zero.</returns>
+	public static decimal QuantizeToScale(decimal value)
+		=> Math.Round(value, NumericScale, MidpointRounding.AwayFromZero);
 }

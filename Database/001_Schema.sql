@@ -142,7 +142,7 @@ CREATE TABLE Orders
     security_id               INT             NOT NULL,
     side                      CHAR(1)         NOT NULL,   -- 'B' = Buy, 'S' = Sell
     qty                       NUMERIC(18,4)   NOT NULL,
-    price                     NUMERIC(18,4)   NULL,       -- NULL allowed for market orders
+    price                     NUMERIC(18,4)   NULL,       -- NULL for market orders; when present must be > 0 (CK_Orders_price)
     order_type                VARCHAR(10)     NOT NULL DEFAULT 'LIMIT',
     status                    VARCHAR(12)     NOT NULL DEFAULT 'PENDING',
     reject_reason             VARCHAR(200)    NULL,
@@ -161,6 +161,10 @@ CREATE TABLE Orders
     CONSTRAINT FK_Orders_Securities FOREIGN KEY (security_id) REFERENCES Securities (security_id),
     CONSTRAINT CK_Orders_side CHECK (side IN ('B','S')),
     CONSTRAINT CK_Orders_qty CHECK (qty > 0),
+    -- A supplied order price must be strictly positive; NULL stays allowed for market orders. Mirrors
+    -- CK_Trades_price and the PreTradeRiskService price<=0 guard, so a zero/negative price can neither be
+    -- persisted nor bypass the price/notional/commission checks (schema + C# defense-in-depth).
+    CONSTRAINT CK_Orders_price CHECK (price IS NULL OR price > 0),
     CONSTRAINT CK_Orders_order_type CHECK (order_type IN ('LIMIT','MARKET')),
     CONSTRAINT CK_Orders_status CHECK (status IN ('PENDING','ACCEPTED','REJECTED','FILLED','PARTFILLED','CANCELLED'))
 );
@@ -180,6 +184,14 @@ CREATE TABLE Trades
     price           NUMERIC(18,4)   NOT NULL,
     executed_date   TIMESTAMP       NOT NULL DEFAULT (now() at time zone 'utc'),
 
+    -- Durable single-apply key for position recalculation (replaces the former in-process HashSet guard).
+    -- PositionRecalculationService.ApplyAsync flips this FALSE->TRUE with a conditional UPDATE in the SAME
+    -- transaction that writes the position, so a trade's position effect is applied exactly once and the
+    -- mark commits/rolls back atomically with it. Being persisted, the guarantee survives process
+    -- restarts and holds across instances (fixes the non-durable/non-atomic idempotency); a replay of the
+    -- same persisted trade_id sees TRUE and becomes a no-op.
+    position_applied BOOLEAN        NOT NULL DEFAULT FALSE,
+
     CONSTRAINT PK_Trades PRIMARY KEY (trade_id),
     CONSTRAINT FK_Trades_Orders FOREIGN KEY (order_id) REFERENCES Orders (order_id),
     CONSTRAINT CK_Trades_qty CHECK (qty > 0),
@@ -198,17 +210,14 @@ CREATE INDEX IX_Trades_executed_date ON Trades (executed_date);
 -- refreshed separately by the EOD mark-to-market batch (outside the scope of
 -- this brief). Treat this column as stale/EOD-only, not real-time.
 --
--- cumulative_gross_notional is a maintained transactional ROLLUP of every trade's
--- gross notional (abs(qty) * price) applied to this (portfolio, security) position.
--- PositionRecalculationService.ApplyAsync increments it by the trade's gross notional
--- in the SAME atomic transaction as the qty/avg_price write, so it stays exact. The
--- PreTradeRiskService commission gate then reads a BOUNDED aggregate -
--- SUM(cumulative_gross_notional) over a portfolio's Positions rows (bounded by the
--- number of traded securities) - instead of re-summing the entire Trades history on
--- every order. The rollup equals the historical SUM(trades.qty * trades.price) because
--- each trade contributes its notional exactly once (single-apply invariant, AAP 0.6.5).
--- This is a column on an EXISTING table, so the schema stays at seven pure-storage
--- tables; it holds no business logic (the C# service owns the arithmetic).
+-- There is deliberately NO cumulative_gross_notional rollup column. A NUMERIC(18,4) rollup would round
+-- every wide qty*price contribution to four decimals BEFORE summing (live: 0.00000001 -> 0.0000), which
+-- can under-state the portfolio gross and let the commission ceiling stop triggering - a loosening of a
+-- risk control forbidden by the strictness NFR (AAP 0.6.4). Instead the PreTradeRiskService commission
+-- gate computes the existing gross EXACTLY as SUM(t.qty * t.price) over the portfolio's Trades
+-- (join Trades -> Orders), reproducing the original usp_ValidatePreTradeRisk arithmetic at full NUMERIC
+-- precision (PostgreSQL evaluates NUMERIC*NUMERIC and its SUM without intermediate rounding). This keeps
+-- the schema pure storage - the C# service owns all arithmetic, and no maintained aggregate can drift.
 -- ============================================================================
 CREATE TABLE Positions
 (
@@ -219,8 +228,6 @@ CREATE TABLE Positions
     avg_price        NUMERIC(18,4)   NOT NULL DEFAULT 0,
     realized_pnl     NUMERIC(18,4)   NOT NULL DEFAULT 0,
     unrealized_pnl   NUMERIC(18,4)   NOT NULL DEFAULT 0,
-    -- maintained rollup of applied gross notional (abs(qty)*price); see header note
-    cumulative_gross_notional  NUMERIC(18,4)  NOT NULL DEFAULT 0,
     updated_date     TIMESTAMP       NOT NULL DEFAULT (now() at time zone 'utc'),
 
     CONSTRAINT PK_Positions PRIMARY KEY (position_id),

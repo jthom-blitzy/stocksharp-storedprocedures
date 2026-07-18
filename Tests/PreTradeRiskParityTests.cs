@@ -707,6 +707,464 @@ public class PreTradeRiskParityTests : BaseTestClass
 	}
 
 	// =============================================================================================
+	// Phase M1 - MANDATED PRODUCTION-PATH COVERAGE (review finding M1).
+	//
+	// Phases A-H prove pure-logic parity and run ValidateAsync for two demo scenarios, but the
+	// checkpoint-required matrix demanded EXACT (not loose) reject reasons plus direct production-path
+	// coverage of: concurrent SubmitOrderAsync serialization, REJECTED orders counting toward the rolling
+	// frequency window, the UTC day-rollover boundary, market-order commission using a seeded latest trade,
+	// exact first-breach reason ORDERING across all seven checks, NULL and ZERO ("unlimited") for EVERY
+	// check read from the database, both order-side signs against a seeded position, and the non-positive
+	// price/qty structural rejection (M11) on the real gateway. Every reject reason is asserted by
+	// FULL-STRING equality against the exact text PreTradeRiskService emits, so a change to the wording,
+	// the number rendering, or the check ORDERING is caught (the loose Contains checks of Phase G are NOT
+	// sufficient for these). Reject-reason numbers follow the proven rendering rules: the order VALUE is the
+	// canonical quantizer output (which preserves the input literal's scale, e.g. "500", "999"), while a
+	// DB-read NUMERIC(18,4) limit always renders at scale 4 ("500.0000") and an INT limit as a plain integer
+	// ("5", "60"). All DB tests use the MANDATORY-WHEN-CONFIGURED OpenPostgresAsync gate (Inconclusive only
+	// when unset; FAIL when configured-but-unreachable), so a configured step-3 engine is always exercised.
+	// =============================================================================================
+
+	/// <summary>
+	/// Concurrent <see cref="SqlLegacyOrderGateway.SubmitOrderAsync"/> serialization (M1). Fires a burst of
+	/// identical, within-all-other-limits orders on ONE portfolio whose only enforced ceiling is the rolling
+	/// frequency limit (5 per 60s). The transaction-scoped per-portfolio advisory lock (C4) serializes them,
+	/// so the k-th committer sees exactly k-1 prior orders and the gate accepts PRECISELY
+	/// <c>maxFreqCount - 1</c> (=4) and rejects the rest for FREQUENCY - a deterministic outcome that would
+	/// NOT hold under the former read-then-write TOCTOU (a burst could all read count 0 and all be accepted).
+	/// </summary>
+	[TestMethod]
+	public async Task Gateway_ConcurrentSubmit_SerializedByAdvisoryLock_AcceptsExactlyFreqCountMinusOne()
+	{
+		await using var manager = await OpenPostgresAsync();
+
+		var suffix = Guid.NewGuid().ToString("N");
+		var portfolioId = 0;
+		var securityId = 0;
+
+		try
+		{
+			portfolioId = await PgInsertPortfolioCommittedAsync(manager, "M1_CONC_" + suffix);
+			securityId = await PgInsertSecurityCommittedAsync(manager, "M1_CONC_" + suffix);
+
+			// Only the rolling frequency ceiling is enforced (5 per 60s); every other limit stays NULL so the
+			// advisory lock and the frequency window are the sole gate under concurrency.
+			await PgInsertRiskLimitsCommittedAsync(manager, portfolioId, new GateVector
+			{
+				MaxOrderFreqCount = DemoMaxOrderFreqCount,          // 5
+				MaxOrderFreqWindowSec = DemoMaxOrderFreqWindowSec,  // 60
+				CommissionRate = DemoCommissionRate,
+			});
+
+			const int burst = 8;
+			var gateway = new SqlLegacyOrderGateway(SqlLegacyConnection.Resolve());
+			var tasks = new List<Task<SqlOrderSubmitResult>>(burst);
+			for (var i = 0; i < burst; i++)
+				tasks.Add(gateway.SubmitOrderAsync(portfolioId, securityId, Sides.Buy, 100m, 150.00m, OrderTypes.Limit, cancellationToken: CancellationToken));
+
+			var results = await Task.WhenAll(tasks);
+
+			var accepted = results.Count(r => r.IsValid);
+			var rejected = results.Where(r => !r.IsValid).ToList();
+
+			// Serialized rolling window => exactly maxFreqCount-1 (=4) accepted, the remainder rejected.
+			accepted.AssertEqual(DemoMaxOrderFreqCount - 1);
+			rejected.Count.AssertEqual(burst - (DemoMaxOrderFreqCount - 1));
+
+			foreach (var r in rejected)
+			{
+				// Every rejection is a FREQUENCY rejection naming the 60s window and the limit 5. The count
+				// number varies with commit order ("5".."8"), which is legitimate, so it is not pinned.
+				r.RejectReason.StartsWith("Order frequency ").AssertTrue();
+				r.RejectReason.EndsWith("s meets/exceeds limit 5").AssertTrue();
+			}
+
+			// Both ACCEPTED and REJECTED orders are persisted (parity with usp_SubmitOrder), so all 8 rows exist.
+			(await PgCountOrdersAsync(manager, portfolioId)).AssertEqual(burst);
+		}
+		finally
+		{
+			await PgCleanupAsync(manager, portfolioId, securityId);
+		}
+	}
+
+	/// <summary>
+	/// REJECTED orders count toward the rolling frequency window through the real gateway (M1). The first
+	/// four submissions breach the PRICE ceiling and are REJECTED, yet each is still PERSISTED (parity with
+	/// usp_SubmitOrder), so they occupy the window; the fifth submission is WITHIN the price ceiling but must
+	/// be rejected for FREQUENCY - proving a rejected order still consumes a frequency slot. Reject reasons
+	/// are asserted EXACTLY.
+	/// </summary>
+	[TestMethod]
+	public async Task Gateway_RejectedOrders_CountTowardRollingFrequencyWindow()
+	{
+		await using var manager = await OpenPostgresAsync();
+
+		var suffix = Guid.NewGuid().ToString("N");
+		var portfolioId = 0;
+		var securityId = 0;
+
+		try
+		{
+			portfolioId = await PgInsertPortfolioCommittedAsync(manager, "M1_RJF_" + suffix);
+			securityId = await PgInsertSecurityCommittedAsync(manager, "M1_RJF_" + suffix);
+
+			await PgInsertRiskLimitsCommittedAsync(manager, portfolioId, new GateVector
+			{
+				MaxOrderPrice = DemoMaxOrderPrice,                  // 500
+				MaxOrderFreqCount = DemoMaxOrderFreqCount,          // 5
+				MaxOrderFreqWindowSec = DemoMaxOrderFreqWindowSec,  // 60
+				CommissionRate = DemoCommissionRate,
+			});
+
+			var gateway = new SqlLegacyOrderGateway(SqlLegacyConnection.Resolve());
+
+			// Four price-ceiling rejections, each PERSISTED (real order_id > 0, not a structural short-circuit).
+			for (var i = 0; i < 4; i++)
+			{
+				var rejPrice = await gateway.SubmitOrderAsync(portfolioId, securityId, Sides.Buy, 1m, 999m, OrderTypes.Limit, cancellationToken: CancellationToken);
+				rejPrice.IsValid.AssertFalse();
+				rejPrice.RejectReason.AssertEqual("Order price 999 meets/exceeds limit 500.0000");
+				(rejPrice.OrderId > 0L).AssertTrue();
+			}
+
+			// Fifth: price 150 clears the ceiling, but the four prior (rejected) orders fill the window.
+			var rejFreq = await gateway.SubmitOrderAsync(portfolioId, securityId, Sides.Buy, 1m, 150m, OrderTypes.Limit, cancellationToken: CancellationToken);
+			rejFreq.IsValid.AssertFalse();
+			rejFreq.RejectReason.AssertEqual("Order frequency 5 in 60s meets/exceeds limit 5");
+
+			(await PgCountOrdersAsync(manager, portfolioId)).AssertEqual(5); // all five persisted
+		}
+		finally
+		{
+			await PgCleanupAsync(manager, portfolioId, securityId);
+		}
+	}
+
+	/// <summary>
+	/// Daily-volume UTC day rollover (M1). With an injected fixed clock, an ACCEPTED order dated the PRIOR
+	/// UTC day must be EXCLUDED from today's volume (the half-open [dayStart, dayEnd) boundary), while an
+	/// order dated this UTC day counts. Sub-scenario 1 accepts an order that only fits if yesterday's volume
+	/// is excluded; sub-scenario 2 crosses the ceiling on THIS day's volume alone and asserts the EXACT
+	/// daily-volume reason (whose number would differ if the prior day leaked in).
+	/// </summary>
+	[TestMethod]
+	public async Task ValidateAsync_DailyVolume_ExcludesPriorUtcDay_AtDayRollover()
+	{
+		await using var cn = await OpenPostgresAsync();
+
+		// Kind=Unspecified; the service normalizes its clock to Unspecified UTC, matching the `timestamp`
+		// (without time zone) columns Npgsql reads back, so the day boundary is computed on one timeline.
+		var fixedNow = new DateTime(2025, 6, 15, 12, 0, 0);
+		var dayStart = fixedNow.Date;                 // 2025-06-15 00:00:00
+		var priorDay = dayStart.AddSeconds(-1);       // 2025-06-14 23:59:59 (prior UTC day)
+		var thisDay = dayStart.AddSeconds(1);         // 2025-06-15 00:00:01 (this UTC day)
+		var service = new PreTradeRiskService(() => fixedNow);
+
+		// Sub-scenario 1: ACCEPT only if the prior day is excluded (100000 today + 149999 = 249999 < 250000).
+		await using (var txn = await cn.BeginTransactionAsync(CancellationToken))
+		{
+			var s = Guid.NewGuid().ToString("N");
+			var pf = await InsertPortfolioAsync(cn, txn, "M1_ROLL_" + s);
+			var sec = await InsertSecurityAsync(cn, txn, "M1_ROLL_" + s);
+			await PgInsertRiskLimitsAsync(cn, txn, pf, null, new GateVector { MaxDailyVolume = DemoMaxDailyVolume }); // 250000, rest NULL
+			await PgSeedOrderWithDateAsync(cn, txn, pf, sec, "B", 200000m, null, "ACCEPTED", priorDay); // prior day - must NOT count
+			await PgSeedOrderWithDateAsync(cn, txn, pf, sec, "B", 100000m, null, "ACCEPTED", thisDay);  // this day - counts
+
+			var accept = await service.ValidateAsync(cn, txn, pf, sec, "B", 149999m, null, CancellationToken);
+			if (!accept.IsValid)
+				Fail($"day-rollover: expected ACCEPT (prior-day volume must be excluded) but got REJECT: {accept.RejectReason}");
+
+			await txn.RollbackAsync(CancellationToken);
+		}
+
+		// Sub-scenario 2: cross the ceiling on THIS day's volume alone (100000 + 150000 = 250000 >= 250000).
+		await using (var txn = await cn.BeginTransactionAsync(CancellationToken))
+		{
+			var s = Guid.NewGuid().ToString("N");
+			var pf = await InsertPortfolioAsync(cn, txn, "M1_ROLL2_" + s);
+			var sec = await InsertSecurityAsync(cn, txn, "M1_ROLL2_" + s);
+			await PgInsertRiskLimitsAsync(cn, txn, pf, null, new GateVector { MaxDailyVolume = DemoMaxDailyVolume });
+			await PgSeedOrderWithDateAsync(cn, txn, pf, sec, "B", 200000m, null, "ACCEPTED", priorDay); // excluded
+			await PgSeedOrderWithDateAsync(cn, txn, pf, sec, "B", 100000m, null, "ACCEPTED", thisDay);  // counts
+
+			var reject = await service.ValidateAsync(cn, txn, pf, sec, "B", 150000m, null, CancellationToken);
+			reject.IsValid.AssertFalse();
+			// todayVolume (100000.0000, NUMERIC SUM) + qty (150000) = 250000.0000; had the prior day leaked in it would be 450000.0000.
+			reject.RejectReason.AssertEqual("Daily volume 250000.0000 meets/exceeds limit 250000.0000");
+
+			await txn.RollbackAsync(CancellationToken);
+		}
+	}
+
+	/// <summary>
+	/// Market-order commission uses the seeded LATEST trade price (M1). A market order (price null) has no
+	/// ex-ante price, so its commission estimate uses the security's most-recent trade price. Sub-scenario A
+	/// seeds one trade (price 1000) so the estimate INCLUDES <c>qty * 1000 * rate</c> and tips to the ceiling
+	/// (EXACT reason asserted); sub-scenario B seeds NO trade, so the estimate omits that term and the order
+	/// is ACCEPTED - isolating the seeded-trade contribution.
+	/// </summary>
+	[TestMethod]
+	public async Task ValidateAsync_MarketOrderCommission_UsesSeededLatestTradePrice()
+	{
+		await using var cn = await OpenPostgresAsync();
+
+		// A: WITH a seeded trade at price 1000 => est = Q( Q(10000)*0.0005 + 100*1000*0.0005 ) = 55.0000 >= 55.
+		await using (var txn = await cn.BeginTransactionAsync(CancellationToken))
+		{
+			var s = Guid.NewGuid().ToString("N");
+			var pf = await InsertPortfolioAsync(cn, txn, "M1_MKT_" + s);
+			var sec = await InsertSecurityAsync(cn, txn, "M1_MKT_" + s);
+			await PgInsertRiskLimitsAsync(cn, txn, pf, null, new GateVector { MaxCommissionTotal = 55m, CommissionRate = 0.0005m });
+			var orderId = await PgInsertOrderReturningIdAsync(cn, txn, pf, sec, "B", 10m, 1000m, "FILLED");
+			await PgInsertTradeTxnAsync(cn, txn, orderId, 10m, 1000m); // last trade price 1000; existing gross notional 10*1000 = 10000
+
+			var reject = await new PreTradeRiskService().ValidateAsync(cn, txn, pf, sec, "B", 100m, null, CancellationToken);
+			reject.IsValid.AssertFalse();
+			reject.RejectReason.AssertEqual("Estimated cumulative commission 55.0000 meets/exceeds limit 55.0000");
+
+			await txn.RollbackAsync(CancellationToken);
+		}
+
+		// B: WITHOUT any trade the market order has no last price => estimate is only the (zero) existing-notional term => ACCEPT.
+		await using (var txn = await cn.BeginTransactionAsync(CancellationToken))
+		{
+			var s = Guid.NewGuid().ToString("N");
+			var pf = await InsertPortfolioAsync(cn, txn, "M1_MKT2_" + s);
+			var sec = await InsertSecurityAsync(cn, txn, "M1_MKT2_" + s);
+			await PgInsertRiskLimitsAsync(cn, txn, pf, null, new GateVector { MaxCommissionTotal = 55m, CommissionRate = 0.0005m });
+
+			var accept = await new PreTradeRiskService().ValidateAsync(cn, txn, pf, sec, "B", 100m, null, CancellationToken);
+			if (!accept.IsValid)
+				Fail($"market commission (no trade): expected ACCEPT but got REJECT: {accept.RejectReason}");
+
+			await txn.RollbackAsync(CancellationToken);
+		}
+	}
+
+	/// <summary>
+	/// Exact first-breach reason ORDERING across all seven checks (M1). Each cascade vector makes the checks
+	/// BEFORE the target pass (their limits NULL) and the target check breach, so the returned reason must be
+	/// the target's - proving the seven checks run in the SAME order as the retired proc and the FIRST breach
+	/// wins. Vectors 1-3 additionally set MULTIPLE low ceilings so more than one check would breach, yet the
+	/// earliest still wins. Every reason is asserted by FULL-STRING equality.
+	/// </summary>
+	[TestMethod]
+	public async Task ValidateAsync_FirstBreachReason_ExactOrderingCascade()
+	{
+		await using var cn = await OpenPostgresAsync();
+
+		async Task AssertFirstBreachAsync(GateVector limits, string side, decimal qty, decimal? price, int recentOrders, string expected)
+		{
+			await using var txn = await cn.BeginTransactionAsync(CancellationToken);
+			var s = Guid.NewGuid().ToString("N");
+			var pf = await InsertPortfolioAsync(cn, txn, "M1_ORD_" + s);
+			var sec = await InsertSecurityAsync(cn, txn, "M1_ORD_" + s);
+			await PgInsertRiskLimitsAsync(cn, txn, pf, null, limits);
+			for (var i = 0; i < recentOrders; i++)
+				await PgSeedOrderAsync(cn, txn, pf, sec, "B", 1m, 1.00m, "PENDING");
+
+			var r = await new PreTradeRiskService().ValidateAsync(cn, txn, pf, sec, side, qty, price, CancellationToken);
+			r.IsValid.AssertFalse();
+			r.RejectReason.AssertEqual(expected);
+
+			await txn.RollbackAsync(CancellationToken);
+		}
+
+		// 1. price WINS over qty and notional (all three would breach).
+		await AssertFirstBreachAsync(new GateVector { MaxOrderPrice = 100m, MaxOrderQty = 1m, MaxOrderValue = 100m },
+			"B", 10m, 500m, 0, "Order price 500 meets/exceeds limit 100.0000");
+		// 2. qty WINS over notional (price disabled).
+		await AssertFirstBreachAsync(new GateVector { MaxOrderQty = 1m, MaxOrderValue = 100m },
+			"B", 10m, 50m, 0, "Order qty 10 meets/exceeds limit 1.0000");
+		// 3. notional (price + qty disabled).
+		await AssertFirstBreachAsync(new GateVector { MaxOrderValue = 100m },
+			"B", 10m, 50m, 0, "Order value 500 meets/exceeds limit 100.0000");
+		// 4. frequency (2 recent + this = 3 >= 3).
+		await AssertFirstBreachAsync(new GateVector { MaxOrderFreqCount = 3, MaxOrderFreqWindowSec = 60 },
+			"B", 1m, null, 2, "Order frequency 3 in 60s meets/exceeds limit 3");
+		// 5. resulting position (no seeded position => resulting = qty).
+		await AssertFirstBreachAsync(new GateVector { MaxPositionSize = 100m },
+			"B", 100m, null, 0, "Resulting position 100 meets/exceeds limit 100.0000");
+		// 6. cumulative commission estimate (no trades => est = qty*price*rate = 10000*100*0.0005 = 500).
+		await AssertFirstBreachAsync(new GateVector { MaxCommissionTotal = 500m, CommissionRate = 0.0005m },
+			"B", 10000m, 100m, 0, "Estimated cumulative commission 500.0000 meets/exceeds limit 500.0000");
+		// 7. daily volume (no seeded today volume => 0 + 100 = 100 >= 100).
+		await AssertFirstBreachAsync(new GateVector { MaxDailyVolume = 100m },
+			"B", 100m, null, 0, "Daily volume 100 meets/exceeds limit 100.0000");
+	}
+
+	/// <summary>
+	/// A NULL or ZERO limit means "not enforced" for EVERY check, read from the database (M1 / AAP 0.6.4).
+	/// For each of the seven checks, the target limit is set NULL and then 0 while a benign, always-passing
+	/// companion ceiling stays enabled (so the "no configured limits" early-out does NOT mask the result -
+	/// the target check is genuinely evaluated and skipped), and a would-breach order is submitted. Every
+	/// case must ACCEPT.
+	/// </summary>
+	[TestMethod]
+	public async Task ValidateAsync_NullAndZeroLimit_TreatedAsUnlimited_PerCheck()
+	{
+		await using var cn = await OpenPostgresAsync();
+
+		async Task AssertUnlimitedAsync(string label, GateVector limits, string side, decimal qty, decimal? price, int recentOrders)
+		{
+			await using var txn = await cn.BeginTransactionAsync(CancellationToken);
+			var s = Guid.NewGuid().ToString("N");
+			var pf = await InsertPortfolioAsync(cn, txn, "M1_NZ_" + s);
+			var sec = await InsertSecurityAsync(cn, txn, "M1_NZ_" + s);
+			await PgInsertRiskLimitsAsync(cn, txn, pf, null, limits);
+			for (var i = 0; i < recentOrders; i++)
+				await PgSeedOrderAsync(cn, txn, pf, sec, "B", 1m, 1.00m, "PENDING");
+
+			var r = await new PreTradeRiskService().ValidateAsync(cn, txn, pf, sec, side, qty, price, CancellationToken);
+			if (!r.IsValid)
+				Fail($"{label}: expected ACCEPT (NULL/0 limit = unlimited) but got REJECT: {r.RejectReason}");
+			r.RejectReason.AssertNull();
+
+			await txn.RollbackAsync(CancellationToken);
+		}
+
+		// Benign, always-passing companions keep a ceiling ENABLED so the early-out cannot mask the target:
+		//  - a huge frequency limit (never tripped by 0 recent orders) companions the six non-frequency checks;
+		//  - a huge position ceiling companions the frequency check itself.
+		const int hugeFreq = 1_000_000;
+		const decimal hugePos = 1_000_000_000_000m;
+
+		// price
+		await AssertUnlimitedAsync("price NULL", new GateVector { MaxOrderPrice = null, MaxOrderFreqCount = hugeFreq, MaxOrderFreqWindowSec = 60 }, "B", 1m, 999999m, 0);
+		await AssertUnlimitedAsync("price 0", new GateVector { MaxOrderPrice = 0m, MaxOrderFreqCount = hugeFreq, MaxOrderFreqWindowSec = 60 }, "B", 1m, 999999m, 0);
+		// qty
+		await AssertUnlimitedAsync("qty NULL", new GateVector { MaxOrderQty = null, MaxOrderFreqCount = hugeFreq, MaxOrderFreqWindowSec = 60 }, "B", 999999m, null, 0);
+		await AssertUnlimitedAsync("qty 0", new GateVector { MaxOrderQty = 0m, MaxOrderFreqCount = hugeFreq, MaxOrderFreqWindowSec = 60 }, "B", 999999m, null, 0);
+		// notional (order value)
+		await AssertUnlimitedAsync("value NULL", new GateVector { MaxOrderValue = null, MaxOrderFreqCount = hugeFreq, MaxOrderFreqWindowSec = 60 }, "B", 1000m, 1000m, 0);
+		await AssertUnlimitedAsync("value 0", new GateVector { MaxOrderValue = 0m, MaxOrderFreqCount = hugeFreq, MaxOrderFreqWindowSec = 60 }, "B", 1000m, 1000m, 0);
+		// frequency (10 recent orders would breach a small count; NULL/0 count disables the check)
+		await AssertUnlimitedAsync("freq NULL", new GateVector { MaxOrderFreqCount = null, MaxOrderFreqWindowSec = 60, MaxPositionSize = hugePos }, "B", 1m, null, 10);
+		await AssertUnlimitedAsync("freq 0", new GateVector { MaxOrderFreqCount = 0, MaxOrderFreqWindowSec = 60, MaxPositionSize = hugePos }, "B", 1m, null, 10);
+		// resulting position
+		await AssertUnlimitedAsync("position NULL", new GateVector { MaxPositionSize = null, MaxOrderFreqCount = hugeFreq, MaxOrderFreqWindowSec = 60 }, "B", 999999m, null, 0);
+		await AssertUnlimitedAsync("position 0", new GateVector { MaxPositionSize = 0m, MaxOrderFreqCount = hugeFreq, MaxOrderFreqWindowSec = 60 }, "B", 999999m, null, 0);
+		// commission (rate present so the estimate is non-trivial; NULL/0 total disables the check)
+		await AssertUnlimitedAsync("commission NULL", new GateVector { MaxCommissionTotal = null, CommissionRate = 0.0005m, MaxOrderFreqCount = hugeFreq, MaxOrderFreqWindowSec = 60 }, "B", 10000m, 1000m, 0);
+		await AssertUnlimitedAsync("commission 0", new GateVector { MaxCommissionTotal = 0m, CommissionRate = 0.0005m, MaxOrderFreqCount = hugeFreq, MaxOrderFreqWindowSec = 60 }, "B", 10000m, 1000m, 0);
+		// daily volume
+		await AssertUnlimitedAsync("daily NULL", new GateVector { MaxDailyVolume = null, MaxOrderFreqCount = hugeFreq, MaxOrderFreqWindowSec = 60 }, "B", 999999m, null, 0);
+		await AssertUnlimitedAsync("daily 0", new GateVector { MaxDailyVolume = 0m, MaxOrderFreqCount = hugeFreq, MaxOrderFreqWindowSec = 60 }, "B", 999999m, null, 0);
+	}
+
+	/// <summary>
+	/// Both order-side signs against seeded database position state (M1). The position-size subject is the
+	/// HYPOTHETICAL post-fill position <c>currentQty + signedDelta</c>, where <c>B</c> adds and <c>S</c>
+	/// subtracts. Against a LONG (+50000) seed a buy tips the magnitude over the ceiling (REJECT) while a
+	/// sell reduces it (ACCEPT); against a SHORT (-50000) seed a sell grows the magnitude (REJECT) while a
+	/// buy reduces it (ACCEPT). Reject reasons - including the sign of the resulting quantity - are EXACT.
+	/// </summary>
+	[TestMethod]
+	public async Task ValidateAsync_PositionSize_BothSideSigns_ThroughDatabaseState()
+	{
+		await using var cn = await OpenPostgresAsync();
+
+		async Task RunSignAsync(decimal seededQty, string side, decimal orderQty, bool expectReject, string expectedReason)
+		{
+			await using var txn = await cn.BeginTransactionAsync(CancellationToken);
+			var s = Guid.NewGuid().ToString("N");
+			var pf = await InsertPortfolioAsync(cn, txn, "M1_SIGN_" + s);
+			var sec = await InsertSecurityAsync(cn, txn, "M1_SIGN_" + s);
+			await PgInsertRiskLimitsAsync(cn, txn, pf, null, new GateVector { MaxPositionSize = DemoMaxPositionSize }); // 100000
+			await PgInsertPositionAsync(cn, txn, pf, sec, seededQty);
+
+			var r = await new PreTradeRiskService().ValidateAsync(cn, txn, pf, sec, side, orderQty, null, CancellationToken);
+			if (expectReject)
+			{
+				r.IsValid.AssertFalse();
+				r.RejectReason.AssertEqual(expectedReason);
+			}
+			else if (!r.IsValid)
+			{
+				Fail($"sign test (seed {seededQty}, {side} {orderQty}): expected ACCEPT but got REJECT: {r.RejectReason}");
+			}
+
+			await txn.RollbackAsync(CancellationToken);
+		}
+
+		// long +50000: buy adds (50000 + 60000 = 110000 => reject), sell reduces (50000 - 60000 = -10000 => accept).
+		await RunSignAsync(50000m, "B", 60000m, true, "Resulting position 110000.0000 meets/exceeds limit 100000.0000");
+		await RunSignAsync(50000m, "S", 60000m, false, null);
+		// short -50000: sell grows magnitude (-50000 - 60000 = -110000 => reject), buy reduces (-50000 + 60000 = 10000 => accept).
+		await RunSignAsync(-50000m, "S", 60000m, true, "Resulting position -110000.0000 meets/exceeds limit 100000.0000");
+		await RunSignAsync(-50000m, "B", 60000m, false, null);
+	}
+
+	/// <summary>
+	/// Non-positive price/qty is rejected STRUCTURALLY on the real gateway with NO row persisted (M11/M12).
+	/// A zero/negative quantity or a non-null non-positive price is a malformed request that violates the
+	/// schema CHECKs, so the gateway short-circuits BEFORE any database read: it returns the rejection DTO
+	/// (OrderId 0) and writes no orders row, so it also never consumes a frequency slot. Reasons are EXACT.
+	/// </summary>
+	[TestMethod]
+	public async Task Gateway_NonPositivePriceOrQty_RejectedStructurally_NoRowPersisted()
+	{
+		await using var manager = await OpenPostgresAsync();
+
+		var suffix = Guid.NewGuid().ToString("N");
+		var portfolioId = 0;
+		var securityId = 0;
+
+		try
+		{
+			portfolioId = await PgInsertPortfolioCommittedAsync(manager, "M1_NEG_" + suffix);
+			securityId = await PgInsertSecurityCommittedAsync(manager, "M1_NEG_" + suffix);
+
+			var gateway = new SqlLegacyOrderGateway(SqlLegacyConnection.Resolve());
+
+			var negPrice = await gateway.SubmitOrderAsync(portfolioId, securityId, Sides.Buy, 100m, -0.01m, OrderTypes.Limit, cancellationToken: CancellationToken);
+			negPrice.IsValid.AssertFalse();
+			negPrice.OrderId.AssertEqual(0L);
+			negPrice.RejectReason.AssertEqual("Invalid price -0.01");
+
+			var zeroQty = await gateway.SubmitOrderAsync(portfolioId, securityId, Sides.Buy, 0m, 150.00m, OrderTypes.Limit, cancellationToken: CancellationToken);
+			zeroQty.IsValid.AssertFalse();
+			zeroQty.OrderId.AssertEqual(0L);
+			zeroQty.RejectReason.AssertEqual("Invalid qty");
+
+			// Neither malformed request may leak an orders row (not persisted => not counted for frequency).
+			(await PgCountOrdersAsync(manager, portfolioId)).AssertEqual(0);
+		}
+		finally
+		{
+			await PgCleanupAsync(manager, portfolioId, securityId);
+		}
+	}
+
+	/// <summary>
+	/// Non-positive price is rejected by the service BEFORE any ceiling (M11). Even with the full DEMO
+	/// ceilings seeded, a zero or negative price must be rejected up front by the structural guard (never
+	/// bypassing the price / notional / commission checks). Reasons are EXACT.
+	/// </summary>
+	[TestMethod]
+	public async Task ValidateAsync_NonPositivePrice_RejectedBeforeAnyCeiling()
+	{
+		await using var cn = await OpenPostgresAsync();
+		await using var txn = await cn.BeginTransactionAsync(CancellationToken);
+
+		var s = Guid.NewGuid().ToString("N");
+		var pf = await InsertPortfolioAsync(cn, txn, "M1_NEGV_" + s);
+		var sec = await InsertSecurityAsync(cn, txn, "M1_NEGV_" + s);
+		await InsertDemoRiskLimitsAsync(cn, txn, pf);
+
+		var zero = await new PreTradeRiskService().ValidateAsync(cn, txn, pf, sec, "B", 100m, 0m, CancellationToken);
+		zero.IsValid.AssertFalse();
+		zero.RejectReason.AssertEqual("Invalid price 0");
+
+		var negative = await new PreTradeRiskService().ValidateAsync(cn, txn, pf, sec, "B", 100m, -5m, CancellationToken);
+		negative.IsValid.AssertFalse();
+		negative.RejectReason.AssertEqual("Invalid price -5");
+
+		await txn.RollbackAsync(CancellationToken);
+	}
+
+	// =============================================================================================
 	// Phase H - DUAL-ENGINE STAGED FOUR-STEP VALIDATION (AAP 0.6.3).
 	//
 	// Two independent change axes landed in one refactor: (A) LOGIC consolidation - the accept/reject
@@ -1497,6 +1955,153 @@ public class PreTradeRiskParityTests : BaseTestClass
 	/// <summary>Builds a Npgsql parameter, mapping a null value (including a null nullable) to DBNull.</summary>
 	private static NpgsqlParameter PgP(string name, NpgsqlDbType type, object value)
 		=> new(name, type) { Value = value ?? DBNull.Value };
+
+	// --- Phase M1 helpers: COMMITTED (auto-commit) seed/teardown for the real-gateway tests -----------------
+	// The production gateway opens its OWN connection via SqlLegacyConnection.Resolve(), so its risk reads see
+	// only COMMITTED rows. These helpers therefore insert on the manager connection with no explicit
+	// transaction (each statement auto-commits), mirroring PositionRecalculationTests' committed gateway path.
+
+	/// <summary>Inserts a portfolio (auto-commit) and returns its generated id, for the real-gateway tests.</summary>
+	private async Task<int> PgInsertPortfolioCommittedAsync(NpgsqlConnection connection, string name)
+	{
+		await using var command = new NpgsqlCommand(
+			"INSERT INTO portfolios (name) VALUES (@name) RETURNING portfolio_id", connection);
+		command.Parameters.Add(new NpgsqlParameter("name", NpgsqlDbType.Varchar) { Value = name });
+		return (int)await command.ExecuteScalarAsync(CancellationToken);
+	}
+
+	/// <summary>Inserts a security (auto-commit) and returns its generated id, for the real-gateway tests.</summary>
+	private async Task<int> PgInsertSecurityCommittedAsync(NpgsqlConnection connection, string code)
+	{
+		await using var command = new NpgsqlCommand(
+			"INSERT INTO securities (security_code) VALUES (@code) RETURNING security_id", connection);
+		command.Parameters.Add(new NpgsqlParameter("code", NpgsqlDbType.Varchar) { Value = code });
+		return (int)await command.ExecuteScalarAsync(CancellationToken);
+	}
+
+	/// <summary>Inserts a portfolio-scoped risklimits row (auto-commit) from a <see cref="GateVector"/>; the
+	/// committed counterpart of <see cref="PgInsertRiskLimitsAsync"/> used by the real-gateway tests.</summary>
+	private async Task PgInsertRiskLimitsCommittedAsync(NpgsqlConnection connection, int portfolioId, GateVector vector)
+	{
+		await using var command = new NpgsqlCommand(
+			"INSERT INTO risklimits (portfolio_id, security_id, max_order_price, max_order_qty, max_order_value, " +
+			"max_position_size, max_daily_volume, max_order_freq_count, max_order_freq_window_sec, max_commission_total, commission_rate) " +
+			"VALUES (@portfolio_id, NULL, @max_order_price, @max_order_qty, @max_order_value, " +
+			"@max_position_size, @max_daily_volume, @max_order_freq_count, @max_order_freq_window_sec, @max_commission_total, @commission_rate)",
+			connection);
+		command.Parameters.Add(PgP("portfolio_id", NpgsqlDbType.Integer, portfolioId));
+		command.Parameters.Add(PgP("max_order_price", NpgsqlDbType.Numeric, vector.MaxOrderPrice));
+		command.Parameters.Add(PgP("max_order_qty", NpgsqlDbType.Numeric, vector.MaxOrderQty));
+		command.Parameters.Add(PgP("max_order_value", NpgsqlDbType.Numeric, vector.MaxOrderValue));
+		command.Parameters.Add(PgP("max_position_size", NpgsqlDbType.Numeric, vector.MaxPositionSize));
+		command.Parameters.Add(PgP("max_daily_volume", NpgsqlDbType.Numeric, vector.MaxDailyVolume));
+		command.Parameters.Add(PgP("max_order_freq_count", NpgsqlDbType.Integer, vector.MaxOrderFreqCount));
+		command.Parameters.Add(PgP("max_order_freq_window_sec", NpgsqlDbType.Integer, vector.MaxOrderFreqWindowSec));
+		command.Parameters.Add(PgP("max_commission_total", NpgsqlDbType.Numeric, vector.MaxCommissionTotal));
+		command.Parameters.Add(PgP("commission_rate", NpgsqlDbType.Numeric, vector.CommissionRate ?? 0.0005m));
+		await command.ExecuteNonQueryAsync(CancellationToken);
+	}
+
+	/// <summary>Counts the orders persisted for a portfolio (auto-commit), used to assert what the gateway wrote.</summary>
+	private async Task<int> PgCountOrdersAsync(NpgsqlConnection connection, int portfolioId)
+	{
+		await using var command = new NpgsqlCommand(
+			"SELECT COUNT(*) FROM orders WHERE portfolio_id = @p", connection);
+		command.Parameters.Add(new NpgsqlParameter("p", NpgsqlDbType.Integer) { Value = portfolioId });
+		return Convert.ToInt32(await command.ExecuteScalarAsync(CancellationToken));
+	}
+
+	/// <summary>FK-respecting teardown of everything seeded for a (portfolio, security), mirroring
+	/// PositionRecalculationTests.CleanupAsync so the real-gateway tests leave the shared database pristine.</summary>
+	private async Task PgCleanupAsync(NpgsqlConnection connection, int portfolioId, int securityId)
+	{
+		if (portfolioId != 0)
+		{
+			await PgExecCommittedAsync(connection,
+				"DELETE FROM orderstatushistory WHERE order_id IN (SELECT order_id FROM orders WHERE portfolio_id = @p)", portfolioId);
+			await PgExecCommittedAsync(connection,
+				"DELETE FROM trades WHERE order_id IN (SELECT order_id FROM orders WHERE portfolio_id = @p)", portfolioId);
+			await PgExecCommittedAsync(connection, "DELETE FROM positions WHERE portfolio_id = @p", portfolioId);
+			await PgExecCommittedAsync(connection, "DELETE FROM risklimits WHERE portfolio_id = @p", portfolioId);
+			await PgExecCommittedAsync(connection, "DELETE FROM orders WHERE portfolio_id = @p", portfolioId);
+		}
+
+		if (securityId != 0)
+			await PgExecCommittedAsync(connection, "DELETE FROM securities WHERE security_id = @p", securityId);
+
+		if (portfolioId != 0)
+			await PgExecCommittedAsync(connection, "DELETE FROM portfolios WHERE portfolio_id = @p", portfolioId);
+	}
+
+	/// <summary>Runs a single-parameter (<c>@p</c>) teardown statement (auto-commit).</summary>
+	private async Task PgExecCommittedAsync(NpgsqlConnection connection, string sql, int id)
+	{
+		await using var command = new NpgsqlCommand(sql, connection);
+		command.Parameters.Add(new NpgsqlParameter("p", NpgsqlDbType.Integer) { Value = id });
+		await command.ExecuteNonQueryAsync(CancellationToken);
+	}
+
+	// --- Phase M1 helpers: transactional seeders for the direct ValidateAsync tests ------------------------
+
+	/// <summary>Inserts a position row (qty may be negative for a short) on the caller's transaction;
+	/// avg_price / realized_pnl / unrealized_pnl / updated_date take their schema defaults (0 / now()).</summary>
+	private async Task PgInsertPositionAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, int portfolioId, int securityId, decimal qty)
+	{
+		await using var command = new NpgsqlCommand(
+			"INSERT INTO positions (portfolio_id, security_id, qty) VALUES (@portfolio_id, @security_id, @qty)", connection, transaction);
+		command.Parameters.Add(new NpgsqlParameter("portfolio_id", NpgsqlDbType.Integer) { Value = portfolioId });
+		command.Parameters.Add(new NpgsqlParameter("security_id", NpgsqlDbType.Integer) { Value = securityId });
+		command.Parameters.Add(new NpgsqlParameter("qty", NpgsqlDbType.Numeric) { Value = qty });
+		await command.ExecuteNonQueryAsync(CancellationToken);
+	}
+
+	/// <summary>Seeds an order with an EXPLICIT <c>submitted_date</c> (Kind=Unspecified UTC) so the daily-volume
+	/// day-boundary tests can place rows in a specific UTC day; a null price yields a MARKET order.</summary>
+	private async Task PgSeedOrderWithDateAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, int portfolioId, int securityId, string side, decimal qty, decimal? price, string status, DateTime submittedDate)
+	{
+		await using var command = new NpgsqlCommand(
+			"INSERT INTO orders (portfolio_id, security_id, side, qty, price, order_type, status, submitted_date) " +
+			"VALUES (@portfolio_id, @security_id, @side, @qty, @price, @order_type, @status, @submitted_date)", connection, transaction);
+		command.Parameters.Add(PgP("portfolio_id", NpgsqlDbType.Integer, portfolioId));
+		command.Parameters.Add(PgP("security_id", NpgsqlDbType.Integer, securityId));
+		command.Parameters.Add(PgP("side", NpgsqlDbType.Varchar, side));
+		command.Parameters.Add(PgP("qty", NpgsqlDbType.Numeric, qty));
+		command.Parameters.Add(PgP("price", NpgsqlDbType.Numeric, price));
+		command.Parameters.Add(PgP("order_type", NpgsqlDbType.Varchar, price is null ? "MARKET" : "LIMIT"));
+		command.Parameters.Add(PgP("status", NpgsqlDbType.Varchar, status));
+		command.Parameters.Add(new NpgsqlParameter("submitted_date", NpgsqlDbType.Timestamp) { Value = DateTime.SpecifyKind(submittedDate, DateTimeKind.Unspecified) });
+		await command.ExecuteNonQueryAsync(CancellationToken);
+	}
+
+	/// <summary>Inserts an order on the caller's transaction and RETURNs its generated order_id (so a trade
+	/// row with a valid FK can be seeded for the market-order commission test); null price => MARKET.</summary>
+	private async Task<long> PgInsertOrderReturningIdAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, int portfolioId, int securityId, string side, decimal qty, decimal? price, string status)
+	{
+		await using var command = new NpgsqlCommand(
+			"INSERT INTO orders (portfolio_id, security_id, side, qty, price, order_type, status) " +
+			"VALUES (@portfolio_id, @security_id, @side, @qty, @price, @order_type, @status) RETURNING order_id", connection, transaction);
+		command.Parameters.Add(PgP("portfolio_id", NpgsqlDbType.Integer, portfolioId));
+		command.Parameters.Add(PgP("security_id", NpgsqlDbType.Integer, securityId));
+		command.Parameters.Add(PgP("side", NpgsqlDbType.Varchar, side));
+		command.Parameters.Add(PgP("qty", NpgsqlDbType.Numeric, qty));
+		command.Parameters.Add(PgP("price", NpgsqlDbType.Numeric, price));
+		command.Parameters.Add(PgP("order_type", NpgsqlDbType.Varchar, price is null ? "MARKET" : "LIMIT"));
+		command.Parameters.Add(PgP("status", NpgsqlDbType.Varchar, status));
+		return (long)await command.ExecuteScalarAsync(CancellationToken);
+	}
+
+	/// <summary>Inserts a trades row on the caller's transaction (for the market-order last-trade-price and
+	/// existing-gross-notional reads); price stays decimal to preserve NUMERIC(18,4) scale.</summary>
+	private async Task PgInsertTradeTxnAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, long orderId, decimal qty, decimal price)
+	{
+		await using var command = new NpgsqlCommand(
+			"INSERT INTO trades (order_id, qty, price, executed_date) " +
+			"VALUES (@order_id, @qty, @price, now() at time zone 'utc')", connection, transaction);
+		command.Parameters.Add(new NpgsqlParameter("order_id", NpgsqlDbType.Bigint) { Value = orderId });
+		command.Parameters.Add(new NpgsqlParameter("qty", NpgsqlDbType.Numeric) { Value = qty });
+		command.Parameters.Add(new NpgsqlParameter("price", NpgsqlDbType.Numeric) { Value = price });
+		await command.ExecuteNonQueryAsync(CancellationToken);
+	}
 
 	// --- Preserved PostgreSQL seed helpers (unchanged from the original Phase G) ---
 

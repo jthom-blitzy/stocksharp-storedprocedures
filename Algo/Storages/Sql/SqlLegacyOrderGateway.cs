@@ -45,10 +45,13 @@ public class SqlLegacyOrderGateway
 
 	// The gateway owns a single PositionRecalculationService and calls ApplyAsync exactly once for each
 	// freshly-inserted trade, inside the SAME gateway-owned transaction as the trade INSERT (single-apply
-	// invariant, AAP 0.6.5). The authoritative guarantee is STRUCTURAL - one atomic transaction per trade
-	// with a fresh unique trade_id, so each committed trade is applied exactly once and a rolled-back
-	// attempt persists nothing - NOT a database ledger table; the service adds an in-process best-effort
-	// guard on top (see PositionRecalculationService). Constructed once and reused across calls.
+	// invariant, AAP 0.6.5). Exactly-once is enforced by TWO cooperating mechanisms: (1) one atomic
+	// transaction per trade with a fresh unique trade_id, so each committed trade is applied once and a
+	// rolled-back attempt persists nothing; and (2) a DURABLE database guard - ApplyAsync flips this trade's
+	// trades.position_applied flag FALSE->TRUE in the SAME commit as the position write, so a restart, retry,
+	// or second-instance replay of an already-committed trade_id sees the flag set and is an idempotent no-op
+	// (C3). This replaces the former in-process HashSet, which could neither survive a restart nor coordinate
+	// across instances. Constructed once and reused across calls.
 	private readonly PositionRecalculationService _positionRecalc = new();
 
 	/// <summary>
@@ -163,6 +166,27 @@ public class SqlLegacyOrderGateway
 			_ => throw new ArgumentOutOfRangeException(nameof(side), side, "Order side must be Buy or Sell."),
 		};
 
+		// M11/M12: normalize qty/price ONCE, up front, to the schema's NUMERIC(18,4) scale with the SAME
+		// canonical quantizer the gate uses, then VALIDATE and PERSIST that one normalized value. Postgres
+		// rounds a NUMERIC insert with the same round-half-away-from-zero rule, so binding the pre-quantized
+		// value and letting the DB round agree exactly; this closes the former mismatch where the gate decided
+		// on a quantized value while the INSERT bound the raw value (they could round differently and the stored
+		// order would not match the decision).
+		var qtyQ = CanonicalRiskRules.QuantizeToScale(volume);
+		decimal? priceQ = price.HasValue ? CanonicalRiskRules.QuantizeToScale(price.Value) : (decimal?)null;
+
+		// STRUCTURAL validity short-circuit (M11/M12): a qty that rounds to <= 0, or a non-null price that rounds
+		// to <= 0, cannot be stored - it would violate CK_Orders_qty / CK_Orders_price - and is a malformed
+		// request rather than a risk-limit breach, so it is NEITHER persisted NOR counted toward the rolling
+		// order-frequency window (the retired proc could not persist it either, given the same CHECKs). Return
+		// the rejection DTO directly (OrderId = 0, no row written), using the SAME reason text the pure gate
+		// emits for these cases so the production path and the direct-gate parity tests agree.
+		if (qtyQ <= 0m)
+			return new() { OrderId = 0, IsValid = false, RejectReason = "Invalid qty" };
+
+		if (priceQ is not null && priceQ.Value <= 0m)
+			return new() { OrderId = 0, IsValid = false, RejectReason = $"Invalid price {priceQ.Value.To<string>()}" };
+
 		// F1: run the DB-state-aware validation reads AND the order INSERT inside ONE gateway-owned
 		// transaction, serialized per-portfolio by a transaction-scoped advisory lock, so a concurrent burst
 		// cannot slip extra orders past the rolling frequency / daily-volume / position gate between a check
@@ -179,13 +203,16 @@ public class SqlLegacyOrderGateway
 				await connection.OpenAsync(cancellationToken);
 				await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
 
-				// Per-portfolio serialization. Lock key (portfolio_id, 0): the 0 sentinel is disjoint from
-				// PositionRecalculationService's (portfolio_id, security_id) lock, whose security_id is always
-				// >= 1, so an order submission and a position apply never contend on the same advisory key.
+				// Per-portfolio serialization (C4). Lock on the SINGLE-key pg_advisory_xact_lock(bigint) space,
+				// keyed on portfolio_id - the SAME advisory-lock space PositionRecalculationService.ApplyAsync
+				// takes. The former (portfolio_id, 0) two-key form lived in a DIFFERENT PostgreSQL advisory-lock
+				// space from the recalc service's single-key lock, so an order submission and a position apply on
+				// the same portfolio did NOT mutually exclude; unifying both services on the one-arg bigint
+				// overload (portfolio_id widened to bigint) restores one coherent per-portfolio lock hierarchy.
 				using (var lockCommand = new NpgsqlCommand(
-					"SELECT pg_advisory_xact_lock(@portfolio_id, 0)", connection, transaction))
+					"SELECT pg_advisory_xact_lock(@portfolio_id)", connection, transaction))
 				{
-					lockCommand.Parameters.Add(new NpgsqlParameter("portfolio_id", NpgsqlDbType.Integer) { Value = portfolioId });
+					lockCommand.Parameters.Add(new NpgsqlParameter("portfolio_id", NpgsqlDbType.Bigint) { Value = (long)portfolioId });
 					await lockCommand.ExecuteNonQueryAsync(cancellationToken);
 				}
 
@@ -193,7 +220,7 @@ public class SqlLegacyOrderGateway
 				// risklimits/positions/orders/trades on THIS connection + transaction so its view is
 				// consistent with, and serialized against, the INSERT below.
 				var validation = await _preTradeRisk.ValidateAsync(
-					connection, transaction, portfolioId, securityId, sideCode, volume, price, cancellationToken);
+					connection, transaction, portfolioId, securityId, sideCode, qtyQ, priceQ, cancellationToken);
 				var status = validation.IsValid ? "ACCEPTED" : "REJECTED";
 
 				// Parameterized INSERT (StoredProcedure call retired; business logic moved to Algo/Risk). Both
@@ -209,10 +236,11 @@ public class SqlLegacyOrderGateway
 				command.Parameters.Add(new NpgsqlParameter("portfolio_id", NpgsqlDbType.Integer) { Value = portfolioId });
 				command.Parameters.Add(new NpgsqlParameter("security_id", NpgsqlDbType.Integer) { Value = securityId });
 				command.Parameters.Add(new NpgsqlParameter("side", NpgsqlDbType.Varchar) { Value = sideCode });
-				// qty / price are NUMERIC(18,4): bind as decimal (never double/float) so the schema's
-				// scale is preserved and no downstream >= comparison can silently loosen (AAP 0.6.4).
-				command.Parameters.Add(new NpgsqlParameter("qty", NpgsqlDbType.Numeric) { Value = volume });
-				command.Parameters.Add(new NpgsqlParameter("price", NpgsqlDbType.Numeric) { Value = (object)price ?? DBNull.Value });
+				// qty / price are NUMERIC(18,4): bind the NORMALIZED qtyQ/priceQ (M12) as decimal (never
+				// double/float) so what is PERSISTED is byte-for-byte what the gate VALIDATED and no downstream
+				// >= comparison can silently loosen (AAP 0.6.4).
+				command.Parameters.Add(new NpgsqlParameter("qty", NpgsqlDbType.Numeric) { Value = qtyQ });
+				command.Parameters.Add(new NpgsqlParameter("price", NpgsqlDbType.Numeric) { Value = (object)priceQ ?? DBNull.Value });
 				command.Parameters.Add(new NpgsqlParameter("order_type", NpgsqlDbType.Varchar) { Value = MapOrderType(orderType) });
 				command.Parameters.Add(new NpgsqlParameter("status", NpgsqlDbType.Varchar) { Value = status });
 				command.Parameters.Add(new NpgsqlParameter("reject_reason", NpgsqlDbType.Varchar) { Value = (object)validation.RejectReason ?? DBNull.Value });
@@ -249,7 +277,9 @@ public class SqlLegacyOrderGateway
 	/// inside a single gateway-owned transaction so the trade row and the position update commit
 	/// together or not at all (atomicity, AAP 0.6.5). The old <c>trg_Trades_PositionRecalc</c> trigger
 	/// that used to recompute the position in the database was removed in the consolidation, so this
-	/// explicit single call is now the sole applier - callers must NOT apply the same trade a second time.
+	/// explicit call is now the sole applier. Exactly-once is enforced durably by the service's
+	/// <c>trades.position_applied</c> guard (flipped in the same commit), so a retried or replayed
+	/// apply of the SAME persisted trade is a safe idempotent no-op rather than a double count.
 	/// </summary>
 	public async Task RecordTradeAsync(long orderId, decimal qty, decimal price, CancellationToken cancellationToken = default)
 	{
@@ -259,29 +289,42 @@ public class SqlLegacyOrderGateway
 		// Atomicity (F2, AAP 0.6.5): the trade INSERT and the position recompute run in ONE gateway-owned
 		// transaction, so a trade row can never be committed without its position effect (nor vice versa).
 		// The recalculation service enrols in this transaction - it neither begins nor commits it and takes
-		// its per-(portfolio, security) advisory lock on it - and the gateway commits once at the end.
+		// its per-portfolio advisory lock on it (C4, the same lock space this gateway's SubmitOrderAsync uses)
+		// - and the gateway commits once at the end.
 		await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
 
-		// Insert the fill, capturing the generated trade id. executed_date via now() at time zone
-		// 'utc' (UTC time source, AAP 0.6.4). T-SQL "OUTPUT INSERTED.trade_id" -> Postgres
-		// "RETURNING trade_id" (was OUTPUT INSERTED / trigger-driven flow).
+		// Insert the fill, capturing the generated trade id AND the PERSISTED qty/price. executed_date via
+		// now() at time zone 'utc' (UTC time source, AAP 0.6.4). C5 fix: bind the caller's qty/price but read
+		// them BACK via RETURNING, so the position recompute below runs on the values ACTUALLY stored in the
+		// NUMERIC(18,4) columns (Postgres rounds to 4dp on insert) rather than on a raw >4dp input that would
+		// disagree with the persisted trade row and could loosen a downstream >= comparison. T-SQL
+		// "OUTPUT INSERTED.*" -> Postgres "RETURNING" (was OUTPUT INSERTED / trigger-driven flow).
 		long tradeId;
+		decimal persistedQty;
+		decimal persistedPrice;
 		await using (var insert = new NpgsqlCommand(
-			"INSERT INTO trades (order_id, qty, price, executed_date) VALUES (@order_id, @qty, @price, now() at time zone 'utc') RETURNING trade_id", connection, transaction))
+			"INSERT INTO trades (order_id, qty, price, executed_date) VALUES (@order_id, @qty, @price, now() at time zone 'utc') RETURNING trade_id, qty, price", connection, transaction))
 		{
 			insert.Parameters.Add(new NpgsqlParameter("order_id", NpgsqlDbType.Bigint) { Value = orderId });
 			// qty / price are NUMERIC(18,4): bind as decimal (never double/float) - AAP 0.6.4.
 			insert.Parameters.Add(new NpgsqlParameter("qty", NpgsqlDbType.Numeric) { Value = qty });
 			insert.Parameters.Add(new NpgsqlParameter("price", NpgsqlDbType.Numeric) { Value = price });
 
-			tradeId = (long)await insert.ExecuteScalarAsync(cancellationToken);
+			// No MARS on a single Npgsql connection: fully read and dispose this reader before ApplyAsync runs
+			// its own commands on the same connection + transaction.
+			await using var reader = await insert.ExecuteReaderAsync(cancellationToken);
+			await reader.ReadAsync(cancellationToken);
+			tradeId = reader.GetInt64(0);
+			// Persisted (4dp-rounded) qty/price -> decimal, so ApplyAsync computes from stored values (C5).
+			persistedQty = reader.GetDecimal(1);
+			persistedPrice = reader.GetDecimal(2);
 		}
 
 		// Single-apply invariant (AAP 0.6.5): the trg_Trades_PositionRecalc trigger was removed, so the
 		// gateway is the sole applier and calls the recalculation service exactly once for this freshly-
 		// inserted trade, on THIS connection + transaction. The service owns neither the connection nor the
 		// transaction (the gateway does), so the trade row and the position write form one atomic unit.
-		await _positionRecalc.ApplyAsync(connection, transaction, orderId, tradeId, qty, price, cancellationToken);
+		await _positionRecalc.ApplyAsync(connection, transaction, orderId, tradeId, persistedQty, persistedPrice, cancellationToken);
 
 		await transaction.CommitAsync(cancellationToken);
 	}

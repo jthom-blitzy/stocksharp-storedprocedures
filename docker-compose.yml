@@ -2,7 +2,7 @@
 # docker-compose.yml — one-command local stack for the StockSharp "Legacy SQL"
 # console demo (Samples/08_Misc/03_LegacySqlDemo) running against PostgreSQL 16.
 #
-# `docker-compose up` (equivalently `docker compose up --build`) brings up two
+# `docker compose up` (or `docker compose up --build`) brings up two
 # services:
 #   1. db  — PostgreSQL 16, initialized from the Database/*.sql scripts.
 #   2. app — the .NET 10 console demo (built from the repo-root Dockerfile),
@@ -20,13 +20,11 @@
 # manager, nothing AWS-specific.
 #
 # Dev-only credentials (LOCAL DEVELOPMENT stand-in for the AWS model; deliberately
-# NOT secret). Following least-privilege (finding F17) there are TWO distinct roles:
-#   * postgres / postgres — the bootstrap SUPERUSER. Used ONLY to initialize the
-#     cluster (the Database/*.sql init scripts) and by the healthcheck below; it is
-#     NOT used by the application.
-#   * app_user / app_pw   — a NON-superuser login with DML-only rights on the seven
-#     tables, provisioned by Database/005_AppRole.sql. The `app` service connects as
-#     THIS role, so the demo never runs with cluster-superuser privileges.
+# NOT secret). The frozen AAP (0.4.2) has the application connect with the db
+# service's POSTGRES_USER / POSTGRES_PASSWORD credentials - a single `postgres` /
+# `postgres` role that both runs the init scripts (and the healthcheck) and is used
+# by the `app` service. There is intentionally NO separate application role and NO
+# init script beyond the three the AAP freezes (001_Schema, 003_Triggers, 004_SeedData).
 # database=stocksharp   host(service)=db
 # =============================================================================
 
@@ -41,10 +39,10 @@ services:
     # POSTGRES_DB makes the entrypoint CREATE the `stocksharp` database on first
     # init — this replaces the old T-SQL `CREATE DATABASE` guard, so the SQL
     # init scripts neither create nor switch databases. POSTGRES_USER / _PASSWORD
-    # set the bootstrap SUPERUSER used to run the init scripts and by the
-    # healthcheck; the application authenticates as the least-privilege app_user
-    # role instead (see Database/005_AppRole.sql and the `app` service). The list
-    # form (- KEY=value) is used throughout so YAML never coerces a value.
+    # set the `postgres` role used to run the init scripts, by the healthcheck, and
+    # by the `app` service (AAP 0.4.2 has the app connect with POSTGRES_USER /
+    # POSTGRES_PASSWORD). The list form (- KEY=value) is used throughout so YAML
+    # never coerces a value.
     environment:
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=postgres
@@ -54,9 +52,9 @@ services:
       # Mount the SQL init scripts read-only into the well-known init directory.
       # The official postgres image auto-executes *.sql / *.sh files placed here
       # in ALPHABETICAL order, on FIRST initialization only (empty data dir).
-      # With 002_StoredProcedures.sql retired, the effective order is:
-      #     001_Schema.sql -> 003_Triggers.sql -> 004_SeedData.sql -> 005_AppRole.sql
-      # (005 provisions the least-privilege app_user AFTER the schema/seed exist.)
+      # With 002_StoredProcedures.sql retired, the effective order is exactly the
+      # three scripts the AAP freezes:
+      #     001_Schema.sql -> 003_Triggers.sql -> 004_SeedData.sql
       # The 002 numbering gap is harmless, and the non-*.sql Database/README.md
       # is ignored by the init runner. `:ro` keeps the host scripts read-only.
       - ./Database:/docker-entrypoint-initdb.d:ro
@@ -122,9 +120,9 @@ services:
     # exactly the variable SqlLegacyConnection.Resolve() reads. `Host=db` resolves
     # to this service via Compose DNS.
     #
-    # Username/Password use the least-privilege app_user role (finding F17), NOT the
-    # cluster superuser — the demo only performs DML on the seven tables, all of which
-    # app_user is granted by Database/005_AppRole.sql.
+    # Username/Password are the db service's POSTGRES_USER / POSTGRES_PASSWORD
+    # (`postgres` / `postgres`), matching the frozen AAP (0.4.2), which has the app
+    # connect with those credentials; there is no separate application role.
     #
     # "GSS Encryption Mode=Disable" (finding F19): Npgsql 10 defaults GssEncryptionMode
     # to Prefer, so on this Kerberos-less Linux runtime image it would probe for
@@ -135,7 +133,7 @@ services:
     #
     # Quoted because the value contains '=' and ';'.
     environment:
-      - "STOCKSHARP_LEGACY_SQL_CONNECTION=Host=db;Port=5432;Database=stocksharp;Username=app_user;Password=app_pw;GSS Encryption Mode=Disable"
+      - "STOCKSHARP_LEGACY_SQL_CONNECTION=Host=db;Port=5432;Database=stocksharp;Username=postgres;Password=postgres;GSS Encryption Mode=Disable"
 
     # No `restart:` policy (defaults to `no`): the demo is a one-shot walkthrough
     # that prints its three scenarios and exits. Auto-restarting would loop it

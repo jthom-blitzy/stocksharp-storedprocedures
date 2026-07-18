@@ -9,10 +9,14 @@
 
 	The old Trades position-recalculation trigger that previously lived here is
 	intentionally removed. That position / P&L recalculation now lives in the
-	C# Algo/Risk/PositionRecalculationService, and removing the trigger is what
-	guarantees the single-apply invariant: with no residual database trigger
-	firing on a Trades row insert, the C# gateway's single recalculation call
-	per trade can never be double-counted.
+	C# Algo/Risk/PositionRecalculationService. Removing the trigger is NECESSARY
+	but not by itself sufficient for exactly-once application: it ensures no
+	residual DATABASE-side recalculation fires on a Trades insert, while the C#
+	side enforces exactly-once DURABLY via a trades.position_applied flag that
+	PositionRecalculationService.ApplyAsync flips FALSE -> TRUE in the SAME
+	transaction as the position write, so a restart / retry / replay of an
+	already-applied trade_id is an idempotent no-op. Together - no database
+	trigger plus the durable C# guard - a trade's effect is applied exactly once.
 
 	This script runs SECOND in the container init sequence
 	(001_Schema.sql -> 003_Triggers.sql -> 004_SeedData.sql), so the Orders and

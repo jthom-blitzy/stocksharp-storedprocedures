@@ -44,7 +44,12 @@ SELECT
 	5, 60,
 	5000.00, 0.0005
 FROM Portfolios p
-WHERE p.name = 'DEMO'
+-- M9: match the portfolio case-INSENSITIVELY via LOWER(name), consistent with the LOWER(name) functional
+-- unique key (F2) and the gateway's ON CONFLICT (LOWER(name)) upsert. A case-sensitive `p.name = 'DEMO'`
+-- here missed a portfolio row stored as 'demo' (e.g. auto-created by the gateway before seeding), so the
+-- SELECT returned no rows and the DEMO portfolio was left with ZERO RiskLimits on a re-seed - which
+-- silently disabled every ceiling (all orders accepted). LOWER(p.name) = 'demo' matches regardless of casing.
+WHERE LOWER(p.name) = 'demo'
 	AND NOT EXISTS (
 		SELECT 1 FROM RiskLimits rl
 		WHERE rl.portfolio_id = p.portfolio_id AND rl.security_id IS NULL

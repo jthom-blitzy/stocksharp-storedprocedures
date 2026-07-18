@@ -13,8 +13,9 @@ public static class SqlLegacyConnection
 	// AAP 0.7.2 decision: the environment-variable NAME is deliberately RETAINED (not renamed) across
 	// the SQL Server -> PostgreSQL engine change, to avoid a wider blast radius. The two places that use
 	// this name are SqlLegacyConnection.Resolve() (below) and the docker-compose `app` service, which
-	// sets this same variable to the in-container value (least-privilege app_user, GSS disabled):
-	// Host=db;Port=5432;Database=stocksharp;Username=app_user;Password=app_pw;GSS Encryption Mode=Disable
+	// sets this same variable to the in-container value (the db service's POSTGRES_USER credentials,
+	// GSS disabled; AAP 0.4.2 has the app connect as that role):
+	// Host=db;Port=5432;Database=stocksharp;Username=postgres;Password=postgres;GSS Encryption Mode=Disable
 	// (db = the compose service name); the fallback below is for a demo run directly on the host.
 	private const string _envVarName = "STOCKSHARP_LEGACY_SQL_CONNECTION";
 

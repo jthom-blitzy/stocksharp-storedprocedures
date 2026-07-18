@@ -9,29 +9,34 @@ This document exists because the last three "why did this order get rejected"
 tickets all turned out to be a disagreement between the C# risk engine and the
 SQL risk engine, and nobody could point at a single place that explained both.
 So that got fixed: the business logic that used to live in SQL stored
-procedures has been pulled out into C#, and every rule that both sides used to
-enforce now reads from one canonical definition. If you're new to this codebase:
-read this before you go looking for "the" risk check - and the good news is that
-this time there *is* one. The pre-trade gate and the circuit breaker are still
-two different patterns (a per-order gate vs. a portfolio-wide breaker), but
-wherever a rule exists on both sides they now consume the same canonical rule
-definitions, so they can't silently disagree the way they used to.
+procedures has been pulled out into C#, and the rules the two engines share now
+key off one canonical definition in `CanonicalRiskRules` - most concretely the
+rolling-window frequency evaluator, which the pre-trade gate and the circuit
+breaker literally both call, plus the shared comparison convention (`>=`
+meets-or-exceeds, and NULL-or-0 = "not enforced"). If you're new to this
+codebase, read this before you go looking for "the" risk check. The pre-trade
+gate and the circuit breaker are still two different patterns (a per-order gate
+vs. a portfolio-wide breaker), and for most checks each keeps its own values and
+its own subject; what changed is that the one rule they used to implement twice
+and disagree on - order frequency - now runs through a single shared evaluator,
+so they can't silently diverge on it the way they used to. The rule-by-rule
+table below is precise about exactly what is shared and what is not.
 
 While that consolidation happened the persistence tier moved too: the database
 is PostgreSQL now (Npgsql, not `Microsoft.Data.SqlClient`), and the whole thing
-- database plus the console demo - comes up with a single `docker-compose up`.
+- database plus the console demo - comes up with a single `docker compose up`.
 The schema is pure storage again: tables, constraints, indexes, and exactly one
 pure-audit trigger. No business logic runs in the database anymore.
 
 ## What's here
 
-- `/Database` - native PostgreSQL 16 DDL only: schema (`001_Schema.sql`),
-  triggers (`003_Triggers.sql`, the status-audit trigger only), seed data
-  (`004_SeedData.sql`), and a least-privilege application role
-  (`005_AppRole.sql`). **`002_StoredProcedures.sql` is gone** - all of its
-  business logic moved into C# under `Algo/Risk/`, so the `002` slot is just a
-  harmless numbering gap now. `Database/README.md` has the `docker-compose`
-  one-liner and the full init-script story.
+- `/Database` - native PostgreSQL 16 DDL only, exactly the three init scripts the
+  AAP freezes: schema (`001_Schema.sql`), triggers (`003_Triggers.sql`, the
+  status-audit trigger only), and seed data (`004_SeedData.sql`).
+  **`002_StoredProcedures.sql` is gone** - all of its business logic moved into
+  C# under `Algo/Risk/`, so the `002` slot is just a harmless numbering gap now.
+  `Database/README.md` has the `docker compose` one-liner and the full
+  init-script story.
 - `Algo/Risk/` - this is where the business logic lives now. `PreTradeRiskService`
   is the per-order accept/reject gate (the C# re-expression of the retired
   `usp_ValidatePreTradeRisk`), `PositionRecalculationService` does the
@@ -51,6 +56,14 @@ pure-audit trigger. No business logic runs in the database anymore.
 - `Samples/08_Misc/03_LegacySqlDemo` - a runnable walkthrough, now against
   PostgreSQL and the consolidated services: submit a compliant order, submit one
   that gets rejected, record a fill, watch the position update automatically.
+- `Tests/` - the parity and characterization suites (`PreTradeRiskParityTests`,
+  `PositionRecalculationTests`) that prove the consolidation. They run the AAP
+  0.6.3 staged four-step sequence, which needs a *baseline* of the original SQL
+  Server behaviour to compare against; that baseline schema+seed is the embedded
+  resource `Tests/Resources/LegacySqlServer/OriginalCharacterizationSetup.sql`
+  (bundled via the `Resources\LegacySqlServer\*.sql` EmbeddedResource glob in
+  `Tests.csproj`). It is inventoried here because it is essential to the staged
+  tests, even though it is not one of the `/Database` runtime init scripts.
 
 ## One canonical source of truth (and two patterns that share it)
 
@@ -81,15 +94,18 @@ questions:
   it was out of scope, and nothing about the mechanics of `ProcessRiskAsync`
   moved.
 
-The important change is what happens where a rule exists on *both* sides. It
-used to be two separate code paths that could give different answers for the
-same input; now both read from `CanonicalRiskRules`. Order frequency is the
-clearest example: the gate and `RiskOrderFreqRule` both call the one
-rolling-window frequency evaluator, so they can't come back with different
-verdicts on the same burst. Anyone asking "does this order get risk-checked" still needs to
-know which path it went through - `SqlLegacyOrderGateway.SubmitOrderAsync` runs
-the gate; a `Connector` / `RiskMessageAdapter` pipeline runs the circuit breaker
-- but the two can no longer *silently disagree* on a rule they share.
+The important change is order frequency - the one rule the two sides used to
+implement twice and disagree on. It used to be two separate code paths (a fixed
+bucket in C#, a rolling `COUNT(*)` in SQL) that could give different answers for
+the same burst; now the gate and `RiskOrderFreqRule` both call the one
+rolling-window evaluator in `CanonicalRiskRules`, so they can't come back with
+different verdicts on the same burst. That shared evaluator, and the comparison
+convention it applies, are the concrete "single source of truth" here; the other
+shared-name checks are more subtle, and the table below says exactly how. Anyone
+asking "does this order get risk-checked" still needs to know which path it went
+through - `SqlLegacyOrderGateway.SubmitOrderAsync` runs the gate; a `Connector` /
+`RiskMessageAdapter` pipeline runs the circuit breaker - but the two can no
+longer *silently disagree* on order frequency, the rule they genuinely share.
 
 
 ### Merged, preserved, or promoted: the rule-by-rule verdict
@@ -102,14 +118,27 @@ C# gate rules. Here's where each one landed.
 
 | Check | C# rule | SQL check (retired) | Classification / Verdict |
 |---|---|---|---|
-| Order price ceiling | `RiskOrderPriceRule` | `max_order_price` | Same semantics → **merged to canonical** |
-| Order qty ceiling | `RiskOrderVolumeRule` | `max_order_qty` | Same semantics (also unifies qty/Volume naming) → **merged to canonical** |
+| Order price ceiling | `RiskOrderPriceRule` | `max_order_price` | Same semantics → **gate re-expresses it via the canonical `>=`/NULL-or-0 convention; the circuit-breaker `RiskOrderPriceRule` keeps its own value** |
+| Order qty ceiling | `RiskOrderVolumeRule` | `max_order_qty` | Same semantics (also unifies qty/Volume naming) → **gate re-expresses it via the canonical convention; `RiskOrderVolumeRule` keeps its own value** |
 | Order frequency | `RiskOrderFreqRule` | `max_order_freq_count` / `_window_sec` | Same config, different algorithm → **merged to the stricter ROLLING evaluator** |
 | Resulting position size | `RiskPositionSizeRule` | `max_position_size` | Different subject: current (C#) vs hypothetical post-fill (gate) → **shared threshold, context-specific subject** |
 | Cumulative commission | `RiskCommissionRule` / `RiskOrderCommissionRule` | `max_commission_total` | Actual (C#, post-fill) vs estimate (gate, pre-fill) → **different-by-design: preserve BOTH, document why** |
 | Order notional value (qty × price) | (none before) | `max_order_value` | SQL-only → **promoted to a first-class C# gate rule** |
 | Daily traded volume | (none before) | `max_daily_volume` | SQL-only → **promoted to a first-class C# gate rule** |
 | Position lifetime / P&L limit / slippage | `RiskPositionTimeRule` / `RiskPnLRule` / `RiskSlippageRule` | (none) | C#-only, needs live streaming state → **remain in the circuit breaker** |
+
+One thing the "merged" verdicts above do **not** mean: they do not mean the
+circuit-breaker rules were rewired to read canonical configuration. In code,
+the single genuinely shared piece of rule *logic* is the rolling-frequency
+evaluator - both the gate and `RiskOrderFreqRule` call it - plus the gate's
+comparison convention (`>=`, and NULL-or-0 = unlimited) that `CanonicalRiskRules`
+codifies. For price, qty, and position the gate re-expresses the retired SQL
+check through that convention against the seeded `RiskLimits` values, while the
+circuit-breaker `RiskOrderPriceRule` / `RiskOrderVolumeRule` / `RiskPositionSizeRule`
+keep their own independent values, comparisons, subjects, and lifecycle. What was
+eliminated is the *frequency* divergence and the two-implementations-of-one-check
+problem for the checks the gate now owns - not every circuit-breaker rule folding
+into one shared configuration object.
 
 Three of these are worth spelling out, because "merge" was the wrong answer for
 two of them and the frequency merge changed behavior on purpose.
@@ -133,9 +162,9 @@ threshold may never end up *less* strict than the stricter of the two originals
 The gate is a pre-trade check, so it evaluates the *hypothetical post-fill*
 position (current signed qty + the signed order qty) and rejects if that would
 meet or exceed the limit. The circuit-breaker `RiskPositionSizeRule` evaluates
-the *current* position off a `PositionChangeMessage`. Only the threshold value
-and the comparison direction are shared; each side keeps its own subject
-because each subject is the right one for its job.
+the *current* position off a `PositionChangeMessage`. Only the *meaning* of the
+check and the comparison direction line up; each side carries its own configured
+value and its own subject, because each subject is the right one for its job.
 
 **Cumulative commission - different by design, both kept.** The gate estimates
 commission *before* the fill (`qty * price * commission_rate`) because that's
@@ -155,18 +184,32 @@ double-counted the trade against `Positions.qty` / `avg_price` /
 `realized_pnl`. Nothing in the schema prevented it; it relied on whoever wrote
 the next batch job knowing not to.
 
-That whole hazard is gone, by construction. The trigger was **removed** (see
-`Database/003_Triggers.sql`, which now keeps only the pure status-audit
-trigger), and the recompute moved into `PositionRecalculationService`.
-`SqlLegacyOrderGateway.RecordTradeAsync` now inserts the trade and then calls
-`PositionRecalculationService` **exactly once** for it, inside the *same*
-transaction that carries the trade insert - so a trade and its position effect
-commit together or not at all. With no residual database trigger firing on a
-`Trades` insert, there is no second applier left to double-count: that's the
-single-apply invariant. The guarantee is structural (one atomic
-transaction per trade, each with a fresh unique `trade_id`), and on top of that
-the service keeps an in-process best-effort guard so an accidental repeat call
-for the *same* `trade_id` within a process is an idempotent no-op.
+That whole hazard is addressed now, and it's worth being precise about *how* -
+because removing the trigger is necessary but not by itself sufficient. Three
+things combine:
+
+1. **The trigger was removed** (see `Database/003_Triggers.sql`, which now keeps
+   only the pure status-audit trigger), so no database-side applier fires on a
+   `Trades` insert - that eliminates the old duplicate path.
+2. **Transactional atomicity.** `SqlLegacyOrderGateway.RecordTradeAsync` inserts
+   the trade and then calls `PositionRecalculationService` inside the *same*
+   transaction, serialized per portfolio by a `pg_advisory_xact_lock`, so a trade
+   and its position effect commit together or not at all and two trades for one
+   portfolio can't interleave.
+3. **A durable idempotency guard.** `Trades.position_applied` is a boolean the
+   service flips with an atomic conditional `UPDATE ... WHERE trade_id = @id AND
+   position_applied = false`; if that matches zero rows the apply is skipped.
+   Because the flag lives in the database, a repeat apply of the same `trade_id`
+   is a no-op even across a process restart or a second gateway/service instance -
+   not just within one process.
+
+Together those give a single apply per trade that holds across retries, restarts,
+and concurrent instances. It is deliberately **not** claimed "by construction"
+from the trigger removal alone - the trigger removal only closes the database-side
+path; the durable `position_applied` guard is what makes single-apply hold
+cross-instance. All of it is covered by the `PositionRecalculationTests`
+idempotency cases (duplicate apply, restart/retry, rollback-then-retry, and a
+concurrent race).
 
 `unrealized_pnl` on `Positions` is still not maintained by the recalculation
 logic - it needs a live market price, which the service doesn't have. It's
@@ -216,9 +259,11 @@ change any of that; the split is the same, and so is the identifier gap.
   described.
 - `qty` in every database table vs. `Volume` / `Quantity` on the C#
   `Order` / `MyTrade` objects. Never fully reconciled in the storage layer - by
-  the time anyone noticed, the column name was baked into the schema - though
-  the order-qty *rule* is now unified at the canonical level (the SQL
-  `max_order_qty` and the C# `RiskOrderVolumeRule` are the same check).
+  the time anyone noticed, the column name was baked into the schema. The
+  order-qty *check* means the same thing on both sides now (the retired SQL
+  `max_order_qty` and the C# `RiskOrderVolumeRule`), but that is a shared
+  *meaning*, not one shared implementation: the gate evaluates it through the
+  canonical convention while `RiskOrderVolumeRule` keeps its own configured value.
 - `Orders.external_transaction_id` exists to let a support engineer correlate a
   row back to the in-memory `Order.TransactionId`, but it's nullable and was
   never back-filled for anything inserted before it was added.
@@ -232,13 +277,13 @@ change any of that; the split is the same, and so is the identifier gap.
 One command, from the repository root:
 
 ```bash
-docker-compose up
+docker compose up
 ```
 
 That brings up two services. The `db` service is `postgres:16`; on first init
 it auto-runs the `Database/*.sql` scripts (mounted read-only into
 `/docker-entrypoint-initdb.d`) in alphabetical order -
-`001_Schema.sql` → `003_Triggers.sql` → `004_SeedData.sql` → `005_AppRole.sql`
+`001_Schema.sql` → `003_Triggers.sql` → `004_SeedData.sql`
 - and only reports healthy once it's actually accepting TCP connections, gated
 by a `pg_isready` healthcheck. The `app` service (the console demo, built from
 the repo-root `Dockerfile`) waits for `db` to become *healthy*
@@ -250,24 +295,34 @@ reads the `STOCKSHARP_LEGACY_SQL_CONNECTION` environment variable and falls back
 to a local PostgreSQL string when it's unset. That variable name was
 **retained** across the SQL Server → PostgreSQL move on purpose - renaming it
 would have been a bigger change than the migration warranted. Inside
-`docker-compose` the `app` service sets it to point at the `db` service by its
+`docker compose` the `app` service sets it to point at the `db` service by its
 Compose DNS name:
 
 ```
-Host=db;Port=5432;Database=stocksharp;Username=app_user;Password=app_pw;GSS Encryption Mode=Disable
+Host=db;Port=5432;Database=stocksharp;Username=postgres;Password=postgres;GSS Encryption Mode=Disable
 ```
 
-Those are dev-only credentials, deliberately not secret. The demo authenticates
-as the least-privilege `app_user` role that `005_AppRole.sql` provisions (DML on
-the seven tables, nothing more); the bootstrap `postgres` superuser is used only
-to run the init scripts and the healthcheck. `Database/README.md` is the
-authoritative reference for the compose commands, the two-role setup, and the
-`docker-compose down -v` re-init trick.
+Those are dev-only credentials, deliberately not secret. Per the frozen AAP
+(0.4.2) the app connects with the `db` service's `POSTGRES_USER` /
+`POSTGRES_PASSWORD` - the single `postgres` role that also runs the init scripts
+and the healthcheck; there is no separate application role or extra init script.
+`Database/README.md` is the authoritative reference for the compose commands, the
+single-role setup, and the `docker compose down -v` re-init trick.
+
+One repeatability note: the demo's exact output assumes a **clean** database.
+Because the `pgdata` volume persists between runs, re-running the demo (or the
+`app` service) against an already-seeded database accumulates the position (qty
+100 → 200 → …) and the repeated submissions can trip the seeded 5-orders /
+60-seconds frequency limit, changing the order ids and the accept/reject
+outcomes. Run `docker compose down -v` immediately before any run whose output
+you want to reproduce exactly.
 
 Every scenario described above - accept within limits, reject-by-price (with a
-reason), reject-by-frequency, a recorded trade triggering the position recalc,
-and a status change writing an `OrderStatusHistory` audit row - has been run
-end to end against a real containerized PostgreSQL 16 instance while building
-this, not just reviewed by eye. `Samples/08_Misc/03_LegacySqlDemo` is the
-runnable walkthrough, and the captured evidence (screenshots and recordings)
-lives under `QA/`.
+reason), reject-by-frequency, a recorded trade driving the position recalc, and a
+status change writing an `OrderStatusHistory` audit row - is exercised by the
+automated suites in `Tests/` (`PreTradeRiskParityTests`, `PositionRecalculationTests`)
+against a real containerized PostgreSQL 16 instance, and by the runnable
+`Samples/08_Misc/03_LegacySqlDemo` walkthrough. Those passing suites and the demo
+run are the evidence of record; `QA/` holds captured artifacts (screenshots and
+transcripts) from real runs, indexed by `QA/README.md`, as an illustration of
+that - not as a stand-in for the tests.

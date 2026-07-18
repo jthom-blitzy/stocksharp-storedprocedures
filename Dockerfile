@@ -6,7 +6,7 @@
 # image is launched by the repository-root docker-compose.yml
 #   build: { context: ., dockerfile: Dockerfile }
 # alongside a postgres:16 service, so the whole stack starts with a single
-# `docker-compose up`.
+# `docker compose up`.
 #
 # Design (Agent Action Plan 0.3.2 / 0.5.1):
 #   * Multi-stage build: .NET 10 SDK builder -> lightweight .NET 10 runtime.

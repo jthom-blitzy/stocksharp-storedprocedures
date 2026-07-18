@@ -81,7 +81,7 @@ public readonly struct GateInputs
 	/// <summary>Current signed position quantity for (portfolio, security); 0 when no position row exists yet.</summary>
 	public decimal CurrentPositionQty { get; init; }
 
-	/// <summary>Existing gross notional over the portfolio (SUM of positions.cumulative_gross_notional); 0 when none.</summary>
+	/// <summary>Existing gross notional over the portfolio (exact SUM(t.qty * t.price) over the portfolio's trades); 0 when none.</summary>
 	public decimal ExistingGrossNotional { get; init; }
 
 	/// <summary>Best-effort last traded price for the security, used only to estimate a market order's commission; may be <see langword="null"/>.</summary>
@@ -182,6 +182,13 @@ public sealed class PreTradeRiskService
 	/// </returns>
 	public static PreTradeRiskResult EvaluateGate(in GateInputs g)
 	{
+		// --- 0. Structural guard: a supplied price must be strictly positive (M11) ---
+		// Mirrors the CK_Orders_price schema constraint and the ValidateAsync guard, so a zero/negative price
+		// is rejected before any ceiling check and can never bypass the price / notional / commission gates.
+		// A market order (Price is null) has no price and is unaffected.
+		if (g.Price is not null && g.Price.Value <= 0m)
+			return PreTradeRiskResult.Reject($"Invalid price {g.Price.Value.To<string>()}");
+
 		// --- 1. Order price ceiling (mirrors RiskOrderPriceRule; rejects when price >= limit) ---
 		// Shared CanonicalRiskRules.MeetsOrExceeds embeds the canonical enabled-limit guard (present AND > 0,
 		// so NULL or 0 = unlimited), so a breach guarantees MaxOrderPrice.HasValue.
@@ -238,8 +245,8 @@ public sealed class PreTradeRiskService
 		{
 			var rate = g.CommissionRate ?? 0m; // commission_rate is NOT NULL in the schema, so present when a limit row exists.
 			var estPrice = g.Price ?? g.LastTradePrice; // quantised limit price, else the market fallback (already 4-dp).
-			var existingNotional = QuantizeToScale(g.ExistingGrossNotional);
-			var est = QuantizeToScale(existingNotional * rate + g.Qty * (estPrice ?? 0m) * rate);
+			var existingNotional = CanonicalRiskRules.QuantizeToScale(g.ExistingGrossNotional);
+			var est = CanonicalRiskRules.QuantizeToScale(existingNotional * rate + g.Qty * (estPrice ?? 0m) * rate);
 			if (CanonicalRiskRules.MeetsOrExceeds(est, g.MaxCommissionTotal))
 				return PreTradeRiskResult.Reject(
 					$"Estimated cumulative commission {est.To<string>()} meets/exceeds limit {g.MaxCommissionTotal.Value.To<string>()}");
@@ -328,7 +335,7 @@ public sealed class PreTradeRiskService
 		// Matching that here makes the gate's accept/reject decision on exactly the value Postgres will persist into
 		// the NUMERIC(18,4) column, so a >4-dp input can no longer be accepted on its full-precision value yet stored
 		// at (or above) a ceiling it should have met. Away-from-zero rounding is never LESS strict (hard NFR, AAP 0.6.4).
-		var q = QuantizeToScale(qty.Value);
+		var q = CanonicalRiskRules.QuantizeToScale(qty.Value);
 
 		if (q <= 0m)
 			return PreTradeRiskResult.Reject("Invalid qty");
@@ -336,7 +343,14 @@ public sealed class PreTradeRiskService
 		// Quantise the limit price to the same NUMERIC(18,4) scale (a market order has no price => null). Every
 		// downstream check and reject message uses this quantised price, not the raw parameter, for the same
 		// decision-matches-persistence reason (F5).
-		var priceQ = price.HasValue ? (decimal?)QuantizeToScale(price.Value) : null;
+		var priceQ = price.HasValue ? (decimal?)CanonicalRiskRules.QuantizeToScale(price.Value) : null;
+
+		// M11: a supplied price must be strictly positive. Guard here (before any RiskLimits read), mirroring
+		// the qty guard and the CK_Orders_price schema constraint, so a zero/negative price is rejected up
+		// front rather than silently bypassing the price / notional / commission ceilings. A market order
+		// (priceQ is null) is unaffected. EvaluateGate re-checks this so the pure-logic parity tests cover it too.
+		if (priceQ is not null && priceQ.Value <= 0m)
+			return PreTradeRiskResult.Reject($"Invalid price {priceQ.Value.To<string>()}");
 
 		// --- Most-specific RiskLimits row selection ---
 		// Prefer portfolio+security, then portfolio-only, then security-only; newest effective_date wins.
@@ -365,7 +379,10 @@ public sealed class PreTradeRiskService
 			"CASE WHEN portfolio_id IS NOT NULL AND security_id IS NOT NULL THEN 0 " +
 			"WHEN portfolio_id IS NOT NULL THEN 1 " +
 			"ELSE 2 END, " +
-			"effective_date DESC " +
+			"effective_date DESC, " +
+			// Deterministic final tie-break: two equal-specificity rows with the SAME effective_date would
+			// otherwise return an arbitrary winner. risk_limit_id DESC picks the most recently inserted row.
+			"risk_limit_id DESC " +
 			"LIMIT 1";
 
 		using (var limitsCommand = new NpgsqlCommand(limitsSql, connection, transaction))
@@ -448,9 +465,13 @@ public sealed class PreTradeRiskService
 		}
 
 		// 6. cumulative commission estimate: last traded price (market order only) + existing gross notional.
-		//    existingGrossNotional is a BOUNDED rollup SUM(cumulative_gross_notional) over the portfolio's
-		//    positions rows (maintained by PositionRecalculationService under the single-apply invariant), equal
-		//    to the retired unbounded SUM(t.qty*t.price) over the portfolio's trades. SUM is NULL => 0.
+		//    existingGrossNotional is the EXACT SUM(t.qty * t.price) over the portfolio's Trades
+		//    (join Trades -> Orders, portfolio-wide across all securities), reproducing the retired
+		//    usp_ValidatePreTradeRisk @existingNotional at full NUMERIC precision (PostgreSQL evaluates the
+		//    NUMERIC product and its SUM without intermediate rounding). It is read directly from Trades
+		//    rather than a maintained rollup column: a NUMERIC(18,4) rollup would round each contribution to
+		//    four decimals before summing (0.00000001 -> 0.0000) and could under-state the gross, letting the
+		//    commission ceiling stop triggering (a loosening forbidden by AAP 0.6.4). SUM is NULL => 0.
 		var existingGrossNotional = 0m;
 		decimal? lastTradePrice = null;
 		if (CanonicalRiskRules.IsCeilingEnabled(maxCommissionTotal))
@@ -458,9 +479,11 @@ public sealed class PreTradeRiskService
 			if (priceQ is null)
 			{
 				// Market order: best-effort last traded price for the security (may stay null if it never traded).
+				// executed_date can tie (same-instant fills); trade_id DESC is the authoritative secondary key so a
+				// tie deterministically picks the newest trade (the highest identity) rather than an arbitrary row.
 				using var lastTradeCommand = new NpgsqlCommand(
 					"SELECT t.price FROM trades t JOIN orders o ON o.order_id = t.order_id " +
-					"WHERE o.security_id = @security_id ORDER BY t.executed_date DESC LIMIT 1", connection, transaction);
+					"WHERE o.security_id = @security_id ORDER BY t.executed_date DESC, t.trade_id DESC LIMIT 1", connection, transaction);
 				lastTradeCommand.Parameters.Add(new NpgsqlParameter("security_id", NpgsqlDbType.Integer) { Value = securityId });
 
 				var lastPriceResult = await lastTradeCommand.ExecuteScalarAsync(cancellationToken);
@@ -468,8 +491,10 @@ public sealed class PreTradeRiskService
 					lastTradePrice = lastPrice;
 			}
 
+			// Exact portfolio-wide gross from Trades (parity with the retired proc), NOT a rounded rollup (AAP 0.6.4 / C5).
 			using var notionalCommand = new NpgsqlCommand(
-				"SELECT SUM(cumulative_gross_notional) FROM positions WHERE portfolio_id = @portfolio_id", connection, transaction);
+				"SELECT SUM(t.qty * t.price) FROM trades t JOIN orders o ON o.order_id = t.order_id " +
+				"WHERE o.portfolio_id = @portfolio_id", connection, transaction);
 			notionalCommand.Parameters.Add(new NpgsqlParameter("portfolio_id", NpgsqlDbType.Integer) { Value = portfolioId });
 			existingGrossNotional = await ExecuteDecimalScalarAsync(notionalCommand, 0m, cancellationToken);
 		}
@@ -531,14 +556,7 @@ public sealed class PreTradeRiskService
 		return result is decimal value ? value : defaultValue;
 	}
 
-	// F5 helper: rounds a decimal to the schema's NUMERIC(18,4) scale using away-from-zero (half-up) rounding - the
-	// exact coercion the retired proc applied by declaring @qty/@price/@max_*/@estCommission as DECIMAL(18,4), and the
-	// same rounding Postgres uses when persisting into a NUMERIC(18,4) column. Quantising the gate's inputs and money
-	// intermediates to this scale keeps the accept/reject decision consistent with the value that is actually stored,
-	// so a >4-dp input can no longer be accepted on its full-precision value yet persisted at (or above) a ceiling it
-	// should have met. Rounding to a fixed scale away from zero is never LESS strict (hard NFR, AAP 0.6.4).
-	private const int NumericScale = 4;
-
-	private static decimal QuantizeToScale(decimal value)
-		=> Math.Round(value, NumericScale, MidpointRounding.AwayFromZero);
+	// Numeric quantization now lives in CanonicalRiskRules.QuantizeToScale (the single canonical NUMERIC(18,4)
+	// rounding shared with the data-access gateway), so the gate DECIDES on exactly the value PostgreSQL PERSISTS
+	// and the gateway binds that same normalized value (decision == persistence, F5 / M12 / AAP 0.6.4).
 }

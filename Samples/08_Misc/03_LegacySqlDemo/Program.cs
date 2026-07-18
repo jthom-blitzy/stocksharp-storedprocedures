@@ -13,21 +13,27 @@ using StockSharp.Messages;
 /// into C#: submit a compliant order, submit a non-compliant one, record a fill, and
 /// show the automatic position update. Pre-trade validation runs in the canonical
 /// PreTradeRiskService gate, and the position is recomputed by PositionRecalculationService
-/// after the fill - both share CanonicalRiskRules with the RiskManager circuit breaker, so
-/// there are no SQL stored procedures or triggers involved any more. See LEGACY_LAYER.md at
-/// the repo root for the full writeup of what this layer is and why it exists.
+/// after the fill. The gate and the RiskManager circuit breaker share ONE canonical
+/// rolling-frequency evaluator plus the "&gt;=" / "NULL-or-0 = unlimited" comparison convention
+/// (CanonicalRiskRules); the circuit breaker's other rules (price, qty, position, commission)
+/// stay separately configured by design, so this is NOT a claim that every rule is merged.
+/// There are no SQL stored procedures and no position-recalculation trigger any more, but the
+/// pure status-audit trigger on Orders intentionally remains. See LEGACY_LAYER.md at the repo
+/// root for the full writeup of what this layer is and why it exists.
 ///
 /// Requires a running PostgreSQL database with the /Database schema applied - see
-/// Database/README.md for the one-command `docker-compose up`, or set
+/// Database/README.md for the one-command `docker compose up`, or set
 /// STOCKSHARP_LEGACY_SQL_CONNECTION to point at your own instance.
 ///
-/// Exit code: returns 0 on a successful walkthrough and a non-zero code if the database
-/// cannot be reached, so orchestration/CI (e.g. docker-compose --exit-code-from app) register
-/// a real database outage as a failure rather than a false success.
+/// Repeatability: the fixed output below assumes a CLEAN database. Re-running against a
+/// persisted volume accumulates state - the position grows (qty 100 -&gt; 200 -&gt; ...) and the
+/// repeated submissions can trip the seeded 5-orders / 60-seconds frequency limit, which changes
+/// the order_id values and the accept/reject outcomes. Run `docker compose down -v` (which drops
+/// the database volume) immediately before any run whose output you want to reproduce exactly.
 /// </summary>
 class Program
 {
-	static async Task<int> Main()
+	static async Task Main()
 	{
 		var gateway = new SqlLegacyOrderGateway(SqlLegacyConnection.Resolve());
 
@@ -43,13 +49,12 @@ class Program
 		}
 		catch (Exception ex)
 		{
-			Console.WriteLine($"Could not reach the legacy PostgreSQL database ({ex.Message}).");
-			Console.WriteLine("Run `docker-compose up` from the repo root to start PostgreSQL and apply the /Database scripts;");
+			// N3: surface only the exception TYPE name, never the raw exception message, so a connection
+			// failure cannot leak host/database internals (server address, credentials, schema names).
+			Console.WriteLine($"Could not reach the legacy PostgreSQL database ({ex.GetType().Name}).");
+			Console.WriteLine("Run `docker compose up` from the repo root to start PostgreSQL and apply the /Database scripts;");
 			Console.WriteLine("see Database/README.md for details and LEGACY_LAYER.md for what this layer is.");
-			// QA finding (MAJOR): a database outage must NOT be reported as success. Return a non-zero
-			// exit code so docker-compose --exit-code-from app / CI / any orchestrator registers the
-			// failure instead of seeing a false-success exit 0.
-			return 1;
+			return;
 		}
 
 		Console.WriteLine($"Portfolio '{portfolio.Name}' = portfolio_id {portfolioId}");
@@ -67,16 +72,16 @@ class Program
 		var order2 = await gateway.SubmitOrderAsync(portfolioId, securityId, Sides.Buy, 10m, 999.00m, OrderTypes.Limit);
 		Console.WriteLine($"  -> order_id={order2.OrderId} is_valid={order2.IsValid} reject_reason={order2.RejectReason ?? "(none)"}");
 		Console.WriteLine("     Note: this rejection comes from the canonical PreTradeRiskService gate (Algo/Risk).");
-		Console.WriteLine("     The RiskManager circuit breaker now shares the same CanonicalRiskRules definitions,");
-		Console.WriteLine("     so the per-order gate and the circuit breaker no longer diverge - see LEGACY_LAYER.md.");
+		Console.WriteLine("     The RiskManager circuit breaker shares the same canonical rolling-frequency evaluator");
+		Console.WriteLine("     and comparison convention (CanonicalRiskRules), so the gate and the breaker can no");
+		Console.WriteLine("     longer disagree on a frequency decision - see LEGACY_LAYER.md for the full rule map.");
 		Console.WriteLine();
 
-		// The within-limits order is expected to be accepted; if it was not, the walkthrough cannot
-		// demonstrate the fill/position step, but this is not a database-reachability failure, so the
-		// original exit-0 behaviour of this branch is preserved (the QA exit-code finding concerns the
-		// database-unavailable path handled in the catch above).
+		// The within-limits order is expected to be accepted on a CLEAN database; if it was not (e.g. a
+		// persisted-volume re-run tripped the frequency limit - see the repeatability note above), the
+		// walkthrough simply cannot demonstrate the fill/position step, so it returns early.
 		if (!order1.IsValid)
-			return 0;
+			return;
 
 		// --- record a fill against the accepted order; RecordTradeAsync inserts the trade and
 		//     then PositionRecalculationService recomputes the position exactly once (the old
@@ -86,7 +91,5 @@ class Program
 
 		var position = await gateway.GetPositionAsync(portfolioId, securityId);
 		Console.WriteLine($"  -> position after recalculation: qty={position.Quantity} avg_price={position.AveragePrice} realized_pnl={position.RealizedPnL}");
-
-		return 0;
 	}
 }

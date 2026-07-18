@@ -16,11 +16,21 @@ using NpgsqlTypes;
 /// both double-counted a trade's effect on a position. In the consolidated design the trigger is removed
 /// and the data-access gateway inserts each trade with a fresh unique <c>trade_id</c> and calls
 /// <see cref="ApplyAsync"/> exactly once for it, WITHIN the same gateway-owned transaction that carries the
-/// trade INSERT, so a trade and its position effect commit together or not at all. That structural
-/// exactly-once-per-committed-trade guarantee - not a database ledger table - is what upholds the
-/// single-apply invariant (AAP 0.6.5); <see cref="ApplyAsync"/> additionally keeps an in-process
-/// best-effort guard (see the <c>_appliedTradeIds</c> field) so an accidental repeat call for the SAME
-/// <c>trade_id</c> within this process is an idempotent no-op.
+/// trade INSERT, so a trade and its position effect commit together or not at all.
+/// </para>
+/// <para>
+/// Single-apply is enforced DURABLY, not by an in-process guard: each trades row carries a
+/// <c>position_applied</c> flag, and <see cref="ApplyAsync"/> flips it FALSE-&gt;TRUE with a conditional
+/// <c>UPDATE ... WHERE trade_id = @id AND NOT position_applied</c> in the SAME transaction as the position
+/// write. If that UPDATE affects zero rows the trade was already applied, so the call is an idempotent
+/// no-op. Because the flag is persisted and marked in the same commit, the guarantee is exactly-once PER
+/// PERSISTED trade_id and survives process restarts and holds across instances (a replay of a committed
+/// trade_id sees TRUE), and a rolled-back attempt undoes both the mark and the position write together.
+/// <see cref="ApplyAsync"/> therefore requires a PERSISTED trade_id (the gateway guarantees this via
+/// <c>INSERT ... RETURNING trade_id</c>). NOTE (boundary): the guarantee is keyed on the DB trade_id, not
+/// on an external fill id; if the SAME real-world fill were reported twice as two separate gateway calls it
+/// would receive two distinct trade_ids and apply twice. De-duplicating that would need a stable external
+/// idempotency key in the gateway signature, which the frozen public contract (AAP 0.7.1) does not permit.
 /// </para>
 /// <para>
 /// The average-cost arithmetic lives in the pure, static, database-free <see cref="Recalculate"/> method so
@@ -32,17 +42,6 @@ using NpgsqlTypes;
 /// </remarks>
 public sealed class PositionRecalculationService
 {
-	// SINGLE-APPLY invariant (AAP 0.6.5). The AUTHORITATIVE guarantee is STRUCTURAL, not a ledger table: the
-	// gateway inserts every trade with a fresh unique trade_id (INSERT ... RETURNING) and calls ApplyAsync
-	// exactly once for it inside ONE atomic transaction that also carries the trade INSERT, so each COMMITTED
-	// trade is applied exactly once and a rolled-back attempt persists nothing (the gateway retries with a NEW
-	// trade_id, never reusing a rolled-back one). This in-process set is an ADDITIONAL best-effort guard that
-	// turns an accidental repeat ApplyAsync call for the SAME trade_id within this process into a no-op; it is
-	// recorded only AFTER the apply's DB work completes, and because a rolled-back trade_id is never reused a
-	// stale entry can never suppress a needed apply. Guarded by _sync since one gateway instance may drive
-	// concurrent applies on different connections.
-	private readonly HashSet<long> _appliedTradeIds = new();
-	private readonly object _sync = new();
 
 	// Injectable UTC clock: mirrors the SQL SYSUTCDATETIME() / Postgres now() at time zone 'utc' time source
 	// used to stamp positions.updated_date, and makes those timestamps deterministic under test.
@@ -189,17 +188,10 @@ public sealed class PositionRecalculationService
 		if (tradePrice <= 0m)
 			throw new ArgumentOutOfRangeException(nameof(tradePrice), tradePrice, "Trade price must be strictly positive.");
 
-		// In-process best-effort single-apply guard (see the _appliedTradeIds field note): a repeat call for the
-		// same trade_id within this process is an idempotent no-op. The authoritative guarantee remains the
-		// gateway's atomic transaction + fresh-trade_id-per-commit, so this never masks a needed apply.
-		lock (_sync)
-		{
-			if (_appliedTradeIds.Contains(tradeId))
-				return;
-		}
-
 		// Every command below runs on the caller's connection + transaction; this method NEVER begins, commits,
 		// or rolls back (the gateway owns that), so the trade INSERT and this position write are one atomic unit.
+		// The DURABLE single-apply guard (the conditional UPDATE of trades.position_applied) lives AFTER
+		// order-resolution and the advisory lock below - see that block for the full C3 idempotency contract.
 
 		// Look up the order to resolve the (portfolio, security, side) the trade affects. Throw when the order
 		// is missing rather than silently no-op, matching the SQL RAISERROR in the retired proc; the caller's
@@ -225,19 +217,44 @@ public sealed class PositionRecalculationService
 			side = orderReader.GetString(2).Trim();
 		}
 
-		// Serialize every apply for this (portfolio, security) with a TRANSACTION-SCOPED advisory lock on the
-		// caller's transaction, held until the gateway commits/rolls back. Unlike SELECT ... FOR UPDATE it locks
-		// even when no positions row exists yet, so two concurrent trades on the same instrument cannot both read
-		// the same base position and lose one update (fixes the concurrent lost-update): the second apply blocks
-		// here, then reads the first apply's committed result. portfolio_id/security_id are INT -> the (int,int)
-		// overload of pg_advisory_xact_lock. The second key is the real security_id (>= 1); the order-submission
-		// gate locks (portfolio, 0), so these two advisory-lock spaces never collide.
+		// Serialize every apply for this portfolio with a TRANSACTION-SCOPED advisory lock on the caller's
+		// transaction, held until the gateway commits/rolls back. Unlike SELECT ... FOR UPDATE it locks even when
+		// no positions row exists yet, so two concurrent trades cannot both read the same base position and lose
+		// one update (fixes the concurrent lost-update): the second apply blocks here, then reads the first
+		// apply's committed result. C4 fix: this uses the SAME single-key pg_advisory_xact_lock(bigint) space,
+		// keyed on portfolio_id, as the pre-trade gate in SqlLegacyOrderGateway.SubmitOrderAsync. The previous
+		// (int,int) overload keyed on (portfolio, security) occupied a DIFFERENT PostgreSQL advisory-lock space
+		// from the gate's single-key lock, so a submit and a recalculate on the same portfolio did NOT mutually
+		// exclude; unifying on the one-arg bigint overload (portfolio_id widened to bigint) restores a single
+		// coherent lock hierarchy per portfolio across both services.
 		using (var lockCommand = new NpgsqlCommand(
-			"SELECT pg_advisory_xact_lock(@portfolio_id, @security_id)", connection, transaction))
+			"SELECT pg_advisory_xact_lock(@portfolio_id)", connection, transaction))
 		{
-			lockCommand.Parameters.Add(new NpgsqlParameter("portfolio_id", NpgsqlDbType.Integer) { Value = portfolioId });
-			lockCommand.Parameters.Add(new NpgsqlParameter("security_id", NpgsqlDbType.Integer) { Value = securityId });
+			lockCommand.Parameters.Add(new NpgsqlParameter("portfolio_id", NpgsqlDbType.Bigint) { Value = (long)portfolioId });
 			await lockCommand.ExecuteNonQueryAsync(cancellationToken);
+		}
+
+		// DURABLE single-apply guard (C3): atomically claim this persisted trade for position application by
+		// flipping trades.position_applied FALSE -> TRUE in the caller's transaction. Because the row is locked
+		// by this UPDATE until the gateway commits, and because the portfolio advisory lock above serializes
+		// same-portfolio applies, a concurrent or repeated apply of the SAME trade_id (another instance, a
+		// restart, or a retry) sees the row already TRUE and the UPDATE affects 0 rows -> idempotent no-op
+		// return, so the position is applied EXACTLY ONCE per persisted trade_id and the effect commits in the
+		// same transaction as the flag. This replaces the former in-process HashSet, which could not survive a
+		// process restart nor coordinate across instances. The trade row must already be persisted (the gateway
+		// INSERTs it immediately before calling this), so a 0-row result here means "already applied", never
+		// "unknown trade". Residual boundary: the SAME external fill reported twice becomes two DISTINCT
+		// trade_ids and both apply - de-duplicating that needs an external-fill id the frozen public contract
+		// (AAP 0.7.1) does not carry, so it is intentionally out of scope.
+		using (var claimCommand = new NpgsqlCommand(
+			"UPDATE trades SET position_applied = TRUE WHERE trade_id = @trade_id AND NOT position_applied", connection, transaction))
+		{
+			claimCommand.Parameters.Add(new NpgsqlParameter("trade_id", NpgsqlDbType.Bigint) { Value = tradeId });
+
+			var claimed = await claimCommand.ExecuteNonQueryAsync(cancellationToken);
+
+			if (claimed == 0)
+				return;
 		}
 
 		// Load the existing position for (portfolio, security); default to a flat 0/0/0 when none exists yet
@@ -268,27 +285,22 @@ public sealed class PositionRecalculationService
 		var (newQty, newAvgPrice, newRealizedPnl) = Recalculate(
 			existingQty, existingAvgPrice, existingRealizedPnl, side, tradeQty, tradePrice);
 
-		// This trade's gross notional (F13): abs(qty) * price. tradeQty is validated > 0 above, so abs(tradeQty)
-		// == tradeQty; kept as decimal so the running rollup preserves NUMERIC(18,4) scale exactly.
-		var tradeGrossNotional = tradeQty * tradePrice;
-
 		// UPSERT the position on the positions (portfolio_id, security_id) unique constraint.
 		// unrealized_pnl requires a live market price and is end-of-day only; the proc never maintained it, so
 		// the INSERT path seeds it to 0 and the DO UPDATE path deliberately OMITS it (existing value left
 		// UNTOUCHED, AAP 0.6.5). qty / avg_price / realized_pnl use an absolute SET (the advisory lock serializes
-		// read-recompute-write per (portfolio, security), so newQty already reflects any concurrent apply's
-		// committed result). cumulative_gross_notional is instead ACCUMULATED (existing + this trade's gross) so
-		// the pre-trade commission gate can read a bounded SUM over the portfolio's positions rows rather than
-		// re-summing every historical trade (F13); the single-apply invariant makes that rollup equal
-		// SUM(qty*price) over the portfolio's trades exactly.
+		// read-recompute-write per portfolio, so newQty already reflects any concurrent apply's committed
+		// result). C5 fix: there is deliberately NO cumulative_gross_notional rollup column here - accumulating
+		// per-trade gross into a NUMERIC(18,4) store rounds each addend to 4dp and can drift from the true total,
+		// silently loosening the pre-trade commission gate. The gate instead computes exact SUM(t.qty * t.price)
+		// straight from the trades rows (PreTradeRiskService), so no lossy rollup is maintained.
 		const string upsertSql =
-			"INSERT INTO positions (portfolio_id, security_id, qty, avg_price, realized_pnl, unrealized_pnl, cumulative_gross_notional, updated_date) " +
-			"VALUES (@portfolio_id, @security_id, @qty, @avg_price, @realized_pnl, 0, @gross_notional, @updated_date) " +
+			"INSERT INTO positions (portfolio_id, security_id, qty, avg_price, realized_pnl, unrealized_pnl, updated_date) " +
+			"VALUES (@portfolio_id, @security_id, @qty, @avg_price, @realized_pnl, 0, @updated_date) " +
 			"ON CONFLICT (portfolio_id, security_id) DO UPDATE " +
 			"SET qty = EXCLUDED.qty, " +
 			"avg_price = EXCLUDED.avg_price, " +
 			"realized_pnl = EXCLUDED.realized_pnl, " +
-			"cumulative_gross_notional = positions.cumulative_gross_notional + EXCLUDED.cumulative_gross_notional, " +
 			"updated_date = EXCLUDED.updated_date";
 
 		using (var upsertCommand = new NpgsqlCommand(upsertSql, connection, transaction))
@@ -299,9 +311,6 @@ public sealed class PositionRecalculationService
 			upsertCommand.Parameters.Add(new NpgsqlParameter("qty", NpgsqlDbType.Numeric) { Value = newQty });
 			upsertCommand.Parameters.Add(new NpgsqlParameter("avg_price", NpgsqlDbType.Numeric) { Value = newAvgPrice });
 			upsertCommand.Parameters.Add(new NpgsqlParameter("realized_pnl", NpgsqlDbType.Numeric) { Value = newRealizedPnl });
-			// EXCLUDED.cumulative_gross_notional carries this trade's gross; the DO UPDATE adds it to the stored
-			// value (NUMERIC(18,4), decimal-exact). On the INSERT path the stored value starts at this gross.
-			upsertCommand.Parameters.Add(new NpgsqlParameter("gross_notional", NpgsqlDbType.Numeric) { Value = tradeGrossNotional });
 			// positions.updated_date is timestamp WITHOUT time zone holding UTC; Npgsql rejects a DateTime with
 			// Kind=Utc bound to that type, so normalise to Unspecified and bind explicitly as NpgsqlDbType.Timestamp.
 			upsertCommand.Parameters.Add(new NpgsqlParameter("updated_date", NpgsqlDbType.Timestamp)
@@ -310,14 +319,6 @@ public sealed class PositionRecalculationService
 			});
 
 			await upsertCommand.ExecuteNonQueryAsync(cancellationToken);
-		}
-
-		// Record this trade_id as applied AFTER its DB work has completed (there is NO commit here - the gateway
-		// owns the commit). A rolled-back gateway transaction is retried with a NEW trade_id, so this entry is
-		// never wrongly reused and can never suppress a needed apply.
-		lock (_sync)
-		{
-			_appliedTradeIds.Add(tradeId);
 		}
 	}
 }
