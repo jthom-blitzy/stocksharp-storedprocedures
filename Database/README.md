@@ -46,12 +46,13 @@ Omit `-v` to stop the containers but keep the data (the init scripts will *not* 
 `Algo/Storages/Sql/SqlLegacyConnection.Resolve()` reads the `STOCKSHARP_LEGACY_SQL_CONNECTION` environment variable and, when it is unset (null / empty / whitespace-only), falls back to a local-dev PostgreSQL connection string:
 
 ```
-Host=localhost;Port=5432;Database=stocksharp;Username=postgres;Password=postgres;GSS Encryption Mode=Disable
+Host=localhost;Port=5432;Database=stocksharp;Username=postgres;Password=postgres;GSS Encryption Mode=Disable;Maximum Pool Size=50
 ```
 
 - Inside `docker compose`, the `app` service **overrides** this by setting `STOCKSHARP_LEGACY_SQL_CONNECTION` with `Host=db` — the compose *service name* — instead of `localhost`, so the app reaches the database over the compose network rather than the published host port.
 - The stack uses a **single role** (local-development only, deliberately not secret): `postgres` / `postgres`, the database's `POSTGRES_USER` / `POSTGRES_PASSWORD`. It runs the init scripts and the healthcheck and — per the frozen AAP (0.4.2), which has the application connect with `POSTGRES_USER` / `POSTGRES_PASSWORD` — is also the role the `app` service uses. Both the in-compose connection string and the host fallback above therefore use `Username=postgres;Password=postgres`.
 - `GSS Encryption Mode=Disable` stops Npgsql from probing for a Kerberos/GSSAPI library on this password-authenticated local stack (none is installed), which would otherwise emit a noisy connect-time error.
+- `Maximum Pool Size=50` bounds the Npgsql connection pool (default 100) so a single saturated app instance holds at most 50 of the server's `max_connections=200` slots, leaving headroom for a second instance, admin tooling, and the healthcheck. The in-compose `app` connection string sets the same cap, so a host-run demo behaves like the containers.
 
 Prefer setting the environment variable to point at a different instance rather than editing the fallback in source.
 

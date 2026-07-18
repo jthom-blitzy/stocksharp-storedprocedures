@@ -120,11 +120,17 @@ public class SqlLegacyOrderGateway
 		// declared NULLS NOT DISTINCT so a NULL board_code participates in the uniqueness check - reproducing
 		// the old "@board IS NULL AND board_code IS NULL" match, preventing duplicate (code, NULL board) rows,
 		// AND folding case so ensuring 'aapl' after 'AAPL' resolves to the SAME row (SQL Server CI parity).
-		// DO UPDATE (a no-op touch of security_code) guarantees a RETURNING row on an existing match, where
-		// DO NOTHING would return none. T-SQL "OUTPUT INSERTED.security_id" -> Postgres "RETURNING security_id".
+		// DO UPDATE re-sets security_code to its EXISTING stored value (SET security_code = securities.security_code),
+		// making the update a true no-op that PRESERVES the originally stored casing while still guaranteeing a
+		// RETURNING row on an existing match (DO NOTHING would return none). This deliberately mirrors
+		// EnsurePortfolioAsync above: using EXCLUDED.security_code here would rewrite the persisted display casing
+		// on a live case-variant repeat (e.g. ensuring 'aapl' after 'AAPL' would overwrite the stored 'AAPL'),
+		// which the QA Final-Acceptance reconciliation flagged - case-insensitive identity resolution must resolve
+		// to the SAME row WITHOUT mutating the stored casing. T-SQL "OUTPUT INSERTED.security_id" -> Postgres
+		// "RETURNING security_id".
 		await using var command = new NpgsqlCommand(
 			"INSERT INTO securities (security_code, board_code, security_type) VALUES (@code, @board, @type) " +
-			"ON CONFLICT (LOWER(security_code), LOWER(board_code)) DO UPDATE SET security_code = EXCLUDED.security_code " +
+			"ON CONFLICT (LOWER(security_code), LOWER(board_code)) DO UPDATE SET security_code = securities.security_code " +
 			"RETURNING security_id", connection);
 		command.Parameters.Add(new NpgsqlParameter("code", NpgsqlDbType.Varchar) { Value = security.Code });
 		command.Parameters.Add(new NpgsqlParameter("board", NpgsqlDbType.Varchar) { Value = (object)boardCode ?? DBNull.Value });

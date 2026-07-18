@@ -323,10 +323,13 @@ would have been a bigger change than the migration warranted. Inside
 Compose DNS name:
 
 ```
-Host=db;Port=5432;Database=stocksharp;Username=postgres;Password=postgres;GSS Encryption Mode=Disable
+Host=db;Port=5432;Database=stocksharp;Username=postgres;Password=postgres;GSS Encryption Mode=Disable;Maximum Pool Size=50
 ```
 
-Those are dev-only credentials, deliberately not secret. Per the frozen AAP
+Those are dev-only credentials, deliberately not secret. `Maximum Pool Size=50`
+bounds the Npgsql pool (default 100) against the `db` service's
+`max_connections=200`, leaving headroom for a second instance, admin tooling, and
+the healthcheck; the host fallback string uses the same cap. Per the frozen AAP
 (0.4.2) the app connects with the `db` service's `POSTGRES_USER` /
 `POSTGRES_PASSWORD` - the single `postgres` role that also runs the init scripts
 and the healthcheck; there is no separate application role or extra init script.

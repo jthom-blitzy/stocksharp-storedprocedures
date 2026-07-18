@@ -111,7 +111,7 @@ PostgreSQL-only — point `STOCKSHARP_LEGACY_SQL_CONNECTION` at a running Postgr
 16 instance (for example the compose `db` service, which publishes `localhost:5432`):
 
 ```bash
-export STOCKSHARP_LEGACY_SQL_CONNECTION="Host=localhost;Port=5432;Database=stocksharp;Username=postgres;Password=postgres"
+export STOCKSHARP_LEGACY_SQL_CONNECTION="Host=localhost;Port=5432;Database=stocksharp;Username=postgres;Password=postgres;GSS Encryption Mode=Disable;Maximum Pool Size=50"
 dotnet test Tests/Tests.csproj
 ```
 
@@ -170,7 +170,7 @@ both engines must be configured and reachable, and the SQL Server target must be
 
    ```bash
    export STOCKSHARP_LEGACY_MSSQL_CONNECTION="Server=localhost,14330;Database=StockSharpLegacyTest;User Id=sa;Password=DevTest_Passw0rd!;TrustServerCertificate=True;"
-   export STOCKSHARP_LEGACY_SQL_CONNECTION="Host=localhost;Port=5432;Database=stocksharp;Username=postgres;Password=postgres"
+   export STOCKSHARP_LEGACY_SQL_CONNECTION="Host=localhost;Port=5432;Database=stocksharp;Username=postgres;Password=postgres;GSS Encryption Mode=Disable;Maximum Pool Size=50"
 
    # Step/Stage 1 — ORIGINAL behavior on SQL Server (golden baseline)
    dotnet test Tests/Tests.csproj --filter "FullyQualifiedName~Step1|FullyQualifiedName~Stage1"
@@ -247,7 +247,7 @@ Source of truth: the repository-root `docker-compose.yml`.
 | Init scripts mount | `./Database` → `/docker-entrypoint-initdb.d:ro` |
 | Healthcheck | `pg_isready -h localhost -U postgres -d stocksharp` |
 | App connection env var | `STOCKSHARP_LEGACY_SQL_CONNECTION` |
-| App connection string | `Host=db;Port=5432;Database=stocksharp;Username=postgres;Password=postgres;GSS Encryption Mode=Disable` |
+| App connection string | `Host=db;Port=5432;Database=stocksharp;Username=postgres;Password=postgres;GSS Encryption Mode=Disable;Maximum Pool Size=50` |
 
 The stack uses a **single role**, `postgres` / `postgres` (a local-development
 credential, deliberately not secret): it runs the init scripts, backs the

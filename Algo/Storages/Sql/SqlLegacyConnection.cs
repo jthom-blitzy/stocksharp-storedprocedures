@@ -15,7 +15,7 @@ public static class SqlLegacyConnection
 	// this name are SqlLegacyConnection.Resolve() (below) and the docker-compose `app` service, which
 	// sets this same variable to the in-container value (the db service's POSTGRES_USER credentials,
 	// GSS disabled; AAP 0.4.2 has the app connect as that role):
-	// Host=db;Port=5432;Database=stocksharp;Username=postgres;Password=postgres;GSS Encryption Mode=Disable
+	// Host=db;Port=5432;Database=stocksharp;Username=postgres;Password=postgres;GSS Encryption Mode=Disable;Maximum Pool Size=50
 	// (db = the compose service name); the fallback below is for a demo run directly on the host.
 	private const string _envVarName = "STOCKSHARP_LEGACY_SQL_CONNECTION";
 
