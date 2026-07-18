@@ -346,6 +346,30 @@ public class PositionRecalculationTests : BaseTestClass
 		return (reader.GetDecimal(0), reader.GetDecimal(1), reader.GetDecimal(2));
 	}
 
+	// Reads the persisted unrealized_pnl for a scope (F-COV-2). Kept separate from ReadPositionAsync so
+	// that helper's tuple shape - relied on by every other Live_* position test - stays unchanged.
+	private static async Task<decimal> ReadUnrealizedPnlAsync(SqlConnection c, SqlTransaction t, int portfolioId, int securityId, CancellationToken ct)
+	{
+		await using var cmd = new SqlCommand(
+			"SELECT unrealized_pnl FROM dbo.Positions WHERE portfolio_id = @p AND security_id = @s", c, t);
+		cmd.Parameters.Add(IntParam("@p", portfolioId));
+		cmd.Parameters.Add(IntParam("@s", securityId));
+
+		return (decimal)await cmd.ExecuteScalarAsync(ct);
+	}
+
+	// Seeds a non-zero unrealized_pnl onto an existing position row (F-COV-2), standing in for the
+	// end-of-day mark-to-market writer that owns this column outside the recalc path.
+	private static async Task SetUnrealizedPnlAsync(SqlConnection c, SqlTransaction t, int portfolioId, int securityId, decimal value, CancellationToken ct)
+	{
+		await using var cmd = new SqlCommand(
+			"UPDATE dbo.Positions SET unrealized_pnl = @u WHERE portfolio_id = @p AND security_id = @s", c, t);
+		cmd.Parameters.Add(Money("@u", value));
+		cmd.Parameters.Add(IntParam("@p", portfolioId));
+		cmd.Parameters.Add(IntParam("@s", securityId));
+		await cmd.ExecuteNonQueryAsync(ct);
+	}
+
 	// Counts how many dbo.Trades rows exist for an order. Used to assert that each RecordTradeAsync call
 	// records a distinct fill: the gateway performs plain CRUD inserts with no server-side de-duplication.
 	private static async Task<int> CountTradesAsync(string connectionString, long orderId)
@@ -607,6 +631,46 @@ public class PositionRecalculationTests : BaseTestClass
 			persisted.Value.Qty.AssertEqual(100m);
 			persisted.Value.Avg.AssertEqual(150m);
 			persisted.Value.Realized.AssertEqual(3000m);
+		});
+
+	[TestMethod]
+	public Task Live_RecomputeUpdatePreservesUnrealizedPnl()
+		=> RunWithFreshScopeAsync(async (svc, c, t, pid, sid) =>
+		{
+			// F-COV-2 (AAP 0.6.4): ApplyTradeAsync persists via an UPDATE that intentionally OMITS
+			// unrealized_pnl (only the INSERT path seeds it to 0). unrealized_pnl stays an end-of-day
+			// mark-to-market concern the recalc path must never touch, so a pre-existing value must survive
+			// a recompute. This pins that invariant across the UPDATE path, which was previously unasserted.
+
+			// Open a long so the position row exists (INSERT path seeds unrealized_pnl = 0).
+			var buy = await InsertOrderAsync(c, t, pid, sid, 'B', 100m, 10m, default);
+			await InsertTradeAsync(c, t, buy, 100m, 10m, default);
+			var opened = await svc.ApplyTradeAsync(c, t, buy);
+			opened.Quantity.AssertEqual(100m);
+
+			// An out-of-band EOD writer stamps a non-zero unrealized_pnl on the row.
+			const decimal seededUnrealized = 4321.75m;
+			await SetUnrealizedPnlAsync(c, t, pid, sid, seededUnrealized, default);
+			(await ReadUnrealizedPnlAsync(c, t, pid, sid, default)).AssertEqual(seededUnrealized); // sanity: seed landed
+
+			// A second fill drives the UPDATE path: sell 40 @ 15 partially closes the long.
+			// closingQty 40 * (15 - 10) * sign(+100) = 200 realized; remaining long 60 keeps avg 10.
+			var sell = await InsertOrderAsync(c, t, pid, sid, 'S', 40m, 15m, default);
+			await InsertTradeAsync(c, t, sell, 40m, 15m, default);
+			var partial = await svc.ApplyTradeAsync(c, t, sell);
+			partial.Quantity.AssertEqual(60m);
+			partial.AveragePrice.AssertEqual(10m);
+			partial.RealizedPnl.AssertEqual(200m);
+
+			// The recompute updated qty/avg/realized on the persisted row ...
+			var persisted = await ReadPositionAsync(c, t, pid, sid, default);
+			persisted.Value.Qty.AssertEqual(60m);
+			persisted.Value.Avg.AssertEqual(10m);
+			persisted.Value.Realized.AssertEqual(200m);
+
+			// ... but left the seeded unrealized_pnl untouched. A regression that added `unrealized_pnl = 0`
+			// (or any value) to the recalc UPDATE would zero out EOD unrealized P&L on every fill and fail here.
+			(await ReadUnrealizedPnlAsync(c, t, pid, sid, default)).AssertEqual(seededUnrealized);
 		});
 
 	[TestMethod]

@@ -490,6 +490,22 @@ public class PreTradeRiskService
 
 		// Check 6 state - existing traded notional for the portfolio, plus (only for market orders,
 		// i.e. price is null) the security's last traded price used as the estimate price.
+		//
+		// Performance note (QA Finding 2). This aggregate re-sums the notional of ALL of the portfolio's
+		// filled trades on every validate, so its cost grows with the portfolio's own accumulated trade
+		// history - it is inherently O(portfolio trades). That is FAITHFUL to the original
+		// dbo.usp_ValidatePreTradeRisk, which computed the same running notional the same way: commission
+		// is deliberately a per-order PRE-fill estimate measured against the filled-trade baseline (AAP
+		// 0.6.2), and preserving that exact semantics is a hard requirement of this refactor. We therefore
+		// do NOT replace it with an incrementally-maintained running total (that would add a new stored
+		// column plus write-path maintenance - a data-model change beyond this minimal-change brief and a
+		// new drift/correctness risk). What we DID remove is the avoidable part of the cost: with the old
+		// non-covering IX_Trades_order (order_id) the optimizer satisfied qty/price by full-scanning the
+		// entire dbo.Trades clustered index on every validate (reading the whole table even for a tiny
+		// portfolio). The covering index IX_Trades_order (order_id) INCLUDE (qty, price, executed_date)
+		// added in Database/001_Schema.sql lets this SUM read qty/price directly from the index, confined
+		// to the portfolio's own order_ids, instead of scanning PK_Trades. Operational ceiling for the
+		// residual, semantics-preserving growth: see LEGACY_LAYER.md.
 		if (limits.EffectiveMaxCommissionTotal is not null)
 		{
 			await using (var command = new SqlCommand(

@@ -265,6 +265,41 @@ SQL counterparts - if a portfolio gets renamed on one side, this silently
 starts creating a second row on the other. None of that changed in this
 refactor; it's noted here so nobody assumes the consolidation touched it.
 
+## Query-plan stability and the commission-SUM ceiling
+
+A performance pass over the consolidated read paths (against a loaded SQL
+Server) surfaced a plan-level concern in the commission/notional SUM read path.
+It is not a correctness defect - the position always recomputes exactly and
+every risk check still enforces the same thresholds - but it affects latency at
+scale, so it was addressed here without changing any observable behaviour.
+
+- **Commission/notional SUM covering index (fixed) + residual ceiling
+  (documented).** The commission check (`PreTradeRiskService`, check 6) sums the
+  notional of all of a portfolio's filled trades on every validate. Cost grows
+  with the portfolio's own trade history - inherently `O(portfolio trades)` -
+  and that is *faithful to the original* `usp_ValidatePreTradeRisk`: commission
+  is deliberately a per-order pre-fill estimate against the filled-trade
+  baseline (AAP 0.6.2), and preserving that exact semantics is a requirement, so
+  the SUM is **not** replaced by an incrementally-maintained running total
+  (that would add a stored column plus write-path maintenance - a data-model
+  change beyond this minimal-change brief, and a new drift risk). What *was*
+  removed is the avoidable part: with the old non-covering `IX_Trades_order
+  (order_id)` the optimiser satisfied `qty`/`price` by full-scanning the entire
+  `dbo.Trades` clustered index on every validate - reading the whole table even
+  for a tiny portfolio. `IX_Trades_order` is now a covering index
+  `(order_id) INCLUDE (qty, price, executed_date)`, so the SUM - and the
+  per-fill position recompute in `PositionRecalculationService`, which folds a
+  portfolio/security's trades by joining `dbo.Trades` to `dbo.Orders` on
+  `order_id` - read straight from the index, confined to the relevant
+  order_ids, instead of scanning `PK_Trades`. The `INCLUDE` form is portable to
+  PostgreSQL/Aurora, so the DDL stays migration-friendly, and an index carries
+  no business logic, so the "SQL is storage" invariant holds. **Operational
+  ceiling:** validate latency still rises gently with a portfolio's accumulated
+  filled-trade count; if a single portfolio's history is expected to reach the
+  hundreds-of-thousands of trades, either archive settled trades or switch
+  commission state to an incremental running total (a follow-up that would
+  require a data-model change and re-proving commission parity).
+
 ## Rough edges cleaned up during the extraction
 
 These long-standing rough edges were addressed opportunistically while porting

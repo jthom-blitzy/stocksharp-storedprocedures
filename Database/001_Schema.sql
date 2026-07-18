@@ -212,8 +212,39 @@ BEGIN
 END
 GO
 
+-- IX_Trades_order is a COVERING index: order_id key + qty/price/executed_date as included columns.
+-- It backs the two hot read paths that join dbo.Trades to dbo.Orders by order_id and need the trade
+-- money/time columns:
+--   * the per-portfolio existing-notional SUM in PreTradeRiskService (commission check 6), and
+--   * the per-fill position recompute in PositionRecalculationService (chronological replay on each fill).
+-- With only (order_id) in the key, the optimizer had to fetch qty/price from the base row, which it
+-- costed as a FULL clustered scan of dbo.Trades on every commission validate and every fold - reading
+-- the whole table even for a tiny portfolio (QA Findings 1 and 2). INCLUDE-ing qty, price and
+-- executed_date lets both queries read everything they need straight from this index, confined to the
+-- relevant order_ids, instead of scanning PK_Trades. trade_id is the clustered key, so it is already the
+-- row locator carried in every nonclustered index and need not be INCLUDEd explicitly. This is still
+-- pure storage - an index carries no business logic - and the CREATE ... INCLUDE form is supported by
+-- PostgreSQL/Aurora too, so the DDL stays migration-friendly.
+--
+-- Guarded, non-destructive, rerun-safe (MA-11 / CR-5). On a fresh database the CREATE below runs. On a
+-- database that still has the older NON-covering IX_Trades_order (order_id) form, the guard drops it
+-- first - detected by the absence of qty as an included column - so the covering definition is applied
+-- in place; once the covering index exists both statements are no-ops.
+IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_Trades_order' AND object_id = OBJECT_ID(N'dbo.Trades'))
+   AND NOT EXISTS (
+       SELECT 1
+       FROM sys.index_columns ic
+       JOIN sys.indexes i ON i.object_id = ic.object_id AND i.index_id = ic.index_id
+       JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+       WHERE i.name = N'IX_Trades_order'
+         AND ic.object_id = OBJECT_ID(N'dbo.Trades')
+         AND ic.is_included_column = 1
+         AND c.name = N'qty')
+	DROP INDEX IX_Trades_order ON dbo.Trades;
+GO
+
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_Trades_order' AND object_id = OBJECT_ID(N'dbo.Trades'))
-	CREATE NONCLUSTERED INDEX IX_Trades_order ON dbo.Trades (order_id);
+	CREATE NONCLUSTERED INDEX IX_Trades_order ON dbo.Trades (order_id) INCLUDE (qty, price, executed_date);
 GO
 
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_Trades_executed_date' AND object_id = OBJECT_ID(N'dbo.Trades'))

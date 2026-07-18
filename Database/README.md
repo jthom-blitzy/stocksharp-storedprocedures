@@ -23,6 +23,19 @@ the audit trigger and drops the removed recalc trigger if present; `004` checks
 before inserting. All four are safe to run repeatably against an
 already-provisioned database without data loss.
 
+> **Applying the scripts to a pre-existing database (required before running the
+> sample).** The setup instructions may describe an SQL Server instance as already
+> "loaded". If you point the sample at a database that was provisioned by an
+> **earlier build** - including a shared or pre-provisioned instance you did not
+> create yourself - (re)apply `001` -> `004` against it first. The scripts are
+> idempotent and non-destructive, and `001`'s guarded `CREATE`/`ALTER` brings the
+> schema up to whatever objects this build depends on. Running the sample against a
+> **stale** schema that predates the consolidated layout can make the C# path fail at
+> runtime; the sample now surfaces that as a single guiding message
+> (`Could not reach StockSharpLegacy (...)`) and exits cleanly rather than crashing,
+> but the actual remedy is to bring the schema current by (re)applying the scripts
+> above.
+
 ## Stand up a local instance (Docker)
 
 > **Security (review finding MA-13, CWE-668).** Bind the container to the
