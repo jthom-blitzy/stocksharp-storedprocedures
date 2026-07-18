@@ -1,90 +1,70 @@
 /*
-	StockSharpLegacy - triggers
+	StockSharpLegacy - triggers (PostgreSQL 16)
 	----------------------------------------
-	trg_Trades_PositionRecalc - fires on every Trades insert and drives the
-	position/P&L recalculation. This is the trigger that makes
-	usp_RecalculatePositionOnTrade "automatic" - see the warning on that
-	proc in 002_StoredProcedures.sql about not calling it a second time.
-
 	trg_Orders_StatusAudit - cascades order status changes into
-	OrderStatusHistory. Narrow on purpose: only fires when status actually
-	changed, not on every column update.
+	OrderStatusHistory. Narrow on purpose: it only fires when the status
+	column actually changed, not on every column update. It is a pure audit
+	trigger - it appends a history row and makes no business decisions, so it
+	stays in the database.
+
+	The old Trades position-recalculation trigger that previously lived here is
+	intentionally removed. That position / P&L recalculation now lives in the
+	C# Algo/Risk/PositionRecalculationService. Removing the trigger is NECESSARY
+	but not by itself sufficient for exactly-once application: it ensures no
+	residual DATABASE-side recalculation fires on a Trades insert, while the C#
+	side enforces exactly-once DURABLY via a trades.position_applied flag that
+	PositionRecalculationService.ApplyAsync flips FALSE -> TRUE in the SAME
+	transaction as the position write, so a restart / retry / replay of an
+	already-applied trade_id is an idempotent no-op. Together - no database
+	trigger plus the durable C# guard - a trade's effect is applied exactly once.
+
+	This script runs SECOND in the container init sequence
+	(001_Schema.sql -> 003_Triggers.sql -> 004_SeedData.sql), so the Orders and
+	OrderStatusHistory tables already exist when it runs. PostgreSQL terminates
+	statements with ';' only, so the T-SQL batch separators and the database /
+	ansi-nulls / quoted-identifier session directives from the original SQL
+	Server script are intentionally dropped (they have no PostgreSQL equivalent
+	and would error here).
 */
 
-USE StockSharpLegacy;
-GO
-
-SET ANSI_NULLS ON;
-SET QUOTED_IDENTIFIER ON;
-GO
-
 -- ============================================================================
--- trg_Trades_PositionRecalc
---
--- Cursor-based on purpose (or at least, that's the polite way to put it -
--- this was written back when multi-row trade inserts were rare enough that
--- nobody optimized for them, and it's never been revisited). Processes
--- inserted rows oldest-first so avg_price/realized_pnl land the same as if
--- the trades had been inserted one at a time.
--- ============================================================================
-CREATE OR ALTER TRIGGER dbo.trg_Trades_PositionRecalc
-ON dbo.Trades
-AFTER INSERT
-AS
-BEGIN
-	SET NOCOUNT ON;
-
-	DECLARE @order_id BIGINT, @qty DECIMAL(18,4), @price DECIMAL(18,4);
-
-	DECLARE trade_cursor CURSOR LOCAL FAST_FORWARD FOR
-		SELECT order_id, qty, price
-		FROM inserted
-		ORDER BY executed_date ASC, trade_id ASC;
-
-	OPEN trade_cursor;
-	FETCH NEXT FROM trade_cursor INTO @order_id, @qty, @price;
-
-	WHILE @@FETCH_STATUS = 0
-	BEGIN
-		EXEC dbo.usp_RecalculatePositionOnTrade
-			@order_id = @order_id,
-			@trade_qty = @qty,
-			@trade_price = @price;
-
-		FETCH NEXT FROM trade_cursor INTO @order_id, @qty, @price;
-	END
-
-	CLOSE trade_cursor;
-	DEALLOCATE trade_cursor;
-END
-GO
-
--- ============================================================================
--- trg_Orders_StatusAudit
+-- trg_Orders_StatusAudit  (PostgreSQL two-part form: trigger function + trigger)
 --
 -- Cascades a status change (e.g. -> 'FILLED') to OrderStatusHistory. Only
 -- fires when the status column is part of the UPDATE and the value actually
--- changed - an UPDATE that touches other columns (price amendment, etc.)
--- without changing status does not create a history row.
+-- changed - an UPDATE that touches other columns (a price amendment, etc.)
+-- without changing status does not create a history row. In PostgreSQL that
+-- "only when status actually changed" behavior is produced by two guards
+-- working together: the trigger is scoped with AFTER UPDATE OF status (so its
+-- function is only considered when status is in the UPDATE's column list), and
+-- the function body then re-checks NEW.status IS DISTINCT FROM OLD.status to
+-- confirm the value truly changed.
 -- ============================================================================
-CREATE OR ALTER TRIGGER dbo.trg_Orders_StatusAudit
-ON dbo.Orders
-AFTER UPDATE
-AS
+
+-- Trigger function: append to OrderStatusHistory only when status actually changed.
+CREATE OR REPLACE FUNCTION trg_orders_status_audit()
+RETURNS TRIGGER AS $$
 BEGIN
-	SET NOCOUNT ON;
+    -- IS DISTINCT FROM is null-safe, replacing the T-SQL
+    -- ISNULL(d.status,'') <> ISNULL(i.status,'') guard.
+    IF NEW.status IS DISTINCT FROM OLD.status THEN
+        INSERT INTO OrderStatusHistory (order_id, old_status, new_status, changed_date)
+        VALUES (NEW.order_id, OLD.status, NEW.status, now() at time zone 'utc');
+        -- changed_by is left to its column DEFAULT current_user (the translation
+        -- of the original SUSER_SNAME()): the source T-SQL INSERT did not set
+        -- changed_by either, so this preserves that behavior and records the
+        -- connection role automatically.
+    END IF;
 
-	IF NOT UPDATE(status)
-		RETURN;
+    RETURN NULL;  -- AFTER trigger: return value is ignored
+END;
+$$ LANGUAGE plpgsql;
 
-	INSERT INTO dbo.OrderStatusHistory (order_id, old_status, new_status, changed_date)
-	SELECT
-		i.order_id,
-		d.status,
-		i.status,
-		SYSUTCDATETIME()
-	FROM inserted i
-	JOIN deleted d ON d.order_id = i.order_id
-	WHERE ISNULL(d.status, '') <> ISNULL(i.status, '');
-END
-GO
+-- AFTER UPDATE OF status: the column-list form means the trigger body is only
+-- considered when the status column is part of the UPDATE (the Postgres analogue
+-- of the T-SQL "IF NOT UPDATE(status) RETURN" guard); the IS DISTINCT FROM check
+-- in the function above then ensures the value truly changed.
+CREATE TRIGGER trg_Orders_StatusAudit
+    AFTER UPDATE OF status ON Orders
+    FOR EACH ROW
+    EXECUTE FUNCTION trg_orders_status_audit();

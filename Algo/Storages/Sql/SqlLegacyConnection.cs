@@ -1,23 +1,55 @@
 namespace StockSharp.Algo.Storages.Sql;
 
 /// <summary>
-/// Connection string resolution for the StockSharpLegacy database. Reads the
-/// STOCKSHARP_LEGACY_SQL_CONNECTION environment variable if set, otherwise
-/// falls back to a local dev default matching Database/README.md's Docker
-/// instructions. There is no config-file-based override here - the real
-/// system reads this from an app.config connectionStrings section, but that
-/// plumbing was out of scope for this brief.
+/// Connection string resolution for the legacy database (now PostgreSQL). Reads the
+/// STOCKSHARP_LEGACY_SQL_CONNECTION environment variable if set, otherwise falls back to a local-dev
+/// PostgreSQL/Npgsql default aligned with the docker-compose stack (host localhost, port 5432,
+/// database stocksharp). There is no
+/// config-file-based override here - reading an app.config connectionStrings section remains out of
+/// scope for this brief.
 /// </summary>
 public static class SqlLegacyConnection
 {
+	// AAP 0.7.2 decision: the environment-variable NAME is deliberately RETAINED (not renamed) across
+	// the SQL Server -> PostgreSQL engine change, to avoid a wider blast radius. The two places that use
+	// this name are SqlLegacyConnection.Resolve() (below) and the docker-compose `app` service, which
+	// sets this same variable to the in-container value (the db service's POSTGRES_USER credentials,
+	// GSS disabled; AAP 0.4.2 has the app connect as that role):
+	// Host=db;Port=5432;Database=stocksharp;Username=postgres;Password=postgres;GSS Encryption Mode=Disable;Maximum Pool Size=50
+	// (db = the compose service name); the fallback below is for a demo run directly on the host.
 	private const string _envVarName = "STOCKSHARP_LEGACY_SQL_CONNECTION";
 
+	// F19: "GSS Encryption Mode=Disable" stops Npgsql 10 (whose GssEncryptionMode
+	// default is Prefer) from probing for libgssapi_krb5.so.2 on connect - the probe
+	// is absent-Kerberos noise on Linux and can even hang connections. This local,
+	// password-authenticated fallback has no use for GSSAPI, so it disables it here
+	// exactly as the docker-compose connection string does.
+	//
+	// "Maximum Pool Size=50" (QA MINOR#4 - connection headroom): explicitly BOUND the Npgsql pool
+	// instead of relying on its default of 100. Left at the default, a single fully-saturated app
+	// instance could hold 100 connections - exactly the PostgreSQL default max_connections (100) - so a
+	// second instance or an interactive psql/admin session could be locked out with zero headroom. The
+	// docker-compose db service raises the server ceiling to max_connections=200 (with 3 reserved for
+	// superusers); capping this side at 50 keeps one instance to at most 50 of those 200 slots, leaving
+	// headroom for a second instance, admin tooling, and the healthcheck. This matches the
+	// docker-compose `app` connection string verbatim so a host-run demo behaves like the containers.
+	//
+	// NOT changed here (AAP-precedence over the QA suggestion): the app still connects as the single
+	// `postgres` role the frozen AAP (0.4.2) mandates - no separate least-privilege application role is
+	// introduced - and the gateway keeps acquiring its pooled connection BEFORE taking the
+	// transaction-scoped per-portfolio advisory lock, because that lock must wrap the validation reads +
+	// INSERT for TOCTOU correctness (a bounded pool, not a lock-ordering change, is the right mitigation).
 	private const string _localDevDefault =
-		"Server=localhost,14330;Database=StockSharpLegacy;User Id=sa;Password=DevTest_Passw0rd!;TrustServerCertificate=True;";
+		"Host=localhost;Port=5432;Database=stocksharp;Username=postgres;Password=postgres;GSS Encryption Mode=Disable;Maximum Pool Size=50";
 
 	/// <summary>
 	/// Resolves the connection string to use, preferring the environment variable.
+	/// A value that is null, empty, OR whitespace-only falls back to the local-dev default:
+	/// a whitespace-only override (e.g. a variable set to spaces by a misconfigured launcher or
+	/// compose file) is treated as "unset" rather than being handed to Npgsql verbatim, which would
+	/// otherwise surface only as an obscure connect-time failure. A genuine connection string that
+	/// merely has surrounding whitespace is preserved as-is.
 	/// </summary>
 	public static string Resolve()
-		=> Environment.GetEnvironmentVariable(_envVarName).IsEmpty(_localDevDefault);
+		=> Environment.GetEnvironmentVariable(_envVarName).IsEmptyOrWhiteSpace(_localDevDefault);
 }

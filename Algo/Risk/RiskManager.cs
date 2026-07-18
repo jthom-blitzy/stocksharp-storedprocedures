@@ -4,19 +4,33 @@ namespace StockSharp.Algo.Risk;
 /// The risks control manager.
 /// </summary>
 /// <remarks>
-/// Since the StockSharpLegacy SQL layer was added (see /Database,
-/// Algo/Storages/Sql, and LEGACY_LAYER.md at the repo root), this is no
-/// longer the only place pre-trade risk is enforced, and the two don't cover
-/// the same rules. This engine is a portfolio-wide circuit breaker: a
-/// triggered rule takes a global action (ClosePositions/StopTrading/
-/// CancelOrders via RiskMessageAdapter) rather than rejecting the one order
-/// that tripped it. dbo.usp_ValidatePreTradeRisk is the opposite model - a
-/// classic per-order gate that rejects a single order before it's accepted,
-/// and it also enforces two limits (order notional value, daily traded
-/// volume) that have no rule class here at all. Nothing in this codebase
-/// reconciles the two, which is the point - a caller going through
-/// SqlLegacyOrderGateway gets SQL-side coverage only; a caller going through
-/// this RiskManager gets C#-side coverage only.
+/// Business risk logic now has a single canonical C# home. The rolling-window order-frequency
+/// evaluator and the gate's numeric-ceiling comparison convention live in
+/// <see cref="CanonicalRiskRules"/> (the per-check limit values themselves are NOT stored there -
+/// the gate reads them from the applicable RiskLimits row at evaluation time), and the per-order
+/// accept/reject gate lives in <see cref="PreTradeRiskService"/> (which re-expresses the retired
+/// usp_ValidatePreTradeRisk in C#). This class remains the portfolio-wide circuit breaker: a
+/// triggered rule takes a global action (ClosePositions/StopTrading/CancelOrders via
+/// <see cref="RiskMessageAdapter"/>) rather than rejecting the one order that tripped it, whereas
+/// <see cref="PreTradeRiskService"/> is the classic per-order gate that rejects a single order
+/// before it is accepted (and it also enforces the order-notional-value and daily-traded-volume
+/// limits that used to exist only on the SQL side). Where a rule exists on both sides - order
+/// frequency being the prime example - the circuit-breaker rule (<see cref="RiskOrderFreqRule"/>)
+/// and the gate now consume the SAME canonical frequency evaluator in
+/// <see cref="CanonicalRiskRules"/>. The shared surface is precise and narrow: the rolling-window
+/// count definition and the "&gt;= Count" meets-or-exceeds threshold plus the "window must be
+/// positive to be enforced" convention - i.e. GIVEN THE SAME observed events the two compute the
+/// SAME in-window verdict, so they can no longer disagree on the frequency ARITHMETIC. They still
+/// differ, by design, in everything AROUND that arithmetic and so can still reach different
+/// outcomes on the same real order flow: the circuit breaker feeds the evaluator an in-memory
+/// buffer of message-stream timestamps that it RESETS when it trips, whereas the gate queries the
+/// Orders table at evaluation time and counts EVERY recent row (including rejected orders); the
+/// data source, the state lifecycle, the rejected-order handling, and the action taken
+/// (portfolio-wide ClosePositions/StopTrading/CancelOrders vs. rejecting the single offending
+/// order) are all distinct. Rules that exist on both sides but evaluate different subjects (for
+/// example commission - post-fill actual vs. pre-fill estimate - and position size - current vs.
+/// hypothetical post-fill) are preserved on each side by design rather than merged; see the
+/// merged-vs-preserved table in LEGACY_LAYER.md for the exact per-rule verdict.
 /// </remarks>
 public class RiskManager : BaseLogReceiver, IRiskManager
 {

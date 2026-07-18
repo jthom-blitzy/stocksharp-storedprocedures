@@ -4,13 +4,26 @@ namespace StockSharp.Algo.Risk;
 /// Risk-rule, tracking orders placing frequency.
 /// </summary>
 /// <remarks>
-/// dbo.usp_ValidatePreTradeRisk (Database/002_StoredProcedures.sql) ports this
-/// same Count/Interval check, but not the same algorithm: this class buckets
-/// time into non-overlapping windows (a burst that straddles a bucket
-/// boundary can dodge the limit), while the SQL version runs a true rolling
-/// COUNT(*) over "now minus Interval seconds". Same configuration can produce
-/// a different accept/reject answer for the same burst pattern depending on
-/// which one evaluates it.
+/// Order-frequency is now evaluated by the single canonical rolling-window evaluator in
+/// <see cref="CanonicalRiskRules"/>, which is also used by the per-order gate
+/// <see cref="PreTradeRiskService"/>. The SHARED surface is precisely: the rolling-window count
+/// definition and the "&gt;= <see cref="Count"/>" meets-or-exceeds threshold, plus the
+/// zero-window-is-disabled convention (a non-positive <see cref="Interval"/> is not enforced,
+/// mirroring <see cref="CanonicalRiskRules.IsFrequencyEnabled"/>). Because both consume that one
+/// definition, the circuit breaker and the gate compute the SAME in-window verdict for the SAME
+/// observed events - they cannot disagree on the frequency ARITHMETIC. They still differ, by
+/// design, both in the STATE they feed that arithmetic and in what they DO with the verdict: this
+/// rule counts an in-memory buffer of message-stream timestamps that it RESETS when it trips and
+/// then takes a portfolio-wide circuit-breaker action, whereas the gate counts recent Orders rows
+/// read from the database at evaluation time (every recent row, including rejected orders) and
+/// rejects the single offending order. Same arithmetic, different data source, state lifecycle, and
+/// reaction - so on the same real order flow the two can still reach different outcomes (see the
+/// divergence note on <see cref="RiskManager"/>).
+/// The previous fixed, non-overlapping bucket algorithm was retired: a burst straddling a bucket
+/// boundary could dodge the limit (looser than the SQL rolling COUNT(*)), which would violate the
+/// threshold-strictness invariant. This rule keeps its circuit-breaker lifecycle - when the rolling
+/// count meets or exceeds <see cref="Count"/> it trips (takes its configured action) and resets its
+/// in-window buffer.
 /// </remarks>
 [Display(
 	ResourceType = typeof(LocalizedStrings),
@@ -19,8 +32,10 @@ namespace StockSharp.Algo.Risk;
 	GroupName = LocalizedStrings.OrdersKey)]
 public class RiskOrderFreqRule : RiskRule
 {
-	private DateTime? _endTime;
-	private int _current;
+	// Rolling-window state: timestamps (message.LocalTime) of recent OrderRegister/OrderReplace
+	// messages. Replaces the old fixed-bucket _endTime/_current pair. The canonical evaluator in
+	// CanonicalRiskRules counts the entries falling in the trailing Interval (AAP 0.6.1).
+	private readonly List<DateTime> _times = [];
 
 	/// <inheritdoc />
 	protected override string GetTitle() => Count + " -> " + Interval;
@@ -85,8 +100,7 @@ public class RiskOrderFreqRule : RiskRule
 	{
 		base.Reset();
 
-		_current = 0;
-		_endTime = null;
+		_times.Clear();
 	}
 
 	/// <inheritdoc />
@@ -100,41 +114,39 @@ public class RiskOrderFreqRule : RiskRule
 				var time = message.LocalTime;
 
 				if (time == default)
-				{
-					//LogWarning("Time is null. Msg={0}", message);
 					return false;
-				}
 
-				if (_endTime == null)
-				{
-					_endTime = time + Interval;
-					_current = 1;
-
-					//LogDebug("EndTime={0}", _endTime);
+				// M12: a ZERO (or non-positive) Interval means the frequency window is DISABLED - the SAME
+				// "window must be > 0 to be enforced" convention the gate applies (CanonicalRiskRules
+				// .IsFrequencyEnabled requires a positive window). With a zero window the trailing range
+				// [time, time] would contain only the just-appended current order and trip immediately at
+				// Count = 1, which the retired fixed-bucket baseline never did and the gate does not do.
+				// Short-circuit so a disabled window neither trips nor accumulates state.
+				if (Interval <= TimeSpan.Zero)
 					return false;
-				}
 
-				if (time < _endTime)
+				// Canonical rolling window (AAP 0.6.1): append this order's time, then ask the
+				// SINGLE shared evaluator - also used by PreTradeRiskService - whether the number
+				// of orders within the trailing Interval meets or exceeds Count. "IncludingCurrent"
+				// because we have already appended the current order (the gate instead counts DB
+				// rows and adds +1; both conventions yield identical answers).
+				_times.Add(time);
+
+				if (CanonicalRiskRules.IsOrderFrequencyBreachedIncludingCurrent(_times, time, Interval, Count))
 				{
-					_current++;
-
-					//LogDebug("Count={0} Msg={1}", _current, message);
-
-					if (_current >= Count)
-					{
-						//LogInfo("Count={0} EndTime={1}", _current, _endTime);
-
-						_endTime = null;
-						return true;
-					}
+					// Circuit-breaker trip-then-reset lifecycle: mirrors the old `_endTime = null`
+					// reset. Clearing after a trip stops the action from re-firing on every
+					// subsequent order and keeps parity with the existing OrderFreq test. This is
+					// still strictly stricter than the retired fixed-bucket algorithm, which could
+					// let a boundary-straddling burst slip through.
+					_times.Clear();
+					return true;
 				}
-				else
-				{
-					_endTime = time + Interval;
-					_current = 1;
 
-					//LogDebug("EndTime={0}", _endTime);
-				}
+				// Not breached: drop entries that have aged out of the trailing window so the
+				// buffer stays bounded (they cannot affect any future window). The evaluator above
+				// already ignores them, so this is pure memory hygiene and does not change results.
+				_times.RemoveAll(t => t < time - Interval);
 
 				return false;
 			}

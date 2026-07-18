@@ -1,0 +1,178 @@
+# =============================================================================
+# docker-compose.yml — one-command local stack for the StockSharp "Legacy SQL"
+# console demo (Samples/08_Misc/03_LegacySqlDemo) running against PostgreSQL 16.
+#
+# `docker compose up` (or `docker compose up --build`) brings up two
+# services:
+#   1. db  — PostgreSQL 16, initialized from the Database/*.sql scripts.
+#   2. app — the .NET 10 console demo (built from the repo-root Dockerfile),
+#            started only once the database is fully initialized and healthy.
+#
+# This is the LOCAL-CONTAINER stand-in for the target containerized-on-AWS model
+# (Agent Action Plan 0.7.2): there is NO real Aurora / ECS / EKS / Fargate / IAM
+# / networking here — just two local containers and a named volume.
+#
+# Minimal-change / scope discipline (AAP 0.7.2): exactly two services and one
+# named volume. There is intentionally NO obsolete top-level `version:` key (the
+# modern Compose Spec omits it; declaring it only emits a deprecation warning),
+# and NO explicit `networks:` block — Compose's implicit default network already
+# lets `app` reach `db` by its service name over DNS. No pgadmin, no secrets
+# manager, nothing AWS-specific.
+#
+# Dev-only credentials (LOCAL DEVELOPMENT stand-in for the AWS model; deliberately
+# NOT secret). The frozen AAP (0.4.2) has the application connect with the db
+# service's POSTGRES_USER / POSTGRES_PASSWORD credentials - a single `postgres` /
+# `postgres` role that both runs the init scripts (and the healthcheck) and is used
+# by the `app` service. There is intentionally NO separate application role and NO
+# init script beyond the three the AAP freezes (001_Schema, 003_Triggers, 004_SeedData).
+# database=stocksharp   host(service)=db
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # db — PostgreSQL 16 (Amazon Aurora-PostgreSQL-parity major version). The tag
+  # is pinned to `16`, never `latest`, for reproducible local runs.
+  # ---------------------------------------------------------------------------
+  db:
+    image: postgres:16
+
+    # Server tuning (QA MINOR#4 - connection headroom). Raise max_connections above PostgreSQL's
+    # default of 100 and keep slots reserved for superuser/admin access. RATIONALE: the app's Npgsql
+    # pool is bounded well below this ceiling (Maximum Pool Size=50 on the connection string below), so
+    # a single app instance can consume at most 50 of the 200 slots. That leaves ample headroom for a
+    # SECOND app instance, for interactive psql / GUI sessions, and for the healthcheck - eliminating the
+    # former zero-headroom situation where Npgsql's default pool (100) exactly equalled the server
+    # default (100) and one saturated app could lock everyone else out. superuser_reserved_connections=3
+    # additionally guarantees an admin can always connect. The `postgres` entrypoint execs
+    # `postgres "$@"`, so these -c overrides are applied to the REAL server it starts after init.
+    #
+    # DELIBERATELY NOT DONE (AAP-precedence over the QA suggestion): (1) a separate NON-superuser
+    # application role - the frozen AAP (0.4.2) has the app connect with the db service's
+    # POSTGRES_USER/POSTGRES_PASSWORD (a single `postgres` role, see the header note); introducing a
+    # least-privilege role is out of scope for this brief. (2) acquiring the pooled connection AFTER the
+    # per-portfolio advisory lock - the lock is intentionally transaction-scoped (pg_advisory_xact_lock)
+    # around the validation reads + INSERT for TOCTOU correctness, so the connection must be held for the
+    # whole gated unit; a bounded pool (not a lock-ordering change) is the correct mitigation.
+    command:
+      - "postgres"
+      - "-c"
+      - "max_connections=200"
+      - "-c"
+      - "superuser_reserved_connections=3"
+
+    # POSTGRES_DB makes the entrypoint CREATE the `stocksharp` database on first
+    # init — this replaces the old T-SQL `CREATE DATABASE` guard, so the SQL
+    # init scripts neither create nor switch databases. POSTGRES_USER / _PASSWORD
+    # set the `postgres` role used to run the init scripts, by the healthcheck, and
+    # by the `app` service (AAP 0.4.2 has the app connect with POSTGRES_USER /
+    # POSTGRES_PASSWORD). The list form (- KEY=value) is used throughout so YAML
+    # never coerces a value.
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=stocksharp
+
+    volumes:
+      # Mount the SQL init scripts read-only into the well-known init directory.
+      # The official postgres image auto-executes *.sql / *.sh files placed here
+      # in ALPHABETICAL order, on FIRST initialization only (empty data dir).
+      # With 002_StoredProcedures.sql retired, the effective order is exactly the
+      # three scripts the AAP freezes:
+      #     001_Schema.sql -> 003_Triggers.sql -> 004_SeedData.sql
+      # The 002 numbering gap is harmless, and the non-*.sql Database/README.md
+      # is ignored by the init runner. `:ro` keeps the host scripts read-only.
+      - ./Database:/docker-entrypoint-initdb.d:ro
+      # Persist the cluster data in a named volume so restarts keep state (and so
+      # the one-time init scripts do NOT re-run on every `up`). Remove it with
+      # `docker compose down -v` to force a clean re-initialization.
+      - pgdata:/var/lib/postgresql/data
+
+    # Publish PostgreSQL on the host for convenience (psql / GUI clients), but bind
+    # ONLY to the loopback interface 127.0.0.1 (finding F17). The bare "5432:5432"
+    # form binds 0.0.0.0 — every host interface — which would expose the database
+    # (and its dev-only superuser) to the local network; "127.0.0.1:5432:5432"
+    # restricts it to this machine. The `app` service does NOT use this published
+    # port: it reaches the database over the Compose network by the service name `db`.
+    ports:
+      - "127.0.0.1:5432:5432"
+
+    # Healthcheck — CRITICAL: it gates the `app` service (below) through
+    # depends_on: condition: service_healthy, and MUST only report healthy once
+    # the database is FULLY initialized and accepting TCP connections.
+    #
+    # Why `-h localhost` (a TCP probe) and not a bare socket check: the postgres
+    # entrypoint first starts a TEMPORARY server that listens on the UNIX SOCKET
+    # ONLY (listen_addresses='') while it runs the init scripts, then restarts
+    # the REAL server with TCP enabled. A socket-based `pg_isready` (no -h) can
+    # report "ready" DURING init, so the app could start before the tables exist.
+    # The demo's Program.cs performs its DB setup inside a try/catch and EXITS on
+    # failure (it does not retry), so an early start makes the demo fail. A TCP
+    # probe fails during the temp-server phase and only succeeds once the real
+    # TCP listener is up — i.e. after every init script has completed — correctly
+    # gating startup. Do NOT drop the `-h localhost`.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h localhost -U postgres -d stocksharp"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # app — the .NET 10 "Legacy SQL" console demo, built from the repo-root
+  # Dockerfile and run once against the `db` service.
+  # ---------------------------------------------------------------------------
+  app:
+    # Build from THIS repository. The build context MUST be the repository root
+    # (context: .) so the Dockerfile's `dotnet publish` can resolve the demo's
+    # transitive project/props references (Algo, BusinessEntities, Messages, the
+    # shared common_*.props chain, etc.). The companion .dockerignore trims
+    # non-build artifacts from that context.
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    # Start only after the database is fully initialized and healthy. Paired with
+    # the TCP healthcheck above, this guarantees the schema, triggers, and seed
+    # data all exist before the (non-retrying) demo connects.
+    depends_on:
+      db:
+        condition: service_healthy
+
+    # Point the demo at the `db` service over the default Compose network. The
+    # variable name STOCKSHARP_LEGACY_SQL_CONNECTION is RETAINED across the SQL
+    # Server -> PostgreSQL migration (AAP 0.7.2 minimal-change decision) and is
+    # exactly the variable SqlLegacyConnection.Resolve() reads. `Host=db` resolves
+    # to this service via Compose DNS.
+    #
+    # Username/Password are the db service's POSTGRES_USER / POSTGRES_PASSWORD
+    # (`postgres` / `postgres`), matching the frozen AAP (0.4.2), which has the app
+    # connect with those credentials; there is no separate application role.
+    #
+    # "GSS Encryption Mode=Disable" (finding F19): Npgsql 10 defaults GssEncryptionMode
+    # to Prefer, so on this Kerberos-less Linux runtime image it would probe for
+    # libgssapi_krb5.so.2 on every connection — emitting a noisy (though harmless)
+    # stderr error and risking connection hangs. Disabling GSS for this local,
+    # password-authenticated stack removes the probe entirely; no Kerberos library is
+    # installed in the runtime image by design (see Dockerfile).
+    #
+    # "Maximum Pool Size=50" (QA MINOR#4): bound THIS instance's Npgsql pool well below the db service's
+    # max_connections=200 (see the db `command:` above). Npgsql's default pool is 100, which previously
+    # equalled the server default (100) and left zero headroom; capping at 50 keeps a single instance to
+    # at most 50 of 200 slots, so a second instance, an admin psql session, and the healthcheck all still
+    # fit. 50 comfortably exceeds this one-shot demo's needs (it uses a single connection).
+    #
+    # Quoted because the value contains '=' and ';'.
+    environment:
+      - "STOCKSHARP_LEGACY_SQL_CONNECTION=Host=db;Port=5432;Database=stocksharp;Username=postgres;Password=postgres;GSS Encryption Mode=Disable;Maximum Pool Size=50"
+
+    # No `restart:` policy (defaults to `no`): the demo is a one-shot walkthrough
+    # that prints its three scenarios and exits. Auto-restarting would loop it
+    # pointlessly once it completes.
+
+# -----------------------------------------------------------------------------
+# Named volume backing the PostgreSQL data directory (see the db service). A
+# named volume (rather than an anonymous one) keeps the data across `up`/`down`
+# cycles until it is explicitly removed with `docker compose down -v`.
+# -----------------------------------------------------------------------------
+volumes:
+  pgdata:
