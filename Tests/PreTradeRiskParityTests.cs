@@ -1260,6 +1260,88 @@ public class PreTradeRiskParityTests : BaseTestClass
 	}
 
 	/// <summary>
+	/// MAJOR#2 - clock-source regression (AAP 0.6.4 + threshold-strictness NFR). The rolling frequency
+	/// window MUST be measured on the SAME clock that stamps <c>orders.submitted_date</c> - the database's
+	/// <c>now() at time zone 'utc'</c> - NOT the application host's wall clock. This test proves the
+	/// production gate (no injected clock, so it reads the instant from the database on the caller's
+	/// transaction) is IMMUNE to application/database clock skew, whereas a gate driven by a skewed
+	/// application clock would silently loosen the control.
+	///
+	/// Setup: only the rolling frequency ceiling is enforced (5 per 60s) and <c>DemoMaxOrderFreqCount - 1</c>
+	/// (=4) orders are seeded, each stamped by the database with the transaction's <c>now()</c>, so a fifth
+	/// prospective order meets/exceeds the limit of 5 <em>when the window is measured on that same DB clock</em>.
+	/// The prospective order is then validated under four clock sources on the one transaction (all reads,
+	/// no inserts, so the seeded set is identical for each):
+	/// <list type="bullet">
+	/// <item>production (DB clock) - the 4 orders are inside the 60s window =&gt; REJECT (immune);</item>
+	/// <item>a control app clock equal to the DB clock =&gt; REJECT (the clocks agree at rest);</item>
+	/// <item>a SLOW app clock (-1h) - the cutoff moves further into the past, so the 4 still count =&gt; REJECT
+	/// (a lagging clock never loosens the control);</item>
+	/// <item>a FAST app clock (+1h) - the cutoff jumps 1h into the FUTURE, so the 4 real orders fall OUTSIDE
+	/// the window and are under-counted =&gt; the app-clock gate ACCEPTS, loosening the ceiling below the
+	/// stricter original. This is exactly the regression the DB-clock fix eliminates.</item>
+	/// </list>
+	/// The production/DB-clock service holding the line while the +1h app-clock service caves is the
+	/// discriminating contrast that a pre-fix (DateTime.UtcNow) gate would fail.
+	/// </summary>
+	[TestMethod]
+	public async Task ValidateAsync_FrequencyWindow_UsesDatabaseClock_ImmuneToAppClockSkew()
+	{
+		await using var cn = await OpenPostgresAsync();
+
+		await using var txn = await cn.BeginTransactionAsync(CancellationToken);
+
+		var s = Guid.NewGuid().ToString("N");
+		var pf = await InsertPortfolioAsync(cn, txn, "M2_CLK_" + s);
+		var sec = await InsertSecurityAsync(cn, txn, "M2_CLK_" + s);
+
+		// Only the rolling frequency ceiling is enforced (5 per 60s); every other limit stays NULL.
+		await PgInsertRiskLimitsAsync(cn, txn, pf, null, new GateVector
+		{
+			MaxOrderFreqCount = DemoMaxOrderFreqCount,          // 5
+			MaxOrderFreqWindowSec = DemoMaxOrderFreqWindowSec,  // 60
+		});
+
+		// Seed maxFreqCount-1 (=4) recent orders. PgSeedOrderAsync lets submitted_date take its DB DEFAULT
+		// (now() at time zone 'utc'), so every seeded order is stamped with THIS transaction's now().
+		for (var i = 0; i < DemoMaxOrderFreqCount - 1; i++)
+			await PgSeedOrderAsync(cn, txn, pf, sec, "B", 1m, 1.00m, "ACCEPTED");
+
+		// The transaction's DB clock - the EXACT instant those 4 orders were stamped (now() is the stable
+		// transaction timestamp). App clocks below are skewed RELATIVE to this same instant.
+		DateTime dbNow;
+		await using (var clock = new NpgsqlCommand("SELECT now() at time zone 'utc'", cn, txn))
+			dbNow = DateTime.SpecifyKind((DateTime)await clock.ExecuteScalarAsync(CancellationToken), DateTimeKind.Unspecified);
+
+		// Validate the prospective 5th order under each clock source (read-only; the seeded set is unchanged).
+		async Task<PreTradeRiskResult> ValidateProspectiveAsync(PreTradeRiskService service)
+			=> await service.ValidateAsync(cn, txn, pf, sec, "B", 1m, 150.00m, CancellationToken);
+
+		var production = await ValidateProspectiveAsync(new PreTradeRiskService());                        // DB clock (production)
+		var zeroSkew   = await ValidateProspectiveAsync(new PreTradeRiskService(() => dbNow));             // app clock == DB clock
+		var slowSkew   = await ValidateProspectiveAsync(new PreTradeRiskService(() => dbNow.AddSeconds(-3600))); // app clock 1h behind
+		var fastSkew   = await ValidateProspectiveAsync(new PreTradeRiskService(() => dbNow.AddSeconds(+3600))); // app clock 1h ahead (BUG model)
+
+		// Production (DB clock): the 4 committed-in-txn orders are inside the 60s window -> REJECT for FREQUENCY.
+		production.IsValid.AssertFalse();
+		production.RejectReason.AssertEqual("Order frequency 5 in 60s meets/exceeds limit 5");
+
+		// Control: an app clock exactly equal to the DB clock reproduces the production outcome.
+		zeroSkew.IsValid.AssertFalse();
+		zeroSkew.RejectReason.AssertEqual("Order frequency 5 in 60s meets/exceeds limit 5");
+
+		// A SLOW app clock only makes the window MORE inclusive -> still REJECT (never loosens the control).
+		slowSkew.IsValid.AssertFalse();
+		slowSkew.RejectReason.AssertEqual("Order frequency 5 in 60s meets/exceeds limit 5");
+
+		// THE MAJOR#2 CONTRAST: a FAST app clock under-counts the recent orders and ACCEPTS - the loosening
+		// the pre-fix (DateTime.UtcNow) gate exhibited. The production DB-clock gate above is immune.
+		fastSkew.IsValid.AssertTrue();
+
+		await txn.RollbackAsync(CancellationToken);
+	}
+
+	/// <summary>
 	/// Daily-volume UTC day rollover (M1). With an injected fixed clock, an ACCEPTED order dated the PRIOR
 	/// UTC day must be EXCLUDED from today's volume (the half-open [dayStart, dayEnd) boundary), while an
 	/// order dated this UTC day counts. Sub-scenario 1 accepts an order that only fits if yesterday's volume
@@ -2539,9 +2621,14 @@ public class PreTradeRiskParityTests : BaseTestClass
 	/// existing-gross-notional reads); price stays decimal to preserve NUMERIC(18,4) scale.</summary>
 	private async Task PgInsertTradeTxnAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, long orderId, decimal qty, decimal price)
 	{
+		// Mirror the production gateway (SqlLegacyOrderGateway.RecordTradeAsync): populate the denormalized
+		// trades.(portfolio_id, security_id) from the parent order via INSERT ... SELECT, so the seeded trade
+		// satisfies the NOT NULL columns and the IX_Trades_portfolio / IX_Trades_security_executed covering
+		// indexes the commission reads use, with values guaranteed to equal the parent order's.
 		await using var command = new NpgsqlCommand(
-			"INSERT INTO trades (order_id, qty, price, executed_date) " +
-			"VALUES (@order_id, @qty, @price, now() at time zone 'utc')", connection, transaction);
+			"INSERT INTO trades (order_id, portfolio_id, security_id, qty, price, executed_date) " +
+			"SELECT @order_id, o.portfolio_id, o.security_id, @qty, @price, now() at time zone 'utc' " +
+			"FROM orders o WHERE o.order_id = @order_id", connection, transaction);
 		command.Parameters.Add(new NpgsqlParameter("order_id", NpgsqlDbType.Bigint) { Value = orderId });
 		command.Parameters.Add(new NpgsqlParameter("qty", NpgsqlDbType.Numeric) { Value = qty });
 		command.Parameters.Add(new NpgsqlParameter("price", NpgsqlDbType.Numeric) { Value = price });

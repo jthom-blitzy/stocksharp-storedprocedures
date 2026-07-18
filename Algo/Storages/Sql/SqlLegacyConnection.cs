@@ -24,8 +24,23 @@ public static class SqlLegacyConnection
 	// is absent-Kerberos noise on Linux and can even hang connections. This local,
 	// password-authenticated fallback has no use for GSSAPI, so it disables it here
 	// exactly as the docker-compose connection string does.
+	//
+	// "Maximum Pool Size=50" (QA MINOR#4 - connection headroom): explicitly BOUND the Npgsql pool
+	// instead of relying on its default of 100. Left at the default, a single fully-saturated app
+	// instance could hold 100 connections - exactly the PostgreSQL default max_connections (100) - so a
+	// second instance or an interactive psql/admin session could be locked out with zero headroom. The
+	// docker-compose db service raises the server ceiling to max_connections=200 (with 3 reserved for
+	// superusers); capping this side at 50 keeps one instance to at most 50 of those 200 slots, leaving
+	// headroom for a second instance, admin tooling, and the healthcheck. This matches the
+	// docker-compose `app` connection string verbatim so a host-run demo behaves like the containers.
+	//
+	// NOT changed here (AAP-precedence over the QA suggestion): the app still connects as the single
+	// `postgres` role the frozen AAP (0.4.2) mandates - no separate least-privilege application role is
+	// introduced - and the gateway keeps acquiring its pooled connection BEFORE taking the
+	// transaction-scoped per-portfolio advisory lock, because that lock must wrap the validation reads +
+	// INSERT for TOCTOU correctness (a bounded pool, not a lock-ordering change, is the right mitigation).
 	private const string _localDevDefault =
-		"Host=localhost;Port=5432;Database=stocksharp;Username=postgres;Password=postgres;GSS Encryption Mode=Disable";
+		"Host=localhost;Port=5432;Database=stocksharp;Username=postgres;Password=postgres;GSS Encryption Mode=Disable;Maximum Pool Size=50";
 
 	/// <summary>
 	/// Resolves the connection string to use, preferring the environment variable.

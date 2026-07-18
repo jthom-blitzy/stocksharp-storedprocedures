@@ -332,15 +332,28 @@ public class SqlLegacyOrderGateway
 		// the lock was taken inside ApplyAsync AFTER the insert; a concurrent submit could acquire the lock in
 		// between and validate against state that could not yet see this uncommitted fill. Taking the lock here,
 		// up front, closes that window (ApplyAsync re-takes the same key re-entrantly - a harmless no-op).
+		//
+		// MAJOR#1 / MINOR#1 denormalization: the SAME up-front read also fetches the order's security_id, so
+		// both the parent order's portfolio_id AND security_id are carried onto the trade row below
+		// (trades.portfolio_id / trades.security_id). That lets the pre-trade commission reads use the
+		// IX_Trades_portfolio / IX_Trades_security_executed covering indexes instead of a Trades -> Orders join
+		// that scanned the whole table at scale. Reading them here, on the same connection+transaction that
+		// inserts the trade, guarantees the copies equal the parent order's values (the Trades FKs re-assert
+		// it); a missing order yields no row and fails fast with InvalidOperationException before anything is
+		// written (no partial state).
 		int portfolioId;
-		using (var portfolioCommand = new NpgsqlCommand(
-			"SELECT portfolio_id FROM orders WHERE order_id = @order_id", connection, transaction))
+		int securityId;
+		using (var orderCommand = new NpgsqlCommand(
+			"SELECT portfolio_id, security_id FROM orders WHERE order_id = @order_id", connection, transaction))
 		{
-			portfolioCommand.Parameters.Add(new NpgsqlParameter("order_id", NpgsqlDbType.Bigint) { Value = orderId });
-			var resolved = await portfolioCommand.ExecuteScalarAsync(cancellationToken);
-			if (resolved is null or DBNull)
+			orderCommand.Parameters.Add(new NpgsqlParameter("order_id", NpgsqlDbType.Bigint) { Value = orderId });
+			// Fully read and dispose this reader before the next command runs on the same connection (no MARS);
+			// the enclosing using-block disposes both the reader and the command before the advisory-lock read.
+			await using var orderReader = await orderCommand.ExecuteReaderAsync(cancellationToken);
+			if (!await orderReader.ReadAsync(cancellationToken))
 				throw new InvalidOperationException($"SqlLegacyOrderGateway.RecordTradeAsync: order_id {orderId} not found");
-			portfolioId = (int)resolved;
+			portfolioId = orderReader.GetInt32(0);
+			securityId = orderReader.GetInt32(1);
 		}
 
 		using (var lockCommand = new NpgsqlCommand(
@@ -358,11 +371,14 @@ public class SqlLegacyOrderGateway
 		// (and applied) by an earlier committed call, so the insert affects 0 rows and RETURNING yields none.
 		// C1: qty/price are NOT read back here for the recompute; ApplyAsync derives the applied values straight
 		// from the persisted trade row it claims, so nothing downstream trusts caller-supplied values.
+		// The trade row also carries the denormalized (portfolio_id, security_id) resolved from the parent
+		// order above (MAJOR#1 / MINOR#1), so the pre-trade commission reads can use the covering indexes
+		// instead of a Trades -> Orders join.
 		var insertSql = externalTradeId is null
-			? "INSERT INTO trades (order_id, qty, price, executed_date) " +
-			  "VALUES (@order_id, @qty, @price, now() at time zone 'utc') RETURNING trade_id"
-			: "INSERT INTO trades (order_id, qty, price, external_trade_id, executed_date) " +
-			  "VALUES (@order_id, @qty, @price, @external_trade_id, now() at time zone 'utc') " +
+			? "INSERT INTO trades (order_id, portfolio_id, security_id, qty, price, executed_date) " +
+			  "VALUES (@order_id, @portfolio_id, @security_id, @qty, @price, now() at time zone 'utc') RETURNING trade_id"
+			: "INSERT INTO trades (order_id, portfolio_id, security_id, qty, price, external_trade_id, executed_date) " +
+			  "VALUES (@order_id, @portfolio_id, @security_id, @qty, @price, @external_trade_id, now() at time zone 'utc') " +
 			  "ON CONFLICT (external_trade_id) WHERE external_trade_id IS NOT NULL DO NOTHING RETURNING trade_id";
 
 		long tradeId;
@@ -370,6 +386,9 @@ public class SqlLegacyOrderGateway
 		await using (var insert = new NpgsqlCommand(insertSql, connection, transaction))
 		{
 			insert.Parameters.Add(new NpgsqlParameter("order_id", NpgsqlDbType.Bigint) { Value = orderId });
+			// Denormalized copies resolved from the parent order above (MAJOR#1 / MINOR#1): bound as INT.
+			insert.Parameters.Add(new NpgsqlParameter("portfolio_id", NpgsqlDbType.Integer) { Value = portfolioId });
+			insert.Parameters.Add(new NpgsqlParameter("security_id", NpgsqlDbType.Integer) { Value = securityId });
 			// qty / price are NUMERIC(18,4): bind as decimal (never double/float) - AAP 0.6.4.
 			insert.Parameters.Add(new NpgsqlParameter("qty", NpgsqlDbType.Numeric) { Value = qty });
 			insert.Parameters.Add(new NpgsqlParameter("price", NpgsqlDbType.Numeric) { Value = price });

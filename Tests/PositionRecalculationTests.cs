@@ -485,10 +485,13 @@ public class PositionRecalculationTests : BaseTestClass
 
 			await using (var txn = await cn.BeginTransactionAsync(CancellationToken))
 			{
-				// Insert a REAL trade row against the valid order, inside the transaction.
+				// Insert a REAL trade row against the valid order, inside the transaction. Populate the
+				// denormalized trades.(portfolio_id, security_id) from the parent order via INSERT ... SELECT,
+				// mirroring the gateway, so the NOT NULL columns and their FKs are satisfied.
 				await using (var insert = new NpgsqlCommand(
-					"INSERT INTO trades (order_id, qty, price, executed_date) " +
-					"VALUES (@order_id, @qty, @price, now() at time zone 'utc') RETURNING trade_id", cn, txn))
+					"INSERT INTO trades (order_id, portfolio_id, security_id, qty, price, executed_date) " +
+					"SELECT @order_id, o.portfolio_id, o.security_id, @qty, @price, now() at time zone 'utc' " +
+					"FROM orders o WHERE o.order_id = @order_id RETURNING trade_id", cn, txn))
 				{
 					insert.Parameters.Add(new NpgsqlParameter("order_id", NpgsqlDbType.Bigint) { Value = orderId });
 					insert.Parameters.Add(new NpgsqlParameter("qty", NpgsqlDbType.Numeric) { Value = 100m });
@@ -1726,9 +1729,13 @@ public class PositionRecalculationTests : BaseTestClass
 	/// </summary>
 	private async Task<long> InsertTradeAsync(NpgsqlConnection connection, long orderId, decimal qty, decimal price)
 	{
+		// Mirror the production gateway (SqlLegacyOrderGateway.RecordTradeAsync): populate the denormalized
+		// trades.(portfolio_id, security_id) from the parent order via INSERT ... SELECT, so the seeded trade
+		// satisfies the NOT NULL columns and their FKs with values equal to the parent order's.
 		await using var command = new NpgsqlCommand(
-			"INSERT INTO trades (order_id, qty, price, executed_date) " +
-			"VALUES (@order_id, @qty, @price, now() at time zone 'utc') RETURNING trade_id", connection);
+			"INSERT INTO trades (order_id, portfolio_id, security_id, qty, price, executed_date) " +
+			"SELECT @order_id, o.portfolio_id, o.security_id, @qty, @price, now() at time zone 'utc' " +
+			"FROM orders o WHERE o.order_id = @order_id RETURNING trade_id", connection);
 		command.Parameters.Add(new NpgsqlParameter("order_id", NpgsqlDbType.Bigint) { Value = orderId });
 		command.Parameters.Add(new NpgsqlParameter("qty", NpgsqlDbType.Numeric) { Value = qty });
 		command.Parameters.Add(new NpgsqlParameter("price", NpgsqlDbType.Numeric) { Value = price });

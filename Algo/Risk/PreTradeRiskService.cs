@@ -521,13 +521,14 @@ public sealed class PreTradeRiskService
 		}
 
 		// 6. cumulative commission estimate: last traded price (market order only) + existing gross notional.
-		//    existingGrossNotional is the EXACT SUM(t.qty * t.price) over the portfolio's Trades
-		//    (join Trades -> Orders, portfolio-wide across all securities), reproducing the retired
-		//    usp_ValidatePreTradeRisk @existingNotional at full NUMERIC precision (PostgreSQL evaluates the
-		//    NUMERIC product and its SUM without intermediate rounding). It is read directly from Trades
-		//    rather than a maintained rollup column: a NUMERIC(18,4) rollup would round each contribution to
-		//    four decimals before summing (0.00000001 -> 0.0000) and could under-state the gross, letting the
-		//    commission ceiling stop triggering (a loosening forbidden by AAP 0.6.4). SUM is NULL => 0.
+		//    existingGrossNotional is the EXACT SUM(qty * price) over the portfolio's Trades (read via the
+		//    denormalized trades.portfolio_id + IX_Trades_portfolio covering index, portfolio-wide across all
+		//    securities; formerly a Trades -> Orders join - see the perf note at the query), reproducing the
+		//    retired usp_ValidatePreTradeRisk @existingNotional at full NUMERIC precision (PostgreSQL evaluates
+		//    the NUMERIC product and its SUM without intermediate rounding). It is summed directly from the
+		//    Trades rows rather than a maintained rollup column: a NUMERIC(18,4) rollup would round each
+		//    contribution to four decimals before summing (0.00000001 -> 0.0000) and could under-state the
+		//    gross, letting the commission ceiling stop triggering (a loosening forbidden by AAP 0.6.4). SUM is NULL => 0.
 		var existingGrossNotional = 0m;
 		decimal? lastTradePrice = null;
 		if (CanonicalRiskRules.IsCeilingEnabled(maxCommissionTotal))
@@ -537,9 +538,17 @@ public sealed class PreTradeRiskService
 				// Market order: best-effort last traded price for the security (may stay null if it never traded).
 				// executed_date can tie (same-instant fills); trade_id DESC is the authoritative secondary key so a
 				// tie deterministically picks the newest trade (the highest identity) rather than an arbitrary row.
+				//
+				// PERF (QA MINOR#1): read the security directly off the DENORMALIZED trades.security_id rather than
+				// JOINing Trades -> Orders and filtering on the order's security_id. The former join placed the
+				// security_id filter AFTER the join, so for a SPARSE security the backward scan on executed_date
+				// had to walk many unrelated rows before finding one that matched. The IX_Trades_security_executed
+				// index, keyed (security_id, executed_date DESC, trade_id DESC), lets this ORDER BY ... LIMIT 1
+				// read a single leaf entry - bounded no matter how sparse the security. The selected row is
+				// identical to the join's (trades.security_id is copied from the parent order's security_id).
 				using var lastTradeCommand = new NpgsqlCommand(
-					"SELECT t.price FROM trades t JOIN orders o ON o.order_id = t.order_id " +
-					"WHERE o.security_id = @security_id ORDER BY t.executed_date DESC, t.trade_id DESC LIMIT 1", connection, transaction);
+					"SELECT price FROM trades " +
+					"WHERE security_id = @security_id ORDER BY executed_date DESC, trade_id DESC LIMIT 1", connection, transaction);
 				lastTradeCommand.Parameters.Add(new NpgsqlParameter("security_id", NpgsqlDbType.Integer) { Value = securityId });
 
 				var lastPriceResult = await lastTradeCommand.ExecuteScalarAsync(cancellationToken);
@@ -548,9 +557,18 @@ public sealed class PreTradeRiskService
 			}
 
 			// Exact portfolio-wide gross from Trades (parity with the retired proc), NOT a rounded rollup (AAP 0.6.4 / C5).
+			//
+			// PERF (QA MAJOR#1): sum directly over the DENORMALIZED trades.portfolio_id rather than JOINing
+			// Trades -> Orders and filtering on the order's portfolio_id. The former join, once a portfolio
+			// outgrew the planner's nested-loop/hash-join crossover, degraded into a FULL GLOBAL scan of Trades
+			// plus a hash join (with a work_mem temp spill at scale), so this hot-path read grew with the WHOLE
+			// table's history. The IX_Trades_portfolio covering index - (portfolio_id) INCLUDE (qty, price) -
+			// makes this an index-only scan over just the portfolio's own trades. This is ONLY an access-path
+			// change: it is still the EXACT NUMERIC SUM(qty*price) over the identical set of trade rows (Postgres
+			// evaluates NUMERIC*NUMERIC and its SUM without intermediate rounding), so no rounding can creep in
+			// and loosen the commission ceiling (the strictness NFR, AAP 0.6.4 / C5). SUM over no rows => NULL => 0.
 			using var notionalCommand = new NpgsqlCommand(
-				"SELECT SUM(t.qty * t.price) FROM trades t JOIN orders o ON o.order_id = t.order_id " +
-				"WHERE o.portfolio_id = @portfolio_id", connection, transaction);
+				"SELECT SUM(qty * price) FROM trades WHERE portfolio_id = @portfolio_id", connection, transaction);
 			notionalCommand.Parameters.Add(new NpgsqlParameter("portfolio_id", NpgsqlDbType.Integer) { Value = portfolioId });
 			existingGrossNotional = await ExecuteDecimalScalarAsync(notionalCommand, 0m, cancellationToken);
 		}

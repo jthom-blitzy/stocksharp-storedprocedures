@@ -216,6 +216,31 @@ CREATE TABLE Trades
 (
     trade_id        BIGINT GENERATED ALWAYS AS IDENTITY,
     order_id        BIGINT          NOT NULL,
+
+    -- Denormalized (portfolio_id, security_id), copied from the parent order at INSERT time and never
+    -- updated afterwards. These are NOT new business facts - every trade already belongs to exactly one
+    -- order, which belongs to exactly one (portfolio, security), so these columns are pure, immutable
+    -- copies of orders.portfolio_id / orders.security_id for the FK'd order. The data-access gateway
+    -- (SqlLegacyOrderGateway.RecordTradeAsync) resolves them from the parent order on the same
+    -- connection+transaction before the insert, and the test seed helpers derive them with an
+    -- INSERT ... SELECT o.portfolio_id, o.security_id FROM orders o WHERE o.order_id = @order_id, so the
+    -- stored value is guaranteed to equal the parent order's - the FKs below re-assert that referential
+    -- integrity independently.
+    --
+    -- WHY (perf, QA MAJOR#1 / MINOR#1): the PreTradeRiskService pre-trade gate reads two portfolio-/
+    -- security-scoped trade aggregates on the hot validation path - the exact portfolio-wide gross
+    -- SUM(qty*price) for the commission ceiling, and the security's latest trade price for a market
+    -- order's commission estimate. Computing those by JOINing Trades -> Orders forced PostgreSQL, once a
+    -- portfolio outgrew the nested-loop/hash-join crossover, into a FULL GLOBAL scan of Trades plus a hash
+    -- join (with a work_mem temp spill at scale), so the cost grew with the WHOLE table's history, not
+    -- just the portfolio's own. Carrying portfolio_id / security_id directly on Trades lets both reads use
+    -- the bounded covering indexes below instead of the join, so each read touches only the rows it
+    -- aggregates. This is purely an ACCESS-PATH optimization: the gate still computes the EXACT
+    -- SUM(qty*price) over the very same set of trade rows (no rounded rollup column - see the Positions
+    -- note below), so the numeric result and the threshold-strictness NFR are unchanged (AAP 0.6.4 / C5).
+    portfolio_id    INT             NOT NULL,
+    security_id     INT             NOT NULL,
+
     qty             NUMERIC(18,4)   NOT NULL,
     price           NUMERIC(18,4)   NOT NULL,
     executed_date   TIMESTAMP       NOT NULL DEFAULT (now() at time zone 'utc'),
@@ -241,12 +266,31 @@ CREATE TABLE Trades
 
     CONSTRAINT PK_Trades PRIMARY KEY (trade_id),
     CONSTRAINT FK_Trades_Orders FOREIGN KEY (order_id) REFERENCES Orders (order_id),
+    -- Re-assert referential integrity of the denormalized copies against the master tables. They mirror
+    -- the parent order's FKs (FK_Orders_Portfolios / FK_Orders_Securities) so a trade can never carry a
+    -- portfolio/security that does not exist.
+    CONSTRAINT FK_Trades_Portfolios FOREIGN KEY (portfolio_id) REFERENCES Portfolios (portfolio_id),
+    CONSTRAINT FK_Trades_Securities FOREIGN KEY (security_id) REFERENCES Securities (security_id),
     CONSTRAINT CK_Trades_qty CHECK (qty > 0),
     CONSTRAINT CK_Trades_price CHECK (price > 0)
 );
 
 CREATE INDEX IX_Trades_order ON Trades (order_id);
 CREATE INDEX IX_Trades_executed_date ON Trades (executed_date);
+
+-- Covering index for the pre-trade commission gate's exact portfolio-wide gross:
+--   SELECT SUM(qty * price) FROM trades WHERE portfolio_id = @portfolio_id
+-- INCLUDE (qty, price) makes this an index-only scan over just the portfolio's own trades (no heap
+-- visits when the visibility map is set, no Trades->Orders join, no global sequential scan, no hash-join
+-- temp spill). The aggregate stays the EXACT NUMERIC SUM over those rows (QA MAJOR#1).
+CREATE INDEX IX_Trades_portfolio ON Trades (portfolio_id) INCLUDE (qty, price);
+
+-- Composite index for the market-order last-trade-price lookup:
+--   SELECT price FROM trades WHERE security_id = @security_id ORDER BY executed_date DESC, trade_id DESC LIMIT 1
+-- Ordering the key by (security_id, executed_date DESC, trade_id DESC) lets PostgreSQL satisfy the
+-- ORDER BY ... LIMIT 1 by reading a single leaf entry for the security, bounded regardless of how SPARSE
+-- that security's trades are among global history; INCLUDE (price) keeps it index-only (QA MINOR#1).
+CREATE INDEX IX_Trades_security_executed ON Trades (security_id, executed_date DESC, trade_id DESC) INCLUDE (price);
 
 -- C2: partial UNIQUE index enforcing at-most-one persisted trade per external fill key. Partial
 -- (WHERE external_trade_id IS NOT NULL) so the many legacy trades WITHOUT an external key are exempt and
@@ -273,8 +317,9 @@ CREATE UNIQUE INDEX UQ_Trades_external_trade_id
 -- every wide qty*price contribution to four decimals BEFORE summing (live: 0.00000001 -> 0.0000), which
 -- can under-state the portfolio gross and let the commission ceiling stop triggering - a loosening of a
 -- risk control forbidden by the strictness NFR (AAP 0.6.4). Instead the PreTradeRiskService commission
--- gate computes the existing gross EXACTLY as SUM(t.qty * t.price) over the portfolio's Trades
--- (join Trades -> Orders), reproducing the original usp_ValidatePreTradeRisk arithmetic at full NUMERIC
+-- gate computes the existing gross EXACTLY as SUM(qty * price) over the portfolio's Trades
+-- (via the denormalized trades.portfolio_id + IX_Trades_portfolio covering index; formerly a
+-- Trades -> Orders join), reproducing the original usp_ValidatePreTradeRisk arithmetic at full NUMERIC
 -- precision (PostgreSQL evaluates NUMERIC*NUMERIC and its SUM without intermediate rounding). This keeps
 -- the schema pure storage - the C# service owns all arithmetic, and no maintained aggregate can drift.
 -- ============================================================================

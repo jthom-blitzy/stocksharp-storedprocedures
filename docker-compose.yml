@@ -36,6 +36,30 @@ services:
   db:
     image: postgres:16
 
+    # Server tuning (QA MINOR#4 - connection headroom). Raise max_connections above PostgreSQL's
+    # default of 100 and keep slots reserved for superuser/admin access. RATIONALE: the app's Npgsql
+    # pool is bounded well below this ceiling (Maximum Pool Size=50 on the connection string below), so
+    # a single app instance can consume at most 50 of the 200 slots. That leaves ample headroom for a
+    # SECOND app instance, for interactive psql / GUI sessions, and for the healthcheck - eliminating the
+    # former zero-headroom situation where Npgsql's default pool (100) exactly equalled the server
+    # default (100) and one saturated app could lock everyone else out. superuser_reserved_connections=3
+    # additionally guarantees an admin can always connect. The `postgres` entrypoint execs
+    # `postgres "$@"`, so these -c overrides are applied to the REAL server it starts after init.
+    #
+    # DELIBERATELY NOT DONE (AAP-precedence over the QA suggestion): (1) a separate NON-superuser
+    # application role - the frozen AAP (0.4.2) has the app connect with the db service's
+    # POSTGRES_USER/POSTGRES_PASSWORD (a single `postgres` role, see the header note); introducing a
+    # least-privilege role is out of scope for this brief. (2) acquiring the pooled connection AFTER the
+    # per-portfolio advisory lock - the lock is intentionally transaction-scoped (pg_advisory_xact_lock)
+    # around the validation reads + INSERT for TOCTOU correctness, so the connection must be held for the
+    # whole gated unit; a bounded pool (not a lock-ordering change) is the correct mitigation.
+    command:
+      - "postgres"
+      - "-c"
+      - "max_connections=200"
+      - "-c"
+      - "superuser_reserved_connections=3"
+
     # POSTGRES_DB makes the entrypoint CREATE the `stocksharp` database on first
     # init — this replaces the old T-SQL `CREATE DATABASE` guard, so the SQL
     # init scripts neither create nor switch databases. POSTGRES_USER / _PASSWORD
@@ -131,9 +155,15 @@ services:
     # password-authenticated stack removes the probe entirely; no Kerberos library is
     # installed in the runtime image by design (see Dockerfile).
     #
+    # "Maximum Pool Size=50" (QA MINOR#4): bound THIS instance's Npgsql pool well below the db service's
+    # max_connections=200 (see the db `command:` above). Npgsql's default pool is 100, which previously
+    # equalled the server default (100) and left zero headroom; capping at 50 keeps a single instance to
+    # at most 50 of 200 slots, so a second instance, an admin psql session, and the healthcheck all still
+    # fit. 50 comfortably exceeds this one-shot demo's needs (it uses a single connection).
+    #
     # Quoted because the value contains '=' and ';'.
     environment:
-      - "STOCKSHARP_LEGACY_SQL_CONNECTION=Host=db;Port=5432;Database=stocksharp;Username=postgres;Password=postgres;GSS Encryption Mode=Disable"
+      - "STOCKSHARP_LEGACY_SQL_CONNECTION=Host=db;Port=5432;Database=stocksharp;Username=postgres;Password=postgres;GSS Encryption Mode=Disable;Maximum Pool Size=50"
 
     # No `restart:` policy (defaults to `no`): the demo is a one-shot walkthrough
     # that prints its three scenarios and exits. Auto-restarting would loop it
