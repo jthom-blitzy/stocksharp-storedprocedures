@@ -66,7 +66,7 @@ The artifacts below collectively demonstrate three things, all from the one run.
   those three scripts running and `README.md` being ignored, and whose post-demo
   catalog shows the seven pure-storage tables.
 - **C. Staged-testing / behavioral parity** — the `Tests/` parity suites
-  **`PreTradeRiskParityTests`** (46 passed, 4 skipped) and
+  **`PreTradeRiskParityTests`** (47 passed, 4 skipped) and
   **`PositionRecalculationTests`** (25 passed, 3 skipped) pass against the same live
   database, proving the consolidated C# logic matches the original behavior. That
   includes the rolling-frequency **threshold-strictness invariant** (the reconciled
@@ -186,7 +186,7 @@ both engines must be configured and reachable, and the SQL Server target must be
    ```
 
    With both variables set and both databases reachable, the staged tests report
-   **zero skips** (`PreTradeRiskParityTests` → 50 passed, `PositionRecalculationTests`
+   **zero skips** (`PreTradeRiskParityTests` → 51 passed, `PositionRecalculationTests`
    → 28 passed). With neither set, every database-integration test is Inconclusive
    (skipped) and only the pure-logic tests run — a missing engine never looks like a
    failure. Tear the throwaway SQL Server down when finished:
@@ -257,6 +257,14 @@ separate application role and no init script beyond the three frozen by the AAP.
 `GSS Encryption Mode=Disable` stops Npgsql probing for a Kerberos library that this
 local, password-authenticated stack does not use.
 
+> **Local-dev credentials only.** Every credential in this document and in the
+> reproduction commands below — the PostgreSQL `postgres` / `postgres` pair and the
+> throwaway SQL Server `sa` / `DevTest_Passw0rd!` used for the optional dual-engine
+> run — is a disposable local-development value that matches the committed
+> `docker-compose.yml` and the setup instructions. None of these are real secrets;
+> they are intended for local, throwaway containers only and must **never** be
+> reused for any shared, staging, or production database.
+
 The seeded risk limits that drive the demo outcomes are fixed by
 `Database/004_SeedData.sql` and must not change: `max_order_price=500.00`,
 `max_order_qty=10000`, `max_order_value=1000000.00`, `max_position_size=100000`,
@@ -279,7 +287,7 @@ environment; none is printed).
 | `screenshots/02_order_accepted.png` | Demo scenario 1 — `BUY 100 @ 150.00` accepted: `is_valid=True`, `reject_reason=(none)` | `QA/recordings/02_demo_scenarios.md` |
 | `screenshots/03_order_rejected_by_price.png` | Demo scenario 2 — `BUY 10 @ 999.00` rejected: `is_valid=False`, reason `Order price 999.00 meets/exceeds limit 500.0000`, from the `PreTradeRiskService` gate | `QA/recordings/02_demo_scenarios.md` |
 | `screenshots/04_position_auto_updated.png` | Demo scenario 3 — after `RecordTradeAsync`, the position auto-updates to `qty=100.0000 avg_price=150.0000 realized_pnl=0.0000` via `PositionRecalculationService` (no trigger) | `QA/recordings/02_demo_scenarios.md` |
-| `screenshots/05_pretraderisk_parity_tests_pass.png` | `PreTradeRiskParityTests` — **46 passed, 0 failed, 4 skipped** against live PostgreSQL (the 4 skips are the SQL-Server golden-baseline tests) | `QA/recordings/03_parity_tests.md` |
+| `screenshots/05_pretraderisk_parity_tests_pass.png` | `PreTradeRiskParityTests` — **47 passed, 0 failed, 4 skipped** against live PostgreSQL (the 4 skips are the SQL-Server golden-baseline tests) | `QA/recordings/03_parity_tests.md` |
 | `screenshots/06_position_recalc_tests_pass.png` | `PositionRecalculationTests` — **25 passed, 0 failed, 3 skipped** against live PostgreSQL (the 3 skips are the SQL-Server golden-baseline stages) | `QA/recordings/03_parity_tests.md` |
 
 ## Recordings — timestamped transcripts (evidence of record)
@@ -292,7 +300,7 @@ authentic run — these transcripts are the evidence of record.
 |---|---|---|
 | `recordings/01_end_to_end.md` | Full end-to-end flow of the one run: `docker compose up --build` → image built (with the OS patch) → healthy PostgreSQL → the demo runs the three scenarios and exits 0 → post-demo catalog (7 tables, position updated) | Timestamped transcript (verbatim build / db-init / app / catalog captures) |
 | `recordings/02_demo_scenarios.md` | Focused walkthrough of the three demo outcomes (accept / reject-by-price / automatic position update) | Timestamped transcript (verbatim `app`-service output) |
-| `recordings/03_parity_tests.md` | The two `dotnet test` parity suites against the same database (46 passed/4 skipped and 25 passed/3 skipped, with the skips explained) | Timestamped transcript (verbatim `dotnet test` summaries) |
+| `recordings/03_parity_tests.md` | The two `dotnet test` parity suites against the same database (47 passed/4 skipped and 25 passed/3 skipped, with the skips explained) | Timestamped transcript (verbatim `dotnet test` summaries) |
 
 **Substitution policy.** Genuine screen-capture video is not feasible for this
 workload — it is a headless .NET console app plus a PostgreSQL container, with no

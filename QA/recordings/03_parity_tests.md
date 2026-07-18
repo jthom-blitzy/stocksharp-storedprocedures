@@ -37,10 +37,10 @@ provision a disposable SQL Server and set both variables as described in
 
 | When (UTC) | Suite | Result |
 |------------|-------|--------|
-| 07:41:49Z | PreTradeRiskParityTests | **Passed 46 / Failed 0 / Skipped 4**, exit 0 |
+| 07:41:49Z | PreTradeRiskParityTests | **Passed 47 / Failed 0 / Skipped 4**, exit 0 |
 | 07:42:09Z | PositionRecalculationTests | **Passed 25 / Failed 0 / Skipped 3**, exit 0 |
 
-## PreTradeRiskParityTests — 46 passed, 0 failed, 4 skipped
+## PreTradeRiskParityTests — 47 passed, 0 failed, 4 skipped
 
 Command (host-side, against the same Compose `db` on the remapped port 55433):
 
@@ -52,12 +52,12 @@ dotnet test Tests/Tests.csproj --no-build -c Release --filter "FullyQualifiedNam
 Verbatim summary line:
 
 ```
-Passed!  - Failed:     0, Passed:    46, Skipped:     4, Total:    50, Duration: 2 s - StockSharp.Tests.dll (net10.0)
+Passed!  - Failed:     0, Passed:    47, Skipped:     4, Total:    51, Duration: 2 s - StockSharp.Tests.dll (net10.0)
 ```
 
 The 4 skipped are the SQL-Server golden-baseline checks (`Step1`, `Step2`, the two
 `Step4` attribution-matrix cases) — Inconclusive because no SQL Server is
-configured in this PostgreSQL-only capture. The 46 passed include the seven
+configured in this PostgreSQL-only capture. The 47 passed include the seven
 pre-trade checks' PostgreSQL parity plus the adversarial/structural gate
 regressions added in this change (malformed input, fail-closed negative limits,
 clock-skew via DB transaction time).
