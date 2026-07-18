@@ -71,15 +71,25 @@ CREATE TABLE Securities
     board_code      VARCHAR(20)   NULL,       -- e.g. "NASDAQ"
     security_type   VARCHAR(20)   NULL,       -- Stock/Future/Option/...
 
-    CONSTRAINT PK_Securities PRIMARY KEY (security_id),
-    -- NULLS NOT DISTINCT (PostgreSQL 15+): treat NULL board_code values as EQUAL so a
-    -- second (security_code, NULL) row is rejected. PostgreSQL's default treats NULLs as
-    -- DISTINCT (which would allow duplicate (AAPL, NULL) rows); SQL Server's UNIQUE treats
-    -- NULLs as equal, so this preserves the original single-NULL-per-code semantics and lets
-    -- the gateway's INSERT ... ON CONFLICT (security_code, board_code) upsert match rows that
-    -- have a NULL board_code.
-    CONSTRAINT UQ_Securities_code_board UNIQUE NULLS NOT DISTINCT (security_code, board_code)
+    CONSTRAINT PK_Securities PRIMARY KEY (security_id)
+    -- Uniqueness on (security_code, board_code) is enforced by the case-insensitive FUNCTIONAL
+    -- unique index declared just below. A functional (expression) index cannot be written as an
+    -- inline table CONSTRAINT, so it must be a separate CREATE UNIQUE INDEX statement.
 );
+
+-- M4 (case-insensitive migration parity): the original SQL Server table collated security_code and
+-- board_code case-INSENSITIVELY (default CI collation), so 'AAPL'/'NASDAQ' and 'aapl'/'nasdaq' resolved
+-- to the SAME instrument. PostgreSQL's VARCHAR comparison is case-SENSITIVE, which silently allowed
+-- 'aapl' and 'AAPL' to coexist as two distinct rows - a migration-parity defect (a live probe inserted
+-- both). A functional UNIQUE INDEX over LOWER(security_code), LOWER(board_code) restores the original
+-- case-folding identity so the two casings collide again. NULLS NOT DISTINCT (PostgreSQL 15+) treats a
+-- LOWER(NULL) board value as EQUAL to another so a second (code, NULL board) row is still rejected -
+-- reproducing SQL Server's UNIQUE, which also treated NULLs as equal, and preserving the original
+-- single-NULL-per-code semantics. The gateway's matching conflict target is
+-- ON CONFLICT (LOWER(security_code), LOWER(board_code)) so its upsert infers THIS index (see
+-- SqlLegacyOrderGateway.EnsureSecurityAsync and 004_SeedData.sql).
+CREATE UNIQUE INDEX UQ_Securities_code_board
+    ON Securities (LOWER(security_code), LOWER(board_code)) NULLS NOT DISTINCT;
 
 -- ============================================================================
 -- RiskLimits
@@ -119,7 +129,33 @@ CREATE TABLE RiskLimits
     CONSTRAINT PK_RiskLimits PRIMARY KEY (risk_limit_id),
     CONSTRAINT FK_RiskLimits_Portfolios FOREIGN KEY (portfolio_id) REFERENCES Portfolios (portfolio_id),
     CONSTRAINT FK_RiskLimits_Securities FOREIGN KEY (security_id) REFERENCES Securities (security_id),
-    CONSTRAINT CK_RiskLimits_scope CHECK (portfolio_id IS NOT NULL OR security_id IS NOT NULL)
+    CONSTRAINT CK_RiskLimits_scope CHECK (portfolio_id IS NOT NULL OR security_id IS NOT NULL),
+
+    -- M2 (fail-CLOSED configuration): every ceiling is a non-negative magnitude. NULL/0 still means
+    -- "not enforced" (the shared C#/SQL convention), but a NEGATIVE ceiling is nonsensical. Previously a
+    -- negative value slipped past the DDL and was then silently treated as "disabled" by the `> 0`
+    -- enable-predicates - a fail-OPEN hole in which an operator fat-fingering `-1` would DISABLE the control
+    -- rather than tighten it (a live all-negative row inserted successfully). Rejecting negatives at the
+    -- storage layer makes misconfiguration fail-CLOSED. PreTradeRiskService carries a matching runtime guard
+    -- (M2 code fix) that fails closed for any negative limit that predates this constraint or arrives by a
+    -- path that bypasses it.
+    CONSTRAINT CK_RiskLimits_max_order_price     CHECK (max_order_price      IS NULL OR max_order_price      >= 0),
+    CONSTRAINT CK_RiskLimits_max_order_qty       CHECK (max_order_qty        IS NULL OR max_order_qty        >= 0),
+    CONSTRAINT CK_RiskLimits_max_order_value     CHECK (max_order_value      IS NULL OR max_order_value      >= 0),
+    CONSTRAINT CK_RiskLimits_max_position_size   CHECK (max_position_size    IS NULL OR max_position_size    >= 0),
+    CONSTRAINT CK_RiskLimits_max_daily_volume    CHECK (max_daily_volume     IS NULL OR max_daily_volume     >= 0),
+    CONSTRAINT CK_RiskLimits_max_commission      CHECK (max_commission_total IS NULL OR max_commission_total >= 0),
+    CONSTRAINT CK_RiskLimits_commission_rate     CHECK (commission_rate >= 0),
+    CONSTRAINT CK_RiskLimits_freq_count          CHECK (max_order_freq_count      IS NULL OR max_order_freq_count      >= 0),
+    CONSTRAINT CK_RiskLimits_freq_window         CHECK (max_order_freq_window_sec IS NULL OR max_order_freq_window_sec >= 0),
+
+    -- Paired-frequency: the rolling order-frequency control is only meaningful when BOTH a count and a
+    -- window are present. Allowing one without the other (a count with no window, or a window with no
+    -- count) is a half-configured control that silently enforces nothing. Require the pair to be either
+    -- both-set or both-NULL. `(a IS NULL) = (b IS NULL)` is TRUE exactly when the two share NULL-ness.
+    CONSTRAINT CK_RiskLimits_freq_paired CHECK (
+        (max_order_freq_count IS NULL) = (max_order_freq_window_sec IS NULL)
+    )
 );
 
 -- filtered index -> Postgres partial index (identical WHERE-predicate syntax).
@@ -192,6 +228,17 @@ CREATE TABLE Trades
     -- same persisted trade_id sees TRUE and becomes a no-op.
     position_applied BOOLEAN        NOT NULL DEFAULT FALSE,
 
+    -- C2 (idempotency / exactly-once fills): OPTIONAL stable external fill identifier supplied by the
+    -- upstream execution source (e.g. a broker/venue fill id). position_applied alone only dedups a replay
+    -- of the SAME persisted trade_id; it does NOT stop a RETRY of RecordTradeAsync from inserting a
+    -- BRAND-NEW trade_id for a fill that already posted, so one real fill could apply twice after an
+    -- ambiguous commit/replay. A caller holding a durable external fill key passes it via the 4-arg
+    -- RecordTradeAsync overload; the partial UNIQUE index below turns the second insert of the same key
+    -- into a no-op (INSERT ... ON CONFLICT DO NOTHING), collapsing retries to exactly one persisted fill.
+    -- NULL is allowed and is NOT deduplicated (the partial index skips NULLs), so the legacy 3-arg path -
+    -- which has no external key - keeps working unchanged.
+    external_trade_id BIGINT        NULL,
+
     CONSTRAINT PK_Trades PRIMARY KEY (trade_id),
     CONSTRAINT FK_Trades_Orders FOREIGN KEY (order_id) REFERENCES Orders (order_id),
     CONSTRAINT CK_Trades_qty CHECK (qty > 0),
@@ -200,6 +247,18 @@ CREATE TABLE Trades
 
 CREATE INDEX IX_Trades_order ON Trades (order_id);
 CREATE INDEX IX_Trades_executed_date ON Trades (executed_date);
+
+-- C2: partial UNIQUE index enforcing at-most-one persisted trade per external fill key. Partial
+-- (WHERE external_trade_id IS NOT NULL) so the many legacy trades WITHOUT an external key are exempt and
+-- unconstrained; only rows that DO carry a key are deduplicated. This is the unique index the 4-arg
+-- RecordTradeAsync overload infers. NOTE: to infer a PARTIAL index, the upsert MUST repeat the index
+-- predicate in its conflict clause -
+--     INSERT ... ON CONFLICT (external_trade_id) WHERE external_trade_id IS NOT NULL DO NOTHING
+-- - a bare "ON CONFLICT (external_trade_id)" fails with "no unique or exclusion constraint matching the
+-- ON CONFLICT specification" because PostgreSQL will not silently pick a partial index. With the matching
+-- WHERE, a post-commit retry of the same fill becomes a no-op (0 rows), making the fill exactly-once.
+CREATE UNIQUE INDEX UQ_Trades_external_trade_id
+    ON Trades (external_trade_id) WHERE external_trade_id IS NOT NULL;
 
 -- ============================================================================
 -- Positions

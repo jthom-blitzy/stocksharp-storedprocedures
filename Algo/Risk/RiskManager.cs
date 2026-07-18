@@ -17,9 +17,20 @@ namespace StockSharp.Algo.Risk;
 /// limits that used to exist only on the SQL side). Where a rule exists on both sides - order
 /// frequency being the prime example - the circuit-breaker rule (<see cref="RiskOrderFreqRule"/>)
 /// and the gate now consume the SAME canonical frequency evaluator in
-/// <see cref="CanonicalRiskRules"/>, so the two can no longer silently diverge. Rules that exist
-/// on both sides but evaluate different subjects (for example commission and position size) are
-/// preserved on each side by design rather than merged.
+/// <see cref="CanonicalRiskRules"/>. The shared surface is precise and narrow: the rolling-window
+/// count definition and the "&gt;= Count" meets-or-exceeds threshold plus the "window must be
+/// positive to be enforced" convention - i.e. GIVEN THE SAME observed events the two compute the
+/// SAME in-window verdict, so they can no longer disagree on the frequency ARITHMETIC. They still
+/// differ, by design, in everything AROUND that arithmetic and so can still reach different
+/// outcomes on the same real order flow: the circuit breaker feeds the evaluator an in-memory
+/// buffer of message-stream timestamps that it RESETS when it trips, whereas the gate queries the
+/// Orders table at evaluation time and counts EVERY recent row (including rejected orders); the
+/// data source, the state lifecycle, the rejected-order handling, and the action taken
+/// (portfolio-wide ClosePositions/StopTrading/CancelOrders vs. rejecting the single offending
+/// order) are all distinct. Rules that exist on both sides but evaluate different subjects (for
+/// example commission - post-fill actual vs. pre-fill estimate - and position size - current vs.
+/// hypothetical post-fill) are preserved on each side by design rather than merged; see the
+/// merged-vs-preserved table in LEGACY_LAYER.md for the exact per-rule verdict.
 /// </remarks>
 public class RiskManager : BaseLogReceiver, IRiskManager
 {

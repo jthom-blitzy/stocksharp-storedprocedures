@@ -114,16 +114,17 @@ public class SqlLegacyOrderGateway
 		await using var connection = CreateConnection();
 		await connection.OpenAsync(cancellationToken);
 
-		// Atomic upsert-or-select (F7): INSERT ... ON CONFLICT (security_code, board_code) DO UPDATE ...
-		// RETURNING removes the former SELECT-then-INSERT race. The conflict target matches
-		// UQ_Securities_code_board, declared UNIQUE NULLS NOT DISTINCT (Phase-2 schema fix) so a NULL
-		// board_code participates in the uniqueness check - reproducing the old
-		// "@board IS NULL AND board_code IS NULL" match and preventing duplicate (code, NULL board) rows.
+		// Atomic upsert-or-select (F7): INSERT ... ON CONFLICT (LOWER(security_code), LOWER(board_code))
+		// DO UPDATE ... RETURNING removes the former SELECT-then-INSERT race. The conflict target is the
+		// case-insensitive expression list of the functional unique index UQ_Securities_code_board (M4),
+		// declared NULLS NOT DISTINCT so a NULL board_code participates in the uniqueness check - reproducing
+		// the old "@board IS NULL AND board_code IS NULL" match, preventing duplicate (code, NULL board) rows,
+		// AND folding case so ensuring 'aapl' after 'AAPL' resolves to the SAME row (SQL Server CI parity).
 		// DO UPDATE (a no-op touch of security_code) guarantees a RETURNING row on an existing match, where
 		// DO NOTHING would return none. T-SQL "OUTPUT INSERTED.security_id" -> Postgres "RETURNING security_id".
 		await using var command = new NpgsqlCommand(
 			"INSERT INTO securities (security_code, board_code, security_type) VALUES (@code, @board, @type) " +
-			"ON CONFLICT (security_code, board_code) DO UPDATE SET security_code = EXCLUDED.security_code " +
+			"ON CONFLICT (LOWER(security_code), LOWER(board_code)) DO UPDATE SET security_code = EXCLUDED.security_code " +
 			"RETURNING security_id", connection);
 		command.Parameters.Add(new NpgsqlParameter("code", NpgsqlDbType.Varchar) { Value = security.Code });
 		command.Parameters.Add(new NpgsqlParameter("board", NpgsqlDbType.Varchar) { Value = (object)boardCode ?? DBNull.Value });
@@ -277,54 +278,126 @@ public class SqlLegacyOrderGateway
 	/// inside a single gateway-owned transaction so the trade row and the position update commit
 	/// together or not at all (atomicity, AAP 0.6.5). The old <c>trg_Trades_PositionRecalc</c> trigger
 	/// that used to recompute the position in the database was removed in the consolidation, so this
-	/// explicit call is now the sole applier. Exactly-once is enforced durably by the service's
-	/// <c>trades.position_applied</c> guard (flipped in the same commit), so a retried or replayed
-	/// apply of the SAME persisted trade is a safe idempotent no-op rather than a double count.
+	/// explicit call is now the sole applier. Exactly-once for a REPLAY of the same persisted trade is
+	/// enforced durably by the service's <c>trades.position_applied</c> guard (flipped in the same commit),
+	/// so a retried or replayed apply of the SAME persisted trade is a safe idempotent no-op rather than a
+	/// double count. To also dedup a RETRY that would otherwise insert a fresh trade id for a fill that was
+	/// already persisted, use the <see cref="RecordTradeAsync(long, decimal, decimal, long, CancellationToken)"/>
+	/// overload that carries a stable external fill key (C2).
 	/// </summary>
-	public async Task RecordTradeAsync(long orderId, decimal qty, decimal price, CancellationToken cancellationToken = default)
+	public Task RecordTradeAsync(long orderId, decimal qty, decimal price, CancellationToken cancellationToken = default)
+		=> RecordTradeCoreAsync(orderId, qty, price, externalTradeId: null, cancellationToken);
+
+	/// <summary>
+	/// Records a fill against an order, tagged with a stable EXTERNAL fill key (e.g. a broker/venue fill id)
+	/// so the operation is idempotent across a post-commit RETRY. If a trade with the same
+	/// <paramref name="externalTradeId"/> was already persisted, the insert is a no-op (the position effect was
+	/// applied by that earlier committed call) and this method returns without applying again - collapsing a
+	/// retried fill to exactly one persisted trade and one position effect (C2). Preserves the public
+	/// three-argument contract (AAP 0.7.1) as an additive overload; everything else matches
+	/// <see cref="RecordTradeAsync(long, decimal, decimal, CancellationToken)"/> (single gateway-owned
+	/// transaction, per-portfolio advisory lock, durable single-apply).
+	/// </summary>
+	/// <param name="orderId">Order the fill executed against (<c>orders.order_id</c>).</param>
+	/// <param name="qty">Executed quantity (NUMERIC(18,4)).</param>
+	/// <param name="price">Executed price (NUMERIC(18,4)).</param>
+	/// <param name="externalTradeId">Stable external fill identifier used as the idempotency key (<c>trades.external_trade_id</c>).</param>
+	/// <param name="cancellationToken">Token used to cancel the database operations.</param>
+	public Task RecordTradeAsync(long orderId, decimal qty, decimal price, long externalTradeId, CancellationToken cancellationToken = default)
+		=> RecordTradeCoreAsync(orderId, qty, price, externalTradeId, cancellationToken);
+
+	/// <summary>
+	/// Shared implementation of the <c>RecordTradeAsync</c> overloads. Runs the WHOLE unit - portfolio
+	/// resolution, per-portfolio advisory lock, trade INSERT, single-apply claim and position recompute - in
+	/// ONE gateway-owned transaction. C3: the advisory lock is acquired BEFORE the trade is inserted, so the
+	/// insert + claim + position update all happen under the SAME lock that <see cref="SubmitOrderAsync"/>
+	/// takes; a concurrent submit therefore cannot acquire the lock and validate against a snapshot that is
+	/// missing this (still-uncommitted) fill. When <paramref name="externalTradeId"/> is supplied, the insert
+	/// is idempotent via <c>ON CONFLICT ... DO NOTHING</c> on the partial-unique external-fill index (C2).
+	/// </summary>
+	private async Task RecordTradeCoreAsync(long orderId, decimal qty, decimal price, long? externalTradeId, CancellationToken cancellationToken)
 	{
 		await using var connection = CreateConnection();
 		await connection.OpenAsync(cancellationToken);
 
 		// Atomicity (F2, AAP 0.6.5): the trade INSERT and the position recompute run in ONE gateway-owned
 		// transaction, so a trade row can never be committed without its position effect (nor vice versa).
-		// The recalculation service enrols in this transaction - it neither begins nor commits it and takes
-		// its per-portfolio advisory lock on it (C4, the same lock space this gateway's SubmitOrderAsync uses)
-		// - and the gateway commits once at the end.
+		// The recalculation service enrols in this transaction - it neither begins nor commits it - and the
+		// gateway commits once at the end.
 		await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
 
-		// Insert the fill, capturing the generated trade id AND the PERSISTED qty/price. executed_date via
-		// now() at time zone 'utc' (UTC time source, AAP 0.6.4). C5 fix: bind the caller's qty/price but read
-		// them BACK via RETURNING, so the position recompute below runs on the values ACTUALLY stored in the
-		// NUMERIC(18,4) columns (Postgres rounds to 4dp on insert) rather than on a raw >4dp input that would
-		// disagree with the persisted trade row and could loosen a downstream >= comparison. T-SQL
-		// "OUTPUT INSERTED.*" -> Postgres "RETURNING" (was OUTPUT INSERTED / trigger-driven flow).
+		// C3 (TOCTOU fix): resolve the order's portfolio and acquire the per-portfolio advisory lock BEFORE
+		// inserting the trade, so the entire insert + claim + position update runs under the SAME single-key
+		// pg_advisory_xact_lock(bigint) that SubmitOrderAsync uses. Previously the trade was inserted first and
+		// the lock was taken inside ApplyAsync AFTER the insert; a concurrent submit could acquire the lock in
+		// between and validate against state that could not yet see this uncommitted fill. Taking the lock here,
+		// up front, closes that window (ApplyAsync re-takes the same key re-entrantly - a harmless no-op).
+		int portfolioId;
+		using (var portfolioCommand = new NpgsqlCommand(
+			"SELECT portfolio_id FROM orders WHERE order_id = @order_id", connection, transaction))
+		{
+			portfolioCommand.Parameters.Add(new NpgsqlParameter("order_id", NpgsqlDbType.Bigint) { Value = orderId });
+			var resolved = await portfolioCommand.ExecuteScalarAsync(cancellationToken);
+			if (resolved is null or DBNull)
+				throw new InvalidOperationException($"SqlLegacyOrderGateway.RecordTradeAsync: order_id {orderId} not found");
+			portfolioId = (int)resolved;
+		}
+
+		using (var lockCommand = new NpgsqlCommand(
+			"SELECT pg_advisory_xact_lock(@portfolio_id)", connection, transaction))
+		{
+			lockCommand.Parameters.Add(new NpgsqlParameter("portfolio_id", NpgsqlDbType.Bigint) { Value = (long)portfolioId });
+			await lockCommand.ExecuteNonQueryAsync(cancellationToken);
+		}
+
+		// Insert the fill. executed_date via now() at time zone 'utc' (UTC time source, AAP 0.6.4). When an
+		// external fill key is supplied, the insert is idempotent: ON CONFLICT (external_trade_id) WHERE
+		// external_trade_id IS NOT NULL DO NOTHING infers the PARTIAL unique index UQ_Trades_external_trade_id -
+		// the WHERE predicate MUST be repeated for a partial index or Postgres raises "no unique or exclusion
+		// constraint matching the ON CONFLICT specification". A conflict means the fill was already persisted
+		// (and applied) by an earlier committed call, so the insert affects 0 rows and RETURNING yields none.
+		// C1: qty/price are NOT read back here for the recompute; ApplyAsync derives the applied values straight
+		// from the persisted trade row it claims, so nothing downstream trusts caller-supplied values.
+		var insertSql = externalTradeId is null
+			? "INSERT INTO trades (order_id, qty, price, executed_date) " +
+			  "VALUES (@order_id, @qty, @price, now() at time zone 'utc') RETURNING trade_id"
+			: "INSERT INTO trades (order_id, qty, price, external_trade_id, executed_date) " +
+			  "VALUES (@order_id, @qty, @price, @external_trade_id, now() at time zone 'utc') " +
+			  "ON CONFLICT (external_trade_id) WHERE external_trade_id IS NOT NULL DO NOTHING RETURNING trade_id";
+
 		long tradeId;
-		decimal persistedQty;
-		decimal persistedPrice;
-		await using (var insert = new NpgsqlCommand(
-			"INSERT INTO trades (order_id, qty, price, executed_date) VALUES (@order_id, @qty, @price, now() at time zone 'utc') RETURNING trade_id, qty, price", connection, transaction))
+		bool inserted;
+		await using (var insert = new NpgsqlCommand(insertSql, connection, transaction))
 		{
 			insert.Parameters.Add(new NpgsqlParameter("order_id", NpgsqlDbType.Bigint) { Value = orderId });
 			// qty / price are NUMERIC(18,4): bind as decimal (never double/float) - AAP 0.6.4.
 			insert.Parameters.Add(new NpgsqlParameter("qty", NpgsqlDbType.Numeric) { Value = qty });
 			insert.Parameters.Add(new NpgsqlParameter("price", NpgsqlDbType.Numeric) { Value = price });
+			if (externalTradeId is not null)
+				insert.Parameters.Add(new NpgsqlParameter("external_trade_id", NpgsqlDbType.Bigint) { Value = externalTradeId.Value });
 
 			// No MARS on a single Npgsql connection: fully read and dispose this reader before ApplyAsync runs
 			// its own commands on the same connection + transaction.
 			await using var reader = await insert.ExecuteReaderAsync(cancellationToken);
-			await reader.ReadAsync(cancellationToken);
-			tradeId = reader.GetInt64(0);
-			// Persisted (4dp-rounded) qty/price -> decimal, so ApplyAsync computes from stored values (C5).
-			persistedQty = reader.GetDecimal(1);
-			persistedPrice = reader.GetDecimal(2);
+			inserted = await reader.ReadAsync(cancellationToken);
+			tradeId = inserted ? reader.GetInt64(0) : 0L;
 		}
 
-		// Single-apply invariant (AAP 0.6.5): the trg_Trades_PositionRecalc trigger was removed, so the
-		// gateway is the sole applier and calls the recalculation service exactly once for this freshly-
-		// inserted trade, on THIS connection + transaction. The service owns neither the connection nor the
-		// transaction (the gateway does), so the trade row and the position write form one atomic unit.
-		await _positionRecalc.ApplyAsync(connection, transaction, orderId, tradeId, persistedQty, persistedPrice, cancellationToken);
+		// C2 idempotency: an external-key conflict means this fill was ALREADY recorded and its position effect
+		// already applied in that prior committed transaction. There is nothing to insert or apply now; commit
+		// the (empty) transaction and return - a safe no-op that makes a post-commit retry exactly-once.
+		if (!inserted)
+		{
+			await transaction.CommitAsync(cancellationToken);
+			return;
+		}
+
+		// Single-apply invariant (AAP 0.6.5): the trg_Trades_PositionRecalc trigger was removed, so the gateway
+		// is the sole applier and calls the recalculation service exactly once for this freshly-inserted trade,
+		// on THIS connection + transaction and under the advisory lock taken above. ApplyAsync (C1) claims the
+		// trade by (trade_id AND order_id) and derives qty/price from the persisted row, so the trade row and
+		// the position write form one atomic, correctly-bound unit.
+		await _positionRecalc.ApplyAsync(connection, transaction, orderId, tradeId, cancellationToken);
 
 		await transaction.CommitAsync(cancellationToken);
 	}

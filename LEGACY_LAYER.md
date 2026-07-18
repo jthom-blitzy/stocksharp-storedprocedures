@@ -19,7 +19,9 @@ gate and the circuit breaker are still two different patterns (a per-order gate
 vs. a portfolio-wide breaker), and for most checks each keeps its own values and
 its own subject; what changed is that the one rule they used to implement twice
 and disagree on - order frequency - now runs through a single shared evaluator,
-so they can't silently diverge on it the way they used to. The rule-by-rule
+so they can no longer disagree on the frequency *arithmetic* the way they used to.
+They still read different state (database rows vs. an in-memory message stream)
+and take different actions, so their outcomes can still differ - the rule-by-rule
 table below is precise about exactly what is shared and what is not.
 
 While that consolidation happened the persistence tier moved too: the database
@@ -98,14 +100,36 @@ The important change is order frequency - the one rule the two sides used to
 implement twice and disagree on. It used to be two separate code paths (a fixed
 bucket in C#, a rolling `COUNT(*)` in SQL) that could give different answers for
 the same burst; now the gate and `RiskOrderFreqRule` both call the one
-rolling-window evaluator in `CanonicalRiskRules`, so they can't come back with
-different verdicts on the same burst. That shared evaluator, and the comparison
-convention it applies, are the concrete "single source of truth" here; the other
-shared-name checks are more subtle, and the table below says exactly how. Anyone
-asking "does this order get risk-checked" still needs to know which path it went
-through - `SqlLegacyOrderGateway.SubmitOrderAsync` runs the gate; a `Connector` /
-`RiskMessageAdapter` pipeline runs the circuit breaker - but the two can no
-longer *silently disagree* on order frequency, the rule they genuinely share.
+rolling-window evaluator in `CanonicalRiskRules`. The shared surface is precise
+and narrow: the rolling-window count definition, the `>= Count` meets-or-exceeds
+threshold, and the "window must be positive to be enforced" convention. Given the
+SAME observed events the two now compute the SAME in-window verdict, so they can
+no longer disagree on the frequency *arithmetic*. What they do **not** share, by
+design, is everything around that arithmetic - and it is enough that the two can
+still reach different outcomes on the same real order flow:
+
+- **Data source.** The circuit breaker feeds the evaluator an in-memory buffer of
+  message-stream timestamps; the gate queries the `Orders` table at evaluation
+  time.
+- **Rejected-order handling.** The gate's `COUNT(*)` includes every recent order
+  row regardless of status (rejected orders count toward the window); the circuit
+  breaker only ever sees what actually flowed through the message stream.
+- **State & lifecycle.** The circuit breaker keeps its buffer and RESETS it when
+  it trips; the gate is stateless per call and re-derives the count from the
+  database every time.
+- **Reaction.** The circuit breaker takes a portfolio-wide action
+  (`ClosePositions` / `StopTrading` / `CancelOrders`); the gate rejects the single
+  offending order.
+
+That shared evaluator, and the comparison convention it applies, are the concrete
+"single source of truth" here; the other shared-name checks are more subtle, and
+the table below says exactly how. Anyone asking "does this order get
+risk-checked" still needs to know which path it went through -
+`SqlLegacyOrderGateway.SubmitOrderAsync` runs the gate; a `Connector` /
+`RiskMessageAdapter` pipeline runs the circuit breaker - and, even for the
+frequency rule they genuinely share, "consolidated" means they can no longer
+disagree on the *arithmetic*, not that they became the same check: the state each
+feeds it, and the action each takes, still differ by design.
 
 
 ### Merged, preserved, or promoted: the rule-by-rule verdict
@@ -317,12 +341,20 @@ Because the `pgdata` volume persists between runs, re-running the demo (or the
 outcomes. Run `docker compose down -v` immediately before any run whose output
 you want to reproduce exactly.
 
-Every scenario described above - accept within limits, reject-by-price (with a
-reason), reject-by-frequency, a recorded trade driving the position recalc, and a
-status change writing an `OrderStatusHistory` audit row - is exercised by the
-automated suites in `Tests/` (`PreTradeRiskParityTests`, `PositionRecalculationTests`)
-against a real containerized PostgreSQL 16 instance, and by the runnable
-`Samples/08_Misc/03_LegacySqlDemo` walkthrough. Those passing suites and the demo
-run are the evidence of record; `QA/` holds captured artifacts (screenshots and
-transcripts) from real runs, indexed by `QA/README.md`, as an illustration of
-that - not as a stand-in for the tests.
+Every scenario described above is exercised by the automated suites in `Tests/`
+against a real containerized PostgreSQL 16 instance: accept-within-limits,
+reject-by-price, reject-by-frequency, and the notional / daily-volume / position
+checks live in `PreTradeRiskParityTests`; the recorded-trade position recalc and
+its single-apply idempotency (duplicate apply, restart/retry, rollback-then-retry,
+and a concurrent race) live in `PositionRecalculationTests`; and the pure
+status-audit trigger writing an `OrderStatusHistory` row is covered specifically
+by the `Audit_StatusChange_WritesHistoryRow_PureAuditOnly` characterization test
+in `PreTradeRiskParityTests` (it asserts a row is written on a real status change
+and that nothing else - price amendments, no-op same-status updates - writes one).
+The runnable `Samples/08_Misc/03_LegacySqlDemo` walkthrough additionally
+demonstrates the three OBSERVABLE outcomes end to end (accept within limits,
+reject-by-price with a reason, and the automatic position update after a recorded
+fill); it does not by itself exercise the frequency or audit paths - the suites
+do. Those passing suites and the demo run are the evidence of record; `QA/` holds
+captured artifacts (screenshots and transcripts) from real runs, indexed by
+`QA/README.md`, as an illustration of that - not as a stand-in for the tests.

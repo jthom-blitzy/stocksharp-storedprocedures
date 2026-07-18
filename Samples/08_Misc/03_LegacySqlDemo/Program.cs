@@ -33,63 +33,95 @@ using StockSharp.Messages;
 /// </summary>
 class Program
 {
-	static async Task Main()
+	// M5: the entry point returns an explicit PROCESS EXIT CODE and never lets a raw provider exception
+	// escape. Exit-code contract (a non-zero code means "the walkthrough did not complete as designed", so
+	// a CI harness or a human can tell success from failure without scraping stdout):
+	//   0 - happy path: order #1 accepted, order #2 rejected, the fill recomputed the position.
+	//   1 - setup failure: the PostgreSQL database could not be reached / initialised.
+	//   2 - order #1 (the within-limits order) was UNEXPECTEDLY rejected, so the fill/position step of the
+	//       walkthrough cannot run (e.g. a persisted-volume re-run tripped the seeded frequency limit).
+	//   3 - any other unexpected failure surfaced by the single top-level exception boundary below.
+	// All failure output goes to STDERR (not stdout) and is SANITIZED to the exception TYPE name only - the
+	// raw Npgsql message, SQLSTATE, and relation/parser details are never printed, so a failure cannot leak
+	// host/database internals (server address, credentials, schema names).
+	static async Task<int> Main()
 	{
-		var gateway = new SqlLegacyOrderGateway(SqlLegacyConnection.Resolve());
-
-		var portfolio = new Portfolio { Name = "DEMO" };
-		var security = new Security { Id = "AAPL@NASDAQ", Code = "AAPL", Board = ExchangeBoard.Nasdaq, Type = SecurityTypes.Stock };
-
-		int portfolioId, securityId;
-
 		try
 		{
-			portfolioId = await gateway.EnsurePortfolioAsync(portfolio);
-			securityId = await gateway.EnsureSecurityAsync(security);
+			var gateway = new SqlLegacyOrderGateway(SqlLegacyConnection.Resolve());
+
+			var portfolio = new Portfolio { Name = "DEMO" };
+			var security = new Security { Id = "AAPL@NASDAQ", Code = "AAPL", Board = ExchangeBoard.Nasdaq, Type = SecurityTypes.Stock };
+
+			int portfolioId, securityId;
+
+			try
+			{
+				portfolioId = await gateway.EnsurePortfolioAsync(portfolio);
+				securityId = await gateway.EnsureSecurityAsync(security);
+			}
+			catch (Exception ex)
+			{
+				// Setup failure. Surface only the exception TYPE name (sanitized) plus actionable guidance,
+				// and exit NON-ZERO so the failure is not mistaken for success.
+				Console.Error.WriteLine($"Could not reach the legacy PostgreSQL database ({ex.GetType().Name}).");
+				Console.Error.WriteLine("Run `docker compose up` from the repo root to start PostgreSQL and apply the /Database scripts;");
+				Console.Error.WriteLine("see Database/README.md for details and LEGACY_LAYER.md for what this layer is.");
+				return 1;
+			}
+
+			Console.WriteLine($"Portfolio '{portfolio.Name}' = portfolio_id {portfolioId}");
+			Console.WriteLine($"Security '{security.Id}' = security_id {securityId}");
+			Console.WriteLine();
+
+			// --- order #1: within every configured RiskLimits ceiling -> ACCEPTED ---
+			Console.WriteLine("Submitting BUY 100 @ 150.00 (within limits)...");
+			var order1 = await gateway.SubmitOrderAsync(portfolioId, securityId, Sides.Buy, 100m, 150.00m, OrderTypes.Limit);
+			Console.WriteLine($"  -> order_id={order1.OrderId} is_valid={order1.IsValid} reject_reason={order1.RejectReason ?? "(none)"}");
+			Console.WriteLine();
+
+			// --- order #2: price breaches RiskLimits.max_order_price (seeded at 500.00) -> REJECTED ---
+			Console.WriteLine("Submitting BUY 10 @ 999.00 (price exceeds the seeded max_order_price limit)...");
+			var order2 = await gateway.SubmitOrderAsync(portfolioId, securityId, Sides.Buy, 10m, 999.00m, OrderTypes.Limit);
+			Console.WriteLine($"  -> order_id={order2.OrderId} is_valid={order2.IsValid} reject_reason={order2.RejectReason ?? "(none)"}");
+			Console.WriteLine("     Note: this rejection comes from the canonical PreTradeRiskService gate (Algo/Risk).");
+			Console.WriteLine("     The RiskManager circuit breaker shares the same canonical rolling-frequency evaluator");
+			Console.WriteLine("     and comparison convention (CanonicalRiskRules), so given the same events the gate and");
+			Console.WriteLine("     the breaker compute the same frequency arithmetic; they still read different state");
+			Console.WriteLine("     (DB rows vs an in-memory stream) and act differently - see LEGACY_LAYER.md for the map.");
+			Console.WriteLine();
+
+			// The within-limits order is expected to be accepted on a CLEAN database; if it was not (e.g. a
+			// persisted-volume re-run tripped the frequency limit - see the repeatability note above), the
+			// walkthrough cannot demonstrate the fill/position step. That is an INCOMPLETE run, so report it on
+			// stderr and exit NON-ZERO (code 2) rather than silently succeeding.
+			if (!order1.IsValid)
+			{
+				Console.Error.WriteLine("Order #1 (BUY 100 @ 150.00) was unexpectedly rejected, so the fill/position step cannot run.");
+				Console.Error.WriteLine($"  reject_reason: {order1.RejectReason ?? "(none)"}");
+				Console.Error.WriteLine("Re-run against a CLEAN database (`docker compose down -v` first) - see the repeatability note in the header.");
+				return 2;
+			}
+
+			// --- record a fill against the accepted order; RecordTradeAsync inserts the trade and
+			//     then PositionRecalculationService recomputes the position exactly once (the old
+			//     trg_Trades_PositionRecalc trigger has been removed) ---
+			Console.WriteLine("Recording a trade: 100 @ 150.00 against order #1...");
+			await gateway.RecordTradeAsync(order1.OrderId, 100m, 150.00m);
+
+			var position = await gateway.GetPositionAsync(portfolioId, securityId);
+			Console.WriteLine($"  -> position after recalculation: qty={position.Quantity} avg_price={position.AveragePrice} realized_pnl={position.RealizedPnL}");
+
+			return 0;
 		}
 		catch (Exception ex)
 		{
-			// N3: surface only the exception TYPE name, never the raw exception message, so a connection
-			// failure cannot leak host/database internals (server address, credentials, schema names).
-			Console.WriteLine($"Could not reach the legacy PostgreSQL database ({ex.GetType().Name}).");
-			Console.WriteLine("Run `docker compose up` from the repo root to start PostgreSQL and apply the /Database scripts;");
-			Console.WriteLine("see Database/README.md for details and LEGACY_LAYER.md for what this layer is.");
-			return;
+			// Single top-level sanitized exception boundary. Any failure AFTER setup (a provider fault while
+			// submitting an order, recording the fill, or reading the position) lands here instead of printing
+			// a raw Npgsql stack trace / SQLSTATE / relation name to the console. Type name only, exit NON-ZERO.
+			Console.Error.WriteLine($"The demo did not complete because of an unexpected error ({ex.GetType().Name}).");
+			Console.Error.WriteLine("Re-run against a CLEAN database (`docker compose down -v` first); see Database/README.md for setup.");
+			return 3;
 		}
-
-		Console.WriteLine($"Portfolio '{portfolio.Name}' = portfolio_id {portfolioId}");
-		Console.WriteLine($"Security '{security.Id}' = security_id {securityId}");
-		Console.WriteLine();
-
-		// --- order #1: within every configured RiskLimits ceiling -> ACCEPTED ---
-		Console.WriteLine("Submitting BUY 100 @ 150.00 (within limits)...");
-		var order1 = await gateway.SubmitOrderAsync(portfolioId, securityId, Sides.Buy, 100m, 150.00m, OrderTypes.Limit);
-		Console.WriteLine($"  -> order_id={order1.OrderId} is_valid={order1.IsValid} reject_reason={order1.RejectReason ?? "(none)"}");
-		Console.WriteLine();
-
-		// --- order #2: price breaches RiskLimits.max_order_price (seeded at 500.00) -> REJECTED ---
-		Console.WriteLine("Submitting BUY 10 @ 999.00 (price exceeds the seeded max_order_price limit)...");
-		var order2 = await gateway.SubmitOrderAsync(portfolioId, securityId, Sides.Buy, 10m, 999.00m, OrderTypes.Limit);
-		Console.WriteLine($"  -> order_id={order2.OrderId} is_valid={order2.IsValid} reject_reason={order2.RejectReason ?? "(none)"}");
-		Console.WriteLine("     Note: this rejection comes from the canonical PreTradeRiskService gate (Algo/Risk).");
-		Console.WriteLine("     The RiskManager circuit breaker shares the same canonical rolling-frequency evaluator");
-		Console.WriteLine("     and comparison convention (CanonicalRiskRules), so the gate and the breaker can no");
-		Console.WriteLine("     longer disagree on a frequency decision - see LEGACY_LAYER.md for the full rule map.");
-		Console.WriteLine();
-
-		// The within-limits order is expected to be accepted on a CLEAN database; if it was not (e.g. a
-		// persisted-volume re-run tripped the frequency limit - see the repeatability note above), the
-		// walkthrough simply cannot demonstrate the fill/position step, so it returns early.
-		if (!order1.IsValid)
-			return;
-
-		// --- record a fill against the accepted order; RecordTradeAsync inserts the trade and
-		//     then PositionRecalculationService recomputes the position exactly once (the old
-		//     trg_Trades_PositionRecalc trigger has been removed) ---
-		Console.WriteLine("Recording a trade: 100 @ 150.00 against order #1...");
-		await gateway.RecordTradeAsync(order1.OrderId, 100m, 150.00m);
-
-		var position = await gateway.GetPositionAsync(portfolioId, securityId);
-		Console.WriteLine($"  -> position after recalculation: qty={position.Quantity} avg_price={position.AveragePrice} realized_pnl={position.RealizedPnL}");
 	}
 }

@@ -445,11 +445,15 @@ public class PositionRecalculationTests : BaseTestClass
 
 		var gateway = new SqlLegacyOrderGateway(SqlLegacyConnection.Resolve());
 
-		await ThrowsAsync<PostgresException>(
+		// C3: the gateway now RESOLVES the order's portfolio (and takes the per-portfolio advisory lock) BEFORE
+		// inserting the trade, so a non-existent order fails FAST with a clear domain InvalidOperationException
+		// during resolution - rather than reaching the INSERT and surfacing a raw foreign-key PostgresException.
+		// Either way nothing is persisted; the point of this test - "leaves no partial state" - is unchanged.
+		await ThrowsAsync<InvalidOperationException>(
 			async () => await gateway.RecordTradeAsync(nonExistentOrderId, 100m, 150.00m, CancellationToken),
-			"recording a trade against a non-existent order must fail on the foreign key");
+			"recording a trade against a non-existent order must fail (order resolved before insert, C3)");
 
-		(await CountTradesForOrderAsync(cn, nonExistentOrderId)).AssertEqual(0); // rolled back: no trade row
+		(await CountTradesForOrderAsync(cn, nonExistentOrderId)).AssertEqual(0); // nothing inserted: no trade row
 	}
 
 	/// <summary>
@@ -496,7 +500,7 @@ public class PositionRecalculationTests : BaseTestClass
 				// RAISERROR). The service reads no order row (no SQL error), so the transaction stays healthy
 				// and can be rolled back cleanly.
 				await ThrowsAsync<InvalidOperationException>(
-					async () => await svc.ApplyAsync(cn, txn, nonExistentOrderId, NextTradeId(), 100m, 150.00m, CancellationToken),
+					async () => await svc.ApplyAsync(cn, txn, nonExistentOrderId, NextTradeId(), CancellationToken),
 					"applying a trade for a non-existent order must throw");
 
 				await txn.RollbackAsync(CancellationToken);
@@ -592,13 +596,13 @@ public class PositionRecalculationTests : BaseTestClass
 
 			await using (var t1 = await cn.BeginTransactionAsync(CancellationToken))
 			{
-				await svc.ApplyAsync(cn, t1, orderId, tradeId, 100m, 150.00m, CancellationToken);
+				await svc.ApplyAsync(cn, t1, orderId, tradeId, CancellationToken);
 				await t1.CommitAsync(CancellationToken);
 			}
 
 			await using (var t2 = await cn.BeginTransactionAsync(CancellationToken))
 			{
-				await svc.ApplyAsync(cn, t2, orderId, tradeId, 100m, 150.00m, CancellationToken);
+				await svc.ApplyAsync(cn, t2, orderId, tradeId, CancellationToken);
 				await t2.CommitAsync(CancellationToken);
 			}
 
@@ -648,7 +652,7 @@ public class PositionRecalculationTests : BaseTestClass
 			var svc = new PositionRecalculationService();
 			await using (var txn = await cn.BeginTransactionAsync(CancellationToken))
 			{
-				await svc.ApplyAsync(cn, txn, orderId, tradeId, 100m, 150.00m, CancellationToken);
+				await svc.ApplyAsync(cn, txn, orderId, tradeId, CancellationToken);
 				await txn.CommitAsync(CancellationToken);
 			}
 
@@ -699,7 +703,7 @@ public class PositionRecalculationTests : BaseTestClass
 			var otherInstance = new PositionRecalculationService();
 			await using (var txn = await cn.BeginTransactionAsync(CancellationToken))
 			{
-				await otherInstance.ApplyAsync(cn, txn, orderId, tradeId, 100m, 150.00m, CancellationToken);
+				await otherInstance.ApplyAsync(cn, txn, orderId, tradeId, CancellationToken);
 				await txn.CommitAsync(CancellationToken);
 			}
 
@@ -746,7 +750,7 @@ public class PositionRecalculationTests : BaseTestClass
 			// First attempt applies then ROLLS BACK: the position write and the position_applied flip are undone.
 			await using (var t1 = await cn.BeginTransactionAsync(CancellationToken))
 			{
-				await svc.ApplyAsync(cn, t1, orderId, tradeId, 100m, 150.00m, CancellationToken);
+				await svc.ApplyAsync(cn, t1, orderId, tradeId, CancellationToken);
 				await t1.RollbackAsync(CancellationToken);
 			}
 
@@ -756,7 +760,7 @@ public class PositionRecalculationTests : BaseTestClass
 			// Retry the SAME trade_id: NOT suppressed - it applies and commits this time.
 			await using (var t2 = await cn.BeginTransactionAsync(CancellationToken))
 			{
-				await svc.ApplyAsync(cn, t2, orderId, tradeId, 100m, 150.00m, CancellationToken);
+				await svc.ApplyAsync(cn, t2, orderId, tradeId, CancellationToken);
 				await t2.CommitAsync(CancellationToken);
 			}
 
@@ -804,7 +808,7 @@ public class PositionRecalculationTests : BaseTestClass
 				await using var c = new NpgsqlConnection(SqlLegacyConnection.Resolve());
 				await c.OpenAsync(CancellationToken);
 				await using var txn = await c.BeginTransactionAsync(CancellationToken);
-				await new PositionRecalculationService().ApplyAsync(c, txn, orderId, tradeId, 100m, 150.00m, CancellationToken);
+				await new PositionRecalculationService().ApplyAsync(c, txn, orderId, tradeId, CancellationToken);
 				await txn.CommitAsync(CancellationToken);
 			}
 
@@ -818,6 +822,304 @@ public class PositionRecalculationTests : BaseTestClass
 		}
 		finally
 		{
+			await CleanupAsync(cn, portfolioId, securityId);
+		}
+	}
+
+	/// <summary>
+	/// C1 (adversarial mismatch - the core finding). A trade legitimately belongs to order A; ApplyAsync is
+	/// then driven with order B (both REAL, on the same portfolio/security). The retired code claimed the trade
+	/// by trade_id ALONE and would have cross-posted A's fill onto B's context; the fix requires
+	/// trade_id = @trade_id AND order_id = @order_id, so the claim matches 0 rows, the disambiguation probe
+	/// finds the trade belongs to a DIFFERENT order, and ApplyAsync THROWS - nothing is posted and the trade's
+	/// durable guard is left un-flipped.
+	/// </summary>
+	[TestMethod]
+	public async Task ApplyAsync_TradeBelongsToDifferentOrder_ThrowsAndPostsNothing()
+	{
+		await using var cn = await OpenMandatoryAsync();
+
+		if (cn is null)
+			return;
+
+		var suffix = Guid.NewGuid().ToString("N");
+		var portfolioId = 0;
+		var securityId = 0;
+
+		try
+		{
+			portfolioId = await InsertPortfolioAsync(cn, "pf_mismatch_" + suffix);
+			securityId = await InsertSecurityAsync(cn, "sec_" + suffix);
+
+			// Two REAL orders on the SAME (portfolio, security). tradeA legitimately belongs to orderA.
+			var orderA = await InsertOrderAsync(cn, portfolioId, securityId, "B", 100m, 150.00m, "ACCEPTED");
+			var orderB = await InsertOrderAsync(cn, portfolioId, securityId, "B", 100m, 150.00m, "ACCEPTED");
+			var tradeA = await InsertTradeAsync(cn, orderA, 100m, 150.00m);
+			var svc = new PositionRecalculationService();
+
+			await using (var txn = await cn.BeginTransactionAsync(CancellationToken))
+			{
+				// Apply tradeA under orderB (the mismatch). The claim WHERE trade_id = tradeA AND order_id = orderB
+				// matches 0 rows; the probe SELECT finds tradeA.order_id = orderA != orderB, so ApplyAsync throws
+				// InvalidOperationException rather than cross-posting the fill onto the wrong order's position.
+				await ThrowsAsync<InvalidOperationException>(
+					async () => await svc.ApplyAsync(cn, txn, orderB, tradeA, CancellationToken),
+					"applying a trade under an order it does not belong to must throw (C1)");
+
+				await txn.RollbackAsync(CancellationToken);
+			}
+
+			// Nothing was posted to EITHER order's position, and tradeA's durable guard was never flipped
+			// (the mismatched claim matched 0 rows, so it could not mark the trade applied).
+			(await ReadTradeAppliedAsync(cn, tradeA)).AssertEqual(false);
+			(await PositionExistsAsync(cn, portfolioId, securityId)).AssertEqual(false);
+		}
+		finally
+		{
+			await CleanupAsync(cn, portfolioId, securityId);
+		}
+	}
+
+	/// <summary>
+	/// C1 (unknown trade - the distinct zero-row branch). The order EXISTS but the trade_id does not. The claim
+	/// matches 0 rows and the disambiguation probe finds NO trade row at all, so ApplyAsync throws
+	/// InvalidOperationException with the "trade_id not found" reason (told apart from the belongs-to-another-order
+	/// case above). Nothing is posted.
+	/// </summary>
+	[TestMethod]
+	public async Task ApplyAsync_UnknownTrade_ThrowsAndPostsNothing()
+	{
+		await using var cn = await OpenMandatoryAsync();
+
+		if (cn is null)
+			return;
+
+		var suffix = Guid.NewGuid().ToString("N");
+		var portfolioId = 0;
+		var securityId = 0;
+
+		try
+		{
+			portfolioId = await InsertPortfolioAsync(cn, "pf_unknown_" + suffix);
+			securityId = await InsertSecurityAsync(cn, "sec_" + suffix);
+			var orderId = await InsertOrderAsync(cn, portfolioId, securityId, "B", 100m, 150.00m, "ACCEPTED");
+			var svc = new PositionRecalculationService();
+
+			// A trade_id that cannot exist (ticks-seeded, far above any identity value assigned so far).
+			var unknownTradeId = NextTradeId();
+
+			await using (var txn = await cn.BeginTransactionAsync(CancellationToken))
+			{
+				// order resolves, but the claim matches 0 rows and the probe finds no such trade -> THROW.
+				await ThrowsAsync<InvalidOperationException>(
+					async () => await svc.ApplyAsync(cn, txn, orderId, unknownTradeId, CancellationToken),
+					"applying an unknown trade_id must throw (C1)");
+
+				await txn.RollbackAsync(CancellationToken);
+			}
+
+			(await CountTradesForOrderAsync(cn, orderId)).AssertEqual(0);      // no trade was created
+			(await PositionExistsAsync(cn, portfolioId, securityId)).AssertEqual(false); // no position posted
+		}
+		finally
+		{
+			await CleanupAsync(cn, portfolioId, securityId);
+		}
+	}
+
+	/// <summary>
+	/// C2 (external-fill-key retry idempotency - the core finding). RecordTradeAsync is called TWICE with the
+	/// SAME external fill key (models an at-least-once / post-commit retry). The retired path had no external key,
+	/// so a retry inserted a FRESH trade_id and double-counted the position. The additive 4-arg overload tags the
+	/// insert with trades.external_trade_id and uses ON CONFLICT ... DO NOTHING on the partial-unique index, so
+	/// the retry inserts 0 rows and applies nothing: exactly ONE persisted trade and ONE position effect.
+	/// </summary>
+	[TestMethod]
+	public async Task Gateway_RecordTradeWithExternalKey_RetryIsIdempotent()
+	{
+		await using var cn = await OpenMandatoryAsync();
+
+		if (cn is null)
+			return;
+
+		var suffix = Guid.NewGuid().ToString("N");
+		var portfolioId = 0;
+		var securityId = 0;
+
+		try
+		{
+			portfolioId = await InsertPortfolioAsync(cn, "pf_extkey_" + suffix);
+			securityId = await InsertSecurityAsync(cn, "sec_" + suffix);
+			var orderId = await InsertOrderAsync(cn, portfolioId, securityId, "B", 100m, 150.00m, "ACCEPTED");
+
+			var gateway = new SqlLegacyOrderGateway(SqlLegacyConnection.Resolve());
+			var externalTradeId = NextTradeId(); // stable synthetic broker/venue fill id (the idempotency key)
+
+			// First delivery: inserts the trade (tagged with the external key) and applies it once.
+			await gateway.RecordTradeAsync(orderId, 100m, 150.00m, externalTradeId, CancellationToken);
+			// Retry with the SAME external key: ON CONFLICT DO NOTHING makes the insert a no-op and NOTHING is
+			// applied a second time.
+			await gateway.RecordTradeAsync(orderId, 100m, 150.00m, externalTradeId, CancellationToken);
+
+			(await CountTradesForOrderAsync(cn, orderId)).AssertEqual(1); // exactly ONE trade despite the retry
+			var position = await gateway.GetPositionAsync(portfolioId, securityId, CancellationToken);
+			IsNotNull(position, "a position must exist after the recorded fill");
+			position.Quantity.AssertEqual(100m);        // applied EXACTLY once - not 200
+			position.AveragePrice.AssertEqual(150.00m);
+			position.RealizedPnL.AssertEqual(0m);
+		}
+		finally
+		{
+			await CleanupAsync(cn, portfolioId, securityId);
+		}
+	}
+
+	/// <summary>
+	/// C2 (idempotency does NOT over-suppress). Two DISTINCT external fill keys are two DISTINCT fills, so BOTH
+	/// must be inserted and applied - the ON CONFLICT dedup keys strictly on external_trade_id and never
+	/// collapses genuinely different fills. Complements the retry test above by proving the guard is not
+	/// swallowing legitimate second fills.
+	/// </summary>
+	[TestMethod]
+	public async Task Gateway_RecordTradeWithExternalKey_DistinctKeysBothApply()
+	{
+		await using var cn = await OpenMandatoryAsync();
+
+		if (cn is null)
+			return;
+
+		var suffix = Guid.NewGuid().ToString("N");
+		var portfolioId = 0;
+		var securityId = 0;
+
+		try
+		{
+			portfolioId = await InsertPortfolioAsync(cn, "pf_extkey2_" + suffix);
+			securityId = await InsertSecurityAsync(cn, "sec_" + suffix);
+			var orderId = await InsertOrderAsync(cn, portfolioId, securityId, "B", 100m, 150.00m, "ACCEPTED");
+
+			var gateway = new SqlLegacyOrderGateway(SqlLegacyConnection.Resolve());
+			var externalTradeId1 = NextTradeId();
+			var externalTradeId2 = NextTradeId(); // guaranteed distinct (Interlocked-monotonic)
+
+			await gateway.RecordTradeAsync(orderId, 100m, 150.00m, externalTradeId1, CancellationToken);
+			await gateway.RecordTradeAsync(orderId, 100m, 150.00m, externalTradeId2, CancellationToken);
+
+			(await CountTradesForOrderAsync(cn, orderId)).AssertEqual(2); // two DISTINCT fills, both persisted
+			var position = await gateway.GetPositionAsync(portfolioId, securityId, CancellationToken);
+			IsNotNull(position, "a position must exist after two distinct recorded fills");
+			position.Quantity.AssertEqual(200m);        // 100 + 100 - both applied
+			position.AveragePrice.AssertEqual(150.00m); // both at 150 -> weighted average still 150
+			position.RealizedPnL.AssertEqual(0m);
+		}
+		finally
+		{
+			await CleanupAsync(cn, portfolioId, securityId);
+		}
+	}
+
+	/// <summary>
+	/// C3 (TOCTOU / shared-lock proof - mixed submit + fill). Proves both RecordTradeAsync AND SubmitOrderAsync
+	/// acquire the SAME single-key per-portfolio pg_advisory_xact_lock before doing their writes: a separate
+	/// session pre-acquires that lock and holds it, and while it is held NEITHER gateway call can complete
+	/// (each blocks trying to take the same key - so a submit can never validate against a snapshot missing an
+	/// in-flight, still-uncommitted fill, which is exactly the window C3 fixes). Once the holder releases, both
+	/// complete correctly and serialised: the fill is applied exactly once (qty 100, one trade row) and the
+	/// submit persists a distinct new order.
+	/// </summary>
+	[TestMethod]
+	public async Task Gateway_ConcurrentSubmitAndRecordTrade_SharePortfolioLock()
+	{
+		await using var cn = await OpenMandatoryAsync();
+
+		if (cn is null)
+			return;
+
+		var suffix = Guid.NewGuid().ToString("N");
+		var portfolioId = 0;
+		var securityId = 0;
+
+		// Declared out here so the finally can release the lock holder and drain the gateway tasks even if a
+		// mid-test assertion fails (otherwise a still-blocked task could race CleanupAsync).
+		NpgsqlConnection holder = null;
+		NpgsqlTransaction holderTxn = null;
+		Task fillTask = null;
+		Task<SqlOrderSubmitResult> submitTask = null;
+
+		try
+		{
+			portfolioId = await InsertPortfolioAsync(cn, "pf_mixlock_" + suffix);
+			securityId = await InsertSecurityAsync(cn, "sec_" + suffix);
+			var orderA = await InsertOrderAsync(cn, portfolioId, securityId, "B", 100m, 150.00m, "ACCEPTED");
+
+			// A separate session pre-acquires the SAME single-key advisory lock the gateway uses (keyed on the
+			// portfolio_id widened to bigint) and HOLDS it inside an open transaction.
+			holder = new NpgsqlConnection(SqlLegacyConnection.Resolve());
+			await holder.OpenAsync(CancellationToken);
+			holderTxn = await holder.BeginTransactionAsync(CancellationToken);
+			using (var lockCommand = new NpgsqlCommand("SELECT pg_advisory_xact_lock(@portfolio_id)", holder, holderTxn))
+			{
+				lockCommand.Parameters.Add(new NpgsqlParameter("portfolio_id", NpgsqlDbType.Bigint) { Value = (long)portfolioId });
+				await lockCommand.ExecuteNonQueryAsync(CancellationToken);
+			}
+
+			// Launch a fill and a submit on the SAME portfolio (each opens its own connection/transaction).
+			// Valid qty/price so the submit passes the structural short-circuit and actually reaches the lock.
+			var gateway = new SqlLegacyOrderGateway(SqlLegacyConnection.Resolve());
+			fillTask = gateway.RecordTradeAsync(orderA, 100m, 150.00m, CancellationToken);
+			submitTask = gateway.SubmitOrderAsync(portfolioId, securityId, Sides.Buy, 10m, 150.00m, OrderTypes.Limit, cancellationToken: CancellationToken);
+
+			// While the holder keeps the lock, NEITHER call can complete: both must take the same key first.
+			await Task.Delay(700, CancellationToken);
+			fillTask.IsCompleted.AssertEqual(false);   // blocked acquiring the per-portfolio lock (C3)
+			submitTask.IsCompleted.AssertEqual(false); // shares the SAME lock space (C4)
+
+			// Release the lock; both now proceed, serialised by the advisory lock.
+			await holderTxn.RollbackAsync(CancellationToken);
+			await holderTxn.DisposeAsync();
+			holderTxn = null;
+			await holder.DisposeAsync();
+			holder = null;
+
+			await Task.WhenAll(fillTask, submitTask).WaitAsync(TimeSpan.FromSeconds(30), CancellationToken);
+			var submitResult = await submitTask;
+
+			// The submit persisted a DISTINCT new order (whatever the accept/reject decision, RETURNING gives an id).
+			(submitResult.OrderId > 0).AssertTrue();
+			(submitResult.OrderId != orderA).AssertTrue();
+
+			// The fill applied EXACTLY once - no lost update, no double count - and recorded exactly one trade.
+			// ReadPositionAsync asserts a row exists, so a missing position (double-lost update) fails here.
+			(await CountTradesForOrderAsync(cn, orderA)).AssertEqual(1);
+			var position = await ReadPositionAsync(cn, portfolioId, securityId);
+			position.Qty.AssertEqual(100m);        // the fill applied exactly once
+			position.AvgPrice.AssertEqual(150.00m);
+			position.RealizedPnl.AssertEqual(0m);
+		}
+		finally
+		{
+			// Release the lock holder first so any still-pending gateway task can finish...
+			if (holderTxn is not null)
+			{
+				await holderTxn.RollbackAsync(CancellationToken);
+				await holderTxn.DisposeAsync();
+			}
+
+			if (holder is not null)
+				await holder.DisposeAsync();
+
+			// ...then drain the tasks BEFORE teardown so they cannot race CleanupAsync or leave orphan rows.
+			// Their outcome is deliberately ignored here (any real failure is asserted on the main path above).
+			if (fillTask is not null)
+			{
+				try { await fillTask; } catch (Exception) { /* drained during teardown */ }
+			}
+
+			if (submitTask is not null)
+			{
+				try { await submitTask; } catch (Exception) { /* drained during teardown */ }
+			}
+
 			await CleanupAsync(cn, portfolioId, securityId);
 		}
 	}
@@ -1114,7 +1416,7 @@ public class PositionRecalculationTests : BaseTestClass
 			{
 				// The gateway owns the transaction in production; here the test plays that role - begin,
 				// ApplyAsync on (connection, transaction), commit once.
-				await svc.ApplyAsync(cn, txn, orderId, tradeId, c.TradeQty, c.TradePrice, CancellationToken);
+				await svc.ApplyAsync(cn, txn, orderId, tradeId, CancellationToken);
 				await txn.CommitAsync(CancellationToken);
 			}
 
@@ -1242,6 +1544,17 @@ public class PositionRecalculationTests : BaseTestClass
 	private static bool _sqlServerSchemaEnsured;
 
 	/// <summary>
+	/// M6 test-safety predicate (twin of PreTradeRiskParityTests.MssqlDatabaseIsDisposable, unit-tested
+	/// there): is <paramref name="databaseName"/> an acceptable target for the destructive characterization
+	/// DDL? True ONLY when the name marks it as a disposable test database (contains "test", case-insensitive)
+	/// OR the operator has explicitly opted in via <paramref name="explicitlyAllowed"/>. Pure and
+	/// side-effect-free. Duplicated here because the SQL Server harness is intentionally per-file.
+	/// </summary>
+	private static bool MssqlDatabaseIsDisposable(string databaseName, bool explicitlyAllowed)
+		=> explicitlyAllowed
+			|| (!databaseName.IsEmpty() && databaseName.Contains("test", StringComparison.OrdinalIgnoreCase));
+
+	/// <summary>
 	/// Materializes the ORIGINAL SQL Server characterization schema and the two retired procedures on the
 	/// given connection by executing the embedded <c>OriginalCharacterizationSetup.sql</c> resource. The
 	/// script is idempotent (guarded CREATEs / CREATE OR ALTER), so re-runs are safe; a static flag avoids
@@ -1257,6 +1570,16 @@ public class PositionRecalculationTests : BaseTestClass
 		{
 			if (_sqlServerSchemaEnsured)
 				return;
+
+			// M6 (test safety): refuse to run destructive DDL against anything that is not clearly a DISPOSABLE
+			// test database (see the twin guard/predicate in PreTradeRiskParityTests). Accept only when the
+			// database NAME contains "test" OR the operator opts in via STOCKSHARP_LEGACY_MSSQL_ALLOW_DDL.
+			if (!MssqlDatabaseIsDisposable(connection.Database,
+					!Environment.GetEnvironmentVariable("STOCKSHARP_LEGACY_MSSQL_ALLOW_DDL").IsEmpty()))
+				Fail($"Refusing to run characterization DDL against database '{connection.Database}': it is not a " +
+					"recognized disposable test database. Point STOCKSHARP_LEGACY_MSSQL_CONNECTION at a DISPOSABLE " +
+					"database whose name contains 'test', or set STOCKSHARP_LEGACY_MSSQL_ALLOW_DDL=1 to confirm the " +
+					"target is safe to (re)initialize (see QA/README.md).");
 
 			var assembly = typeof(PositionRecalculationTests).Assembly;
 			var resourceName = assembly.GetManifestResourceNames()
@@ -1499,10 +1822,14 @@ public class PositionRecalculationTests : BaseTestClass
 	}
 
 	/// <summary>
-	/// A monotonic in-memory trade_id used ONLY where ApplyAsync is expected to THROW at order-resolution
-	/// BEFORE it reaches the durable trades.position_applied guard (e.g. the non-existent-order rollback
-	/// test), so no persisted trade row is required. Tests that expect the apply to SUCCEED must instead
-	/// insert a real trades row via <see cref="InsertTradeAsync"/> and use the returned trade_id (C3).
+	/// A monotonic in-memory identifier with two uses, both relying only on its uniqueness:
+	/// (1) a synthetic trade_id where ApplyAsync is expected to THROW at order-resolution BEFORE it reaches
+	/// the durable trades.position_applied guard (e.g. the non-existent-order rollback test), so no persisted
+	/// trade row is required; and (2) a stable, collision-free synthetic EXTERNAL fill key
+	/// (trades.external_trade_id) for the C2 retry-idempotency tests. It is Interlocked-monotonic and
+	/// ticks-seeded, so it stays unique even under parallel test execution. Tests that expect a position apply
+	/// to SUCCEED via a real trade_id must instead insert a real trades row via
+	/// <see cref="InsertTradeAsync"/> and use the returned trade_id (C3).
 	/// </summary>
 	private static long NextTradeId() => Interlocked.Increment(ref _tradeIdSeq);
 

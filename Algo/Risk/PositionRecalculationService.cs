@@ -27,10 +27,14 @@ using NpgsqlTypes;
 /// PERSISTED trade_id and survives process restarts and holds across instances (a replay of a committed
 /// trade_id sees TRUE), and a rolled-back attempt undoes both the mark and the position write together.
 /// <see cref="ApplyAsync"/> therefore requires a PERSISTED trade_id (the gateway guarantees this via
-/// <c>INSERT ... RETURNING trade_id</c>). NOTE (boundary): the guarantee is keyed on the DB trade_id, not
-/// on an external fill id; if the SAME real-world fill were reported twice as two separate gateway calls it
-/// would receive two distinct trade_ids and apply twice. De-duplicating that would need a stable external
-/// idempotency key in the gateway signature, which the frozen public contract (AAP 0.7.1) does not permit.
+/// <c>INSERT ... RETURNING trade_id</c>) and, as a second integrity check, verifies the trade actually
+/// BELONGS to the order it is being applied against, deriving the applied qty/price from the stored trade row
+/// rather than from caller-supplied values (C1). The per-trade_id guard dedups a replay of the SAME persisted
+/// trade; to additionally dedup the SAME real-world fill reported twice as two separate gateway calls, the
+/// gateway exposes a 4-argument <c>RecordTradeAsync</c> overload that carries a stable external fill key
+/// (<c>trades.external_trade_id</c>, a partial-unique column) and collapses a retry to a single persisted
+/// trade via <c>INSERT ... ON CONFLICT DO NOTHING</c> (C2). The original 3-argument gateway contract is
+/// preserved unchanged (AAP 0.7.1); the external key is an additive opt-in overload.
 /// </para>
 /// <para>
 /// The average-cost arithmetic lives in the pure, static, database-free <see cref="Recalculate"/> method so
@@ -43,20 +47,27 @@ using NpgsqlTypes;
 public sealed class PositionRecalculationService
 {
 
-	// Injectable UTC clock: mirrors the SQL SYSUTCDATETIME() / Postgres now() at time zone 'utc' time source
-	// used to stamp positions.updated_date, and makes those timestamps deterministic under test.
+	// Injectable UTC clock OVERRIDE for positions.updated_date. NULL (the default) means "use the DATABASE
+	// transaction time": the position timestamp is then written by the same now() at time zone 'utc' server
+	// clock that stamps trades.executed_date and orders.submitted_date, so one order/trade/position timeline
+	// cannot be skewed by a divergent application-host clock (M3). A non-null clock OVERRIDES that with an
+	// app-supplied value purely to make tests deterministic; production leaves it null and trusts the DB clock.
 	private readonly Func<DateTime> _utcNow;
 
 	/// <summary>
 	/// Initializes a new instance of the <see cref="PositionRecalculationService"/> class.
 	/// </summary>
 	/// <param name="utcNow">
-	/// Optional UTC clock used to stamp <c>positions.updated_date</c>. When <see langword="null"/> the service
-	/// uses <see cref="DateTime.UtcNow"/>. Supplying a fixed clock makes tests deterministic.
+	/// Optional UTC clock OVERRIDE used to stamp <c>positions.updated_date</c>. When <see langword="null"/>
+	/// (the default) the service stamps the position from the DATABASE transaction clock
+	/// (<c>now() at time zone 'utc'</c>), so the timestamp shares the server clock with the trade and cannot be
+	/// skewed by the application host's clock (M3). Supplying a fixed clock overrides this to make tests
+	/// deterministic.
 	/// </param>
 	public PositionRecalculationService(Func<DateTime> utcNow = null)
 	{
-		_utcNow = utcNow ?? (() => DateTime.UtcNow);
+		// Deliberately NOT defaulted to DateTime.UtcNow: a null clock selects the DB-time SQL path in ApplyAsync.
+		_utcNow = utcNow;
 	}
 
 	/// <summary>
@@ -134,10 +145,13 @@ public sealed class PositionRecalculationService
 	}
 
 	/// <summary>
-	/// Applies a single trade's effect to the position for the trade's order, on the gateway's already-open
-	/// connection and WITHIN the gateway's transaction: reads the order and the current position, recomputes
-	/// via <see cref="Recalculate"/>, and upserts the position. Enrolls in the caller's transaction so the
-	/// trade row and this position write commit together or not at all (atomicity, AAP 0.6.5).
+	/// Applies a single PERSISTED trade's effect to the position for the trade's order, on the gateway's
+	/// already-open connection and WITHIN the gateway's transaction. The trade's quantity, price and owning
+	/// order are read back FROM THE DATABASE (never trusted from the caller): the method atomically claims the
+	/// trade by BOTH <paramref name="tradeId"/> AND <paramref name="orderId"/> - so a trade can only ever be
+	/// applied to the order it actually belongs to - then reads the current position, recomputes via
+	/// <see cref="Recalculate"/>, and upserts the position. Enrolls in the caller's transaction so the trade
+	/// row and this position write commit together or not at all (atomicity, AAP 0.6.5).
 	/// </summary>
 	/// <param name="connection">
 	/// An already-open <see cref="NpgsqlConnection"/> owned by the caller. This service never opens, closes,
@@ -146,21 +160,30 @@ public sealed class PositionRecalculationService
 	/// <param name="transaction">
 	/// The caller's in-flight <see cref="NpgsqlTransaction"/> on <paramref name="connection"/>. This service
 	/// runs every command on it but NEVER begins, commits, or rolls it back - the gateway owns that lifecycle,
-	/// so the trade INSERT and this position write form ONE atomic unit and the per-(portfolio,security)
-	/// advisory lock taken here is held until the gateway commits/rolls back.
+	/// so the trade INSERT and this position write form ONE atomic unit and the per-portfolio advisory lock
+	/// taken here is held until the gateway commits/rolls back.
 	/// </param>
-	/// <param name="orderId">Identifier of the order the trade executed against (<c>orders.order_id</c>).</param>
-	/// <param name="tradeId">Identifier of the trade being applied; drives the in-process single-apply guard.</param>
-	/// <param name="tradeQty">Executed trade quantity; must be strictly positive.</param>
-	/// <param name="tradePrice">Executed trade price; must be strictly positive.</param>
+	/// <param name="orderId">
+	/// Identifier of the order the trade MUST belong to (<c>orders.order_id</c>). The atomic claim verifies
+	/// <c>trades.order_id = orderId</c>, so a mismatched pair is rejected rather than silently posting the
+	/// trade to another order's position (C1).
+	/// </param>
+	/// <param name="tradeId">
+	/// Identifier of the PERSISTED trade to apply. Drives the DURABLE single-apply guard
+	/// (<c>trades.position_applied</c>, a database column - NOT an in-process flag): a replay of an
+	/// already-applied trade is an idempotent no-op that survives process restarts and holds across instances.
+	/// </param>
 	/// <param name="cancellationToken">Token used to cancel the database operations.</param>
 	/// <returns>
-	/// A task that completes when the position has been upserted, or immediately when this <paramref name="tradeId"/>
-	/// has already been applied within this process.
+	/// A task that completes when the position has been upserted, or immediately when this
+	/// <paramref name="tradeId"/> has already been applied (durable idempotent no-op).
 	/// </returns>
 	/// <exception cref="ArgumentNullException"><paramref name="connection"/> or <paramref name="transaction"/> is <see langword="null"/>.</exception>
-	/// <exception cref="ArgumentOutOfRangeException"><paramref name="tradeQty"/> or <paramref name="tradePrice"/> is not strictly positive.</exception>
-	/// <exception cref="InvalidOperationException">No order exists for <paramref name="orderId"/> (parity with the SQL RAISERROR).</exception>
+	/// <exception cref="InvalidOperationException">
+	/// No order exists for <paramref name="orderId"/> (parity with the SQL RAISERROR); OR the trade
+	/// <paramref name="tradeId"/> does not exist; OR the trade exists but belongs to a DIFFERENT order than
+	/// <paramref name="orderId"/> (the C1 mismatch this method rejects).
+	/// </exception>
 	// The assembly is [CLSCompliant(true)], but the Npgsql provider types are not CLS-compliant. Exposing the
 	// gateway's open NpgsqlConnection/NpgsqlTransaction here is intentional (this service is the persistence seam
 	// that runs on the gateway's connection/transaction), so opt this member out of CLS checking, matching the
@@ -171,8 +194,6 @@ public sealed class PositionRecalculationService
 		NpgsqlTransaction transaction,
 		long orderId,
 		long tradeId,
-		decimal tradeQty,
-		decimal tradePrice,
 		CancellationToken cancellationToken = default)
 	{
 		if (connection is null)
@@ -181,21 +202,16 @@ public sealed class PositionRecalculationService
 		if (transaction is null)
 			throw new ArgumentNullException(nameof(transaction));
 
-		// Reject a malformed fill before any DB work (F4, parity with the Trades CHECK qty > 0 / price > 0).
-		if (tradeQty <= 0m)
-			throw new ArgumentOutOfRangeException(nameof(tradeQty), tradeQty, "Trade quantity must be strictly positive.");
-
-		if (tradePrice <= 0m)
-			throw new ArgumentOutOfRangeException(nameof(tradePrice), tradePrice, "Trade price must be strictly positive.");
-
 		// Every command below runs on the caller's connection + transaction; this method NEVER begins, commits,
 		// or rolls back (the gateway owns that), so the trade INSERT and this position write are one atomic unit.
-		// The DURABLE single-apply guard (the conditional UPDATE of trades.position_applied) lives AFTER
-		// order-resolution and the advisory lock below - see that block for the full C3 idempotency contract.
+		// C1: the applied qty/price and the trade->order linkage are read back FROM THE DATABASE below (the
+		// atomic claim), never trusted from the caller, so a caller can neither post arbitrary values to a
+		// position nor apply a trade to an order it does not belong to.
 
-		// Look up the order to resolve the (portfolio, security, side) the trade affects. Throw when the order
-		// is missing rather than silently no-op, matching the SQL RAISERROR in the retired proc; the caller's
-		// transaction then rolls back so nothing is persisted for a bad order id.
+		// (1) Resolve the ORDER the trade must belong to. portfolio_id / security_id / side are properties of
+		// the ORDER (the trades table has no side/portfolio/security of its own), so they are read here from
+		// the order the caller names. A missing order throws (parity with the retired proc's RAISERROR); the
+		// caller's transaction then rolls back so nothing is persisted for a bad order id.
 		int portfolioId;
 		int securityId;
 		string side;
@@ -234,30 +250,70 @@ public sealed class PositionRecalculationService
 			await lockCommand.ExecuteNonQueryAsync(cancellationToken);
 		}
 
-		// DURABLE single-apply guard (C3): atomically claim this persisted trade for position application by
-		// flipping trades.position_applied FALSE -> TRUE in the caller's transaction. Because the row is locked
-		// by this UPDATE until the gateway commits, and because the portfolio advisory lock above serializes
-		// same-portfolio applies, a concurrent or repeated apply of the SAME trade_id (another instance, a
-		// restart, or a retry) sees the row already TRUE and the UPDATE affects 0 rows -> idempotent no-op
-		// return, so the position is applied EXACTLY ONCE per persisted trade_id and the effect commits in the
-		// same transaction as the flag. This replaces the former in-process HashSet, which could not survive a
-		// process restart nor coordinate across instances. The trade row must already be persisted (the gateway
-		// INSERTs it immediately before calling this), so a 0-row result here means "already applied", never
-		// "unknown trade". Residual boundary: the SAME external fill reported twice becomes two DISTINCT
-		// trade_ids and both apply - de-duplicating that needs an external-fill id the frozen public contract
-		// (AAP 0.7.1) does not carry, so it is intentionally out of scope.
+		// (3) ATOMIC CLAIM + DERIVE (C1 + durable single-apply). One UPDATE both claims the trade for position
+		// application (flips trades.position_applied FALSE -> TRUE) AND reads the PERSISTED qty/price straight
+		// back via RETURNING. The WHERE requires trade_id = @trade_id AND order_id = @order_id, so the trade is
+		// proven to belong to the caller's order before anything is posted; binding the applied qty/price to the
+		// stored NUMERIC(18,4) row (not to caller-supplied values) means a caller can neither post arbitrary
+		// values to a position nor cross-post a trade onto another order's position. The UPDATE is atomic under
+		// the row lock and, together with the per-portfolio advisory lock above, collapses concurrent/duplicate
+		// applies of the SAME trade to a single winner - the loser sees position_applied already TRUE, matches 0
+		// rows, and no-ops. This is the DURABLE guard (a database column), which survives process restarts and
+		// coordinates across instances - NOT the former in-process HashSet.
+		decimal persistedQty;
+		decimal persistedPrice;
+		bool claimed;
+
 		using (var claimCommand = new NpgsqlCommand(
-			"UPDATE trades SET position_applied = TRUE WHERE trade_id = @trade_id AND NOT position_applied", connection, transaction))
+			"UPDATE trades SET position_applied = TRUE " +
+			"WHERE trade_id = @trade_id AND order_id = @order_id AND NOT position_applied " +
+			"RETURNING qty, price", connection, transaction))
 		{
 			claimCommand.Parameters.Add(new NpgsqlParameter("trade_id", NpgsqlDbType.Bigint) { Value = tradeId });
+			claimCommand.Parameters.Add(new NpgsqlParameter("order_id", NpgsqlDbType.Bigint) { Value = orderId });
 
-			var claimed = await claimCommand.ExecuteNonQueryAsync(cancellationToken);
+			// No MARS on a single Npgsql connection: fully read and dispose this reader before the next command.
+			await using var claimReader = await claimCommand.ExecuteReaderAsync(cancellationToken);
 
-			if (claimed == 0)
-				return;
+			claimed = await claimReader.ReadAsync(cancellationToken);
+
+			// NUMERIC(18,4) -> decimal (never double) to preserve scale and the >= semantics downstream.
+			persistedQty = claimed ? claimReader.GetDecimal(0) : 0m;
+			persistedPrice = claimed ? claimReader.GetDecimal(1) : 0m;
 		}
 
-		// Load the existing position for (portfolio, security); default to a flat 0/0/0 when none exists yet
+		// (4) DISAMBIGUATE a zero-row claim (C1). The claim matched nothing for exactly one of three reasons,
+		// and each must be told apart rather than lumped into a silent no-op:
+		//   (a) the trade does not exist at all               -> data/programming error, THROW;
+		//   (b) the trade exists but belongs to another order -> the adversarial mismatch this fix targets,
+		//                                                         THROW so nothing posts to the wrong position;
+		//   (c) the trade exists, belongs to THIS order, and was ALREADY applied -> the legitimate durable
+		//                                                         idempotent replay, RETURN a no-op.
+		// This probe SELECT runs ONLY on the (rare) zero-row path, so the happy path stays a single round trip.
+		if (!claimed)
+		{
+			using var probeCommand = new NpgsqlCommand(
+				"SELECT order_id, position_applied FROM trades WHERE trade_id = @trade_id", connection, transaction);
+			probeCommand.Parameters.Add(new NpgsqlParameter("trade_id", NpgsqlDbType.Bigint) { Value = tradeId });
+
+			await using var probeReader = await probeCommand.ExecuteReaderAsync(cancellationToken);
+
+			if (!await probeReader.ReadAsync(cancellationToken))
+				throw new InvalidOperationException(
+					$"PositionRecalculationService: trade_id {tradeId} not found");
+
+			var actualOrderId = probeReader.GetInt64(0);
+
+			if (actualOrderId != orderId)
+				throw new InvalidOperationException(
+					$"PositionRecalculationService: trade_id {tradeId} belongs to order_id {actualOrderId}, not {orderId}");
+
+			// Belongs to this order and was already applied (or was concurrently claimed under the same advisory
+			// lock): the durable guard has already done its job - idempotent no-op.
+			return;
+		}
+
+		// (5) Load the existing position for (portfolio, security); default to a flat 0/0/0 when none exists yet
 		// (the UPSERT below inserts a fresh row in that case, so a separate "exists" flag is unnecessary). The
 		// read is serialized by the advisory lock above, so it observes any prior apply's committed result.
 		var existingQty = 0m;
@@ -281,11 +337,13 @@ public sealed class PositionRecalculationService
 			}
 		}
 
-		// Average-cost recompute via the shared pure method (the single source of truth for the math).
+		// (6) Average-cost recompute via the shared pure method (the single source of truth for the math), on
+		// the PERSISTED trade values (C1). Recalculate re-validates side / qty > 0 / price > 0, so even a
+		// corrupt persisted trade row cannot mis-post a position - it throws instead.
 		var (newQty, newAvgPrice, newRealizedPnl) = Recalculate(
-			existingQty, existingAvgPrice, existingRealizedPnl, side, tradeQty, tradePrice);
+			existingQty, existingAvgPrice, existingRealizedPnl, side, persistedQty, persistedPrice);
 
-		// UPSERT the position on the positions (portfolio_id, security_id) unique constraint.
+		// (7) UPSERT the position on the positions (portfolio_id, security_id) unique constraint.
 		// unrealized_pnl requires a live market price and is end-of-day only; the proc never maintained it, so
 		// the INSERT path seeds it to 0 and the DO UPDATE path deliberately OMITS it (existing value left
 		// UNTOUCHED, AAP 0.6.5). qty / avg_price / realized_pnl use an absolute SET (the advisory lock serializes
@@ -294,9 +352,14 @@ public sealed class PositionRecalculationService
 		// per-trade gross into a NUMERIC(18,4) store rounds each addend to 4dp and can drift from the true total,
 		// silently loosening the pre-trade commission gate. The gate instead computes exact SUM(t.qty * t.price)
 		// straight from the trades rows (PreTradeRiskService), so no lossy rollup is maintained.
-		const string upsertSql =
+		// M3 (time semantics): by DEFAULT updated_date is stamped from the DATABASE transaction clock
+		// (now() at time zone 'utc') - the SAME server clock as trades.executed_date / orders.submitted_date -
+		// so a divergent application-host clock cannot skew the position's timeline. Only when a clock was
+		// injected (deterministic tests) is an app value bound instead. One UPSERT serves both paths.
+		var updatedDateSql = _utcNow is null ? "now() at time zone 'utc'" : "@updated_date";
+		var upsertSql =
 			"INSERT INTO positions (portfolio_id, security_id, qty, avg_price, realized_pnl, unrealized_pnl, updated_date) " +
-			"VALUES (@portfolio_id, @security_id, @qty, @avg_price, @realized_pnl, 0, @updated_date) " +
+			$"VALUES (@portfolio_id, @security_id, @qty, @avg_price, @realized_pnl, 0, {updatedDateSql}) " +
 			"ON CONFLICT (portfolio_id, security_id) DO UPDATE " +
 			"SET qty = EXCLUDED.qty, " +
 			"avg_price = EXCLUDED.avg_price, " +
@@ -311,12 +374,17 @@ public sealed class PositionRecalculationService
 			upsertCommand.Parameters.Add(new NpgsqlParameter("qty", NpgsqlDbType.Numeric) { Value = newQty });
 			upsertCommand.Parameters.Add(new NpgsqlParameter("avg_price", NpgsqlDbType.Numeric) { Value = newAvgPrice });
 			upsertCommand.Parameters.Add(new NpgsqlParameter("realized_pnl", NpgsqlDbType.Numeric) { Value = newRealizedPnl });
-			// positions.updated_date is timestamp WITHOUT time zone holding UTC; Npgsql rejects a DateTime with
-			// Kind=Utc bound to that type, so normalise to Unspecified and bind explicitly as NpgsqlDbType.Timestamp.
-			upsertCommand.Parameters.Add(new NpgsqlParameter("updated_date", NpgsqlDbType.Timestamp)
+			// On the injected-clock path only, bind the app timestamp. positions.updated_date is timestamp
+			// WITHOUT time zone holding UTC; Npgsql rejects a DateTime with Kind=Utc bound to that type, so
+			// normalise to Unspecified and bind explicitly as NpgsqlDbType.Timestamp. The default (null-clock)
+			// path binds no parameter and lets the DB clock write the column.
+			if (_utcNow is not null)
 			{
-				Value = DateTime.SpecifyKind(_utcNow(), DateTimeKind.Unspecified)
-			});
+				upsertCommand.Parameters.Add(new NpgsqlParameter("updated_date", NpgsqlDbType.Timestamp)
+				{
+					Value = DateTime.SpecifyKind(_utcNow(), DateTimeKind.Unspecified)
+				});
+			}
 
 			await upsertCommand.ExecuteNonQueryAsync(cancellationToken);
 		}

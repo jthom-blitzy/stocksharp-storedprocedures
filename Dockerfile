@@ -67,6 +67,33 @@ FROM mcr.microsoft.com/dotnet/runtime:10.0 AS runtime
 
 WORKDIR /app
 
+# M7 — patch fixed-available OS-package CVEs in the runtime base image.
+#
+# The .NET 10 runtime image is Ubuntu 24.04 (Noble) based and ships slightly
+# behind the Ubuntu security stream, so a fresh pull carries packages (notably
+# gzip and tar) for which FIXED versions are already published in the Ubuntu
+# apt repositories. A container image scan flags these as "fixed-available"
+# vulnerabilities. Applying the security updates here — as root, at the TOP of
+# the runtime stage and BEFORE we drop to the non-root `app` user below — pulls
+# every such package up to its patched version so a rescan of the built image
+# reports no fixed-available OS vulnerabilities.
+#
+#   * `apt-get upgrade` (not a full `dist-upgrade`) applies available security/
+#     bugfix updates to the already-installed package set without adding or
+#     removing packages, keeping the image minimal (no new dependency surface).
+#   * DEBIAN_FRONTEND=noninteractive keeps the upgrade non-interactive in the
+#     build.
+#   * The apt lists are removed in the SAME layer so the cache does not bloat the
+#     final image (the metadata is only needed for the upgrade itself).
+#
+# This runs before the `USER app` drop precisely because apt requires root; the
+# subsequent COPY and privilege drop are unaffected.
+RUN export DEBIAN_FRONTEND=noninteractive \
+    && apt-get update \
+    && apt-get upgrade -y \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
 # Bring in only the framework-dependent publish output from the build stage (the
 # app DLL plus its managed dependencies, including Npgsql.dll). The SDK, the
 # sources, and the NuGet caches stay behind in the build stage, keeping the

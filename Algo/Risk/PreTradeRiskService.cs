@@ -133,22 +133,29 @@ public readonly struct GateInputs
 /// </remarks>
 public sealed class PreTradeRiskService
 {
-	// Injectable UTC clock: mirrors the SQL SYSUTCDATETIME() / Postgres now() at time zone 'utc' time
-	// source the original proc used for the rolling frequency window and the daily-volume day boundary,
-	// and makes the gate deterministic under the parity tests.
+	// Injectable UTC clock OVERRIDE for the rolling frequency window and the daily-volume day boundary. NULL
+	// (the default, and the production path) means "use the DATABASE transaction time": ValidateAsync reads
+	// ONE timestamp via SELECT now() at time zone 'utc' on the caller's transaction and uses it for BOTH
+	// boundaries, so the cutoffs share the SAME server clock as the orders.submitted_date rows they compare
+	// against and host/database clock skew can never loosen (or tighten) a control (M3). This replaces the
+	// former DateTime.UtcNow default, which read the APP host clock and could drift from the DB. A non-null
+	// clock (the parity/skew tests supply one) OVERRIDES this to make the gate deterministic.
 	private readonly Func<DateTime> _utcNow;
 
 	/// <summary>
 	/// Initializes a new instance of the <see cref="PreTradeRiskService"/> class.
 	/// </summary>
 	/// <param name="utcNow">
-	/// Optional UTC clock used for the rolling frequency window and the daily-volume day boundary. When
-	/// <see langword="null"/> the service uses <see cref="DateTime.UtcNow"/>. Supplying a fixed clock
-	/// makes the parity tests deterministic.
+	/// Optional UTC clock OVERRIDE for the rolling frequency window and the daily-volume day boundary. When
+	/// <see langword="null"/> (the default, and the production path) the service instead reads a single
+	/// transaction timestamp from PostgreSQL (<c>now() at time zone 'utc'</c>) so the window and day
+	/// boundaries share the database clock with the <c>submitted_date</c> rows they compare against, and
+	/// app/database clock skew cannot shift a boundary (M3). Supplying a fixed clock overrides this and makes
+	/// the parity tests deterministic.
 	/// </param>
 	public PreTradeRiskService(Func<DateTime> utcNow = null)
 	{
-		_utcNow = utcNow ?? (() => DateTime.UtcNow);
+		_utcNow = utcNow;
 	}
 
 	/// <summary>
@@ -182,10 +189,27 @@ public sealed class PreTradeRiskService
 	/// </returns>
 	public static PreTradeRiskResult EvaluateGate(in GateInputs g)
 	{
-		// --- 0. Structural guard: a supplied price must be strictly positive (M11) ---
-		// Mirrors the CK_Orders_price schema constraint and the ValidateAsync guard, so a zero/negative price
-		// is rejected before any ceiling check and can never bypass the price / notional / commission gates.
-		// A market order (Price is null) has no price and is unaffected.
+		// --- 0. Structural guards: the order must be WELL-FORMED before any ceiling check (M1). These mirror
+		// exactly the guards ValidateAsync applies before it delegates here, so the pure decision core is
+		// self-defending: a DIRECT caller (or a test) cannot obtain a wrong answer from a malformed order, and
+		// the production path (which pre-guards in ValidateAsync) sees identical outcomes. Without these, an
+		// unknown side fell through to the step-5 "'B' adds, else subtracts" position math (silently treated as
+		// a SELL), and a non-positive qty could return Valid whenever the qty ceiling happened to be disabled.
+
+		// 0a. Side must be exactly "B" (buy) or "S" (sell) - the CK_Orders_side domain. SAME reason text as
+		// ValidateAsync so the production path and the direct-gate parity tests agree.
+		if (g.Side != "B" && g.Side != "S")
+			return PreTradeRiskResult.Reject($"Invalid side: {g.Side}");
+
+		// 0b. Quantity must be strictly positive - the CK_Orders_qty domain. GateInputs.Qty is already the
+		// NUMERIC(18,4)-quantised value ValidateAsync decided on, so a value that rounds to <= 0 is malformed
+		// and must be rejected rather than slip past a disabled qty ceiling. SAME reason text as ValidateAsync.
+		if (g.Qty <= 0m)
+			return PreTradeRiskResult.Reject("Invalid qty");
+
+		// 0c. A supplied price must be strictly positive (M11). Mirrors the CK_Orders_price schema constraint
+		// and the ValidateAsync guard, so a zero/negative price is rejected before any ceiling check and can
+		// never bypass the price / notional / commission gates. A market order (Price is null) is unaffected.
 		if (g.Price is not null && g.Price.Value <= 0m)
 			return PreTradeRiskResult.Reject($"Invalid price {g.Price.Value.To<string>()}");
 
@@ -316,11 +340,24 @@ public sealed class PreTradeRiskService
 		if (transaction is null)
 			throw new ArgumentNullException(nameof(transaction));
 
-		// One UTC instant for the whole validation (the SQL proc used a single SYSUTCDATETIME()).
-		// The Postgres columns are `timestamp WITHOUT time zone` holding UTC; Npgsql rejects a DateTime
-		// with Kind=Utc bound to such a column, and reads them back as Kind=Unspecified. Normalise to
-		// Unspecified so every DB comparison and the rolling evaluator run on one consistent timeline.
-		var now = DateTime.SpecifyKind(_utcNow(), DateTimeKind.Unspecified);
+		// One UTC instant for the whole validation (the SQL proc used a single SYSUTCDATETIME()). By DEFAULT
+		// (no injected clock, i.e. the production path) this is the DATABASE transaction timestamp, read ONCE
+		// here via SELECT now() at time zone 'utc' on the caller's transaction - the SAME server clock that
+		// writes orders.submitted_date - so the frequency cutoff and the daily-volume day boundary below
+		// compare like-for-like against the stored timestamps and app/database clock skew cannot shift a
+		// boundary (M3). A test-injected clock overrides this. The Postgres columns are `timestamp WITHOUT
+		// time zone` holding UTC; Npgsql reads/writes them as Kind=Unspecified, so normalise to Unspecified for
+		// one consistent timeline. Reading a single value here preserves the proc's single-instant semantic.
+		DateTime now;
+		if (_utcNow is not null)
+		{
+			now = DateTime.SpecifyKind(_utcNow(), DateTimeKind.Unspecified);
+		}
+		else
+		{
+			using var nowCommand = new NpgsqlCommand("SELECT now() at time zone 'utc'", connection, transaction);
+			now = DateTime.SpecifyKind((DateTime)await nowCommand.ExecuteScalarAsync(cancellationToken), DateTimeKind.Unspecified);
+		}
 
 		// --- Guards (mirror the SQL RETURNs that run before any RiskLimits lookup) ---
 		if (side != "B" && side != "S")
@@ -407,6 +444,25 @@ public sealed class PreTradeRiskService
 				commissionRate = reader.IsDBNull(8) ? (decimal?)null : reader.GetDecimal(8);
 			}
 		}
+
+		// M2 (fail-closed configuration). The schema CK_RiskLimits_* constraints forbid a negative limit at
+		// write time, but a row predating the constraint - or a manual / out-of-band override - could still
+		// carry one. A negative ceiling would be silently swallowed by the null-or-zero-is-unlimited convention
+		// (the enabled-predicates require > 0), DISABLING the control and LOOSENING risk - the opposite of
+		// safe, and it would also short-circuit to Valid via the "nothing enforced" early-out just below. Fail
+		// CLOSED: reject the order outright rather than evaluate it against an untrustworthy configuration.
+		// (NULL and 0 remain the legitimate "unlimited" convention, AAP 0.6.4; only a strictly negative value
+		// is treated as invalid, via the canonical CanonicalRiskRules.IsNegative predicate.)
+		if (CanonicalRiskRules.IsNegative(maxOrderPrice)
+			|| CanonicalRiskRules.IsNegative(maxOrderQty)
+			|| CanonicalRiskRules.IsNegative(maxOrderValue)
+			|| CanonicalRiskRules.IsNegative(maxPositionSize)
+			|| CanonicalRiskRules.IsNegative(maxDailyVolume)
+			|| CanonicalRiskRules.IsNegative(maxCommissionTotal)
+			|| CanonicalRiskRules.IsNegative(commissionRate)
+			|| CanonicalRiskRules.IsNegative(maxOrderFreqCount)
+			|| CanonicalRiskRules.IsNegative(maxOrderFreqWindowSec))
+			return PreTradeRiskResult.Reject("Invalid risk configuration: negative limit");
 
 		// No ENFORCED ceilings at all => nothing to check (a NULL or 0 limit means "unlimited", the AAP 0.6.4
 		// convention the C# RiskRule classes also use). Evaluated through the canonical enabled-limit predicates

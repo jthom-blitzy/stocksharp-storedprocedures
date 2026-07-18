@@ -5,9 +5,13 @@ namespace StockSharp.Algo.Risk;
 /// SHARED between the per-order pre-trade gate (<see cref="PreTradeRiskService"/>) and the
 /// portfolio-wide circuit-breaker rules. Two things live here, and only here:
 /// (1) the rolling-window ORDER-FREQUENCY evaluator, consumed by BOTH the gate and
-/// <see cref="RiskOrderFreqRule"/> — this is what removes the former C# &lt;-&gt; SQL frequency
-/// divergence, because the two sides can no longer disagree when they compute frequency from one
-/// definition; and (2) the gate's numeric-ceiling semantics — the "enabled limit" predicate
+/// <see cref="RiskOrderFreqRule"/> — this removes the former C# &lt;-&gt; SQL frequency
+/// ARITHMETIC divergence: given the same observed events both sides now compute the same in-window
+/// count from one definition, so they cannot disagree on that arithmetic. It does NOT make their
+/// overall decisions identical — they still read different state (the gate queries the Orders
+/// table; the breaker sees an in-memory message stream) and take different actions (the gate
+/// rejects the single order; the breaker takes portfolio-wide action), as documented on
+/// <see cref="RiskOrderFreqRule"/>; and (2) the gate's numeric-ceiling semantics — the "enabled limit" predicate
 /// (<see cref="IsCeilingEnabled"/>, where a NULL or zero limit means "not enforced") and the
 /// "meets or exceeds" comparison (<see cref="MeetsOrExceeds"/>), consumed by the gate.
 /// </summary>
@@ -156,6 +160,30 @@ public static class CanonicalRiskRules
 	/// <returns><see langword="true"/> if both the count and the window are present and strictly positive.</returns>
 	public static bool IsFrequencyEnabled(int? maxCount, int? windowSeconds)
 		=> maxCount.HasValue && maxCount.Value > 0 && windowSeconds.HasValue && windowSeconds.Value > 0;
+
+	/// <summary>
+	/// Canonical "is this configured limit INVALID (strictly negative)?" predicate. The
+	/// null-or-zero-is-unlimited convention (<see cref="IsCeilingEnabled"/> / <see cref="IsFrequencyEnabled"/>)
+	/// deliberately treats NULL or 0 as "not enforced", but a NEGATIVE limit is neither a valid ceiling nor a
+	/// meaningful "disabled" value - it is a misconfiguration. Detecting it lets the pre-trade gate FAIL CLOSED
+	/// (reject the order) rather than silently swallow the negative through the <c>&gt; 0</c> enabled-predicate
+	/// and thereby LOOSEN the control (M2). The schema <c>CK_RiskLimits_*</c> constraints forbid negatives at
+	/// write time; this is the defense-in-depth read-time counterpart for a row that predates the constraint
+	/// or was written out of band.
+	/// </summary>
+	/// <param name="value">The optional decimal limit to test.</param>
+	/// <returns><see langword="true"/> if the value is present and strictly negative.</returns>
+	public static bool IsNegative(decimal? value)
+		=> value.HasValue && value.Value < 0m;
+
+	/// <summary>
+	/// Integer overload of <see cref="IsNegative(decimal?)"/>, for the order-frequency count and window
+	/// (<c>max_order_freq_count</c> / <c>max_order_freq_window_sec</c>).
+	/// </summary>
+	/// <param name="value">The optional integer limit to test.</param>
+	/// <returns><see langword="true"/> if the value is present and strictly negative.</returns>
+	public static bool IsNegative(int? value)
+		=> value.HasValue && value.Value < 0;
 
 	/// <summary>
 	/// Shared "meets or exceeds an optional ceiling" comparison used by the pre-trade gate for its

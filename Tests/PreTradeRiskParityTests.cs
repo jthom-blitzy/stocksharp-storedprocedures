@@ -1,6 +1,7 @@
 namespace StockSharp.Tests;
 
 using System.Data;
+using System.Diagnostics;
 using System.Text;
 
 using StockSharp.Algo.Risk;
@@ -707,6 +708,423 @@ public class PreTradeRiskParityTests : BaseTestClass
 	}
 
 	// =============================================================================================
+	// Phase M9 - REVIEW-FINDING REGRESSIONS for the pre-trade GATE (findings M1, M2, M3).
+	//
+	// These four tests lock in the Phase 4 gate-logic fixes so a future edit cannot silently reopen them:
+	//   * M1  - EvaluateGate rejects a STRUCTURALLY malformed order (bad side / non-positive qty / bad price)
+	//           even when every ceiling is disabled (pure, no database).
+	//   * M2  - negative and unpaired-frequency limits are rejected at BOTH layers: the schema CHECK
+	//           constraints (Phase 2 DDL) AND the ValidateAsync runtime fail-closed guard (Phase 4).
+	//   * M3  - the rolling frequency window is anchored on the DATABASE transaction clock, not a (skewable)
+	//           application clock, so a skewed app clock cannot loosen the control.
+	// =============================================================================================
+
+	/// <summary>
+	/// M1: <see cref="PreTradeRiskService.EvaluateGate"/> is a PURE static decision core with no database
+	/// dependency. A direct caller (or a future reuse of the gate) must never be able to coax a wrong answer
+	/// out of a malformed order. Before the fix an unknown side fell through to the step-5 "'B' adds, else
+	/// subtracts" position math (silently treated as a SELL) and a non-positive qty could return Valid whenever
+	/// the qty ceiling happened to be disabled. Every vector here uses ALL-NULL ("unlimited") ceilings on
+	/// purpose, so ONLY the new structural guards can produce a rejection.
+	/// </summary>
+	[TestMethod]
+	public void EvaluateGate_MalformedInput_StructurallyRejected()
+	{
+		// Unknown side "X" -> rejected with the EXACT reason ValidateAsync uses (full-string equality).
+		var badSide = PreTradeRiskService.EvaluateGate(new GateInputs { Side = "X", Qty = 100m, Price = 150m });
+		badSide.IsValid.AssertFalse();
+		badSide.RejectReason.AssertEqual("Invalid side: X");
+
+		// Lowercase and word forms are NOT the canonical "B"/"S" domain either.
+		PreTradeRiskService.EvaluateGate(new GateInputs { Side = "b", Qty = 100m, Price = 150m }).IsValid.AssertFalse();
+		PreTradeRiskService.EvaluateGate(new GateInputs { Side = "SELL", Qty = 100m, Price = 150m }).IsValid.AssertFalse();
+		PreTradeRiskService.EvaluateGate(new GateInputs { Side = "", Qty = 100m, Price = 150m }).IsValid.AssertFalse();
+
+		// Zero and negative quantity -> rejected even though the qty ceiling is disabled (NULL).
+		var zeroQty = PreTradeRiskService.EvaluateGate(new GateInputs { Side = "B", Qty = 0m, Price = 150m });
+		zeroQty.IsValid.AssertFalse();
+		zeroQty.RejectReason.AssertEqual("Invalid qty");
+		PreTradeRiskService.EvaluateGate(new GateInputs { Side = "B", Qty = -5m, Price = 150m }).IsValid.AssertFalse();
+
+		// A SUPPLIED non-positive price -> rejected before any ceiling check (a market order, Price=null, is
+		// unaffected and is covered by the control case below).
+		var badPrice = PreTradeRiskService.EvaluateGate(new GateInputs { Side = "B", Qty = 100m, Price = -1m });
+		badPrice.IsValid.AssertFalse();
+		badPrice.RejectReason.Contains("Invalid price").AssertTrue();
+
+		// CONTROL: well-formed buy (limit) and sell (market) with ALL ceilings disabled -> Valid, reason null.
+		// Proves the structural guards do not false-positive on a legitimate order.
+		var okBuy = PreTradeRiskService.EvaluateGate(new GateInputs { Side = "B", Qty = 100m, Price = 150m });
+		okBuy.IsValid.AssertTrue();
+		okBuy.RejectReason.AssertNull();
+		PreTradeRiskService.EvaluateGate(new GateInputs { Side = "S", Qty = 100m, Price = null }).IsValid.AssertTrue();
+	}
+
+	/// <summary>
+	/// M2 (schema layer): the Phase 2 CHECK constraints reject a negative ceiling, an unpaired frequency
+	/// (count set without a window), and a negative frequency window at the DDL boundary - so a corrupt limit
+	/// can never be persisted in the first place. Each attempt runs in its own transaction that is rolled back,
+	/// because a failed statement aborts the surrounding PostgreSQL transaction.
+	/// </summary>
+	[TestMethod]
+	public async Task RiskLimits_NegativeAndUnpairedFrequency_RejectedByCheckConstraints()
+	{
+		await using var connection = await OpenPostgresAsync();
+
+		// (a) negative max_order_price -> ck_risklimits_max_order_price.
+		await AssertRiskLimitsInsertViolatesCheckAsync(connection,
+			"INSERT INTO risklimits (portfolio_id, max_order_price, commission_rate) VALUES (@pid, -1, 0.0005)");
+
+		// (b) frequency count set but window NULL (unpaired) -> ck_risklimits_freq_paired.
+		await AssertRiskLimitsInsertViolatesCheckAsync(connection,
+			"INSERT INTO risklimits (portfolio_id, max_order_freq_count, commission_rate) VALUES (@pid, 5, 0.0005)");
+
+		// (c) negative frequency window (paired, so freq_paired is satisfied) -> ck_risklimits_freq_window.
+		await AssertRiskLimitsInsertViolatesCheckAsync(connection,
+			"INSERT INTO risklimits (portfolio_id, max_order_freq_count, max_order_freq_window_sec, commission_rate) " +
+			"VALUES (@pid, 5, -1, 0.0005)");
+	}
+
+	/// <summary>
+	/// M2 (runtime layer / defence in depth): even if a negative ceiling somehow bypasses the DDL (an older
+	/// database, a manual edit, a dropped constraint), <see cref="PreTradeRiskService.ValidateAsync"/> must
+	/// FAIL CLOSED rather than treat the negative value as "unlimited". We drop the CHECK constraint INSIDE the
+	/// transaction, plant a negative row, prove ValidateAsync rejects, then ROLLBACK - which restores both the
+	/// constraint and removes the row (PostgreSQL transactional DDL), leaving the shared test database pristine.
+	/// </summary>
+	[TestMethod]
+	public async Task ValidateAsync_NegativeLimit_FailsClosed()
+	{
+		await using var connection = await OpenPostgresAsync();
+		await using var transaction = await connection.BeginTransactionAsync(CancellationToken);
+
+		var suffix = Guid.NewGuid().ToString("N");
+		var portfolioId = await InsertPortfolioAsync(connection, transaction, "NEGRT_" + suffix);
+		var securityId = await InsertSecurityAsync(connection, transaction, "SEC_" + suffix);
+
+		await using (var drop = new NpgsqlCommand(
+			"ALTER TABLE risklimits DROP CONSTRAINT IF EXISTS ck_risklimits_max_order_price", connection, transaction))
+			await drop.ExecuteNonQueryAsync(CancellationToken);
+
+		await using (var insert = new NpgsqlCommand(
+			"INSERT INTO risklimits (portfolio_id, max_order_price, commission_rate) VALUES (@pid, -1, 0.0005)",
+			connection, transaction))
+		{
+			insert.Parameters.Add(PgP("pid", NpgsqlDbType.Integer, portfolioId));
+			await insert.ExecuteNonQueryAsync(CancellationToken);
+		}
+
+		var result = await new PreTradeRiskService()
+			.ValidateAsync(connection, transaction, portfolioId, securityId, "B", 10m, 100.00m, CancellationToken);
+
+		result.IsValid.AssertFalse();
+		result.RejectReason.AssertNotNull();
+		result.RejectReason.ToLowerInvariant().Contains("negative limit").AssertTrue();
+
+		await transaction.RollbackAsync(CancellationToken);
+	}
+
+	/// <summary>
+	/// M3: the rolling frequency window must be anchored on the DATABASE transaction clock (the same clock that
+	/// stamps <c>orders.submitted_date</c>), NOT on a skewable application clock. PostgreSQL <c>now()</c> is the
+	/// TRANSACTION-START timestamp (stable for the whole transaction), so seeded orders and an in-transaction
+	/// <c>SELECT now()</c> share one clock. We seed four recent orders (limit = 5 per 60s) and show the two
+	/// verdicts DIVERGE: the DEFAULT service (DB clock) counts them and REJECTS the fifth on frequency (the safe
+	/// verdict), whereas a service given an app clock skewed +1h into the future would push the cutoff past the
+	/// seeded rows and wrongly ACCEPT. Proving the default path yields the strict verdict proves it does not
+	/// trust an app clock.
+	/// </summary>
+	[TestMethod]
+	public async Task ValidateAsync_FrequencyWindow_UsesDatabaseClock_NotAppClock()
+	{
+		await using var connection = await OpenPostgresAsync();
+		await using var transaction = await connection.BeginTransactionAsync(CancellationToken);
+
+		var suffix = Guid.NewGuid().ToString("N");
+		var portfolioId = await InsertPortfolioAsync(connection, transaction, "SKEW_" + suffix);
+		var securityId = await InsertSecurityAsync(connection, transaction, "SEC_" + suffix);
+		await InsertDemoRiskLimitsAsync(connection, transaction, portfolioId); // frequency = 5 orders / 60s
+
+		// Seed FOUR recent orders; submitted_date DEFAULTS to (now() at time zone 'utc') = txn-start time.
+		for (var i = 0; i < 4; i++)
+			await PgSeedOrderAsync(connection, transaction, portfolioId, securityId, "B", 1m, 150.00m, "ACCEPTED");
+
+		// Read the SAME transaction clock so the injected-clock service can be skewed relative to it.
+		DateTime dbNow;
+		await using (var nowCmd = new NpgsqlCommand("SELECT now() at time zone 'utc'", connection, transaction))
+			dbNow = DateTime.SpecifyKind((DateTime)await nowCmd.ExecuteScalarAsync(CancellationToken), DateTimeKind.Unspecified);
+
+		// (a) DEFAULT service (no injected clock) -> reads DB transaction time; cutoff = dbNow - 60s, so all
+		// four seeded orders fall INSIDE the window and the prospective fifth trips 4 + 1 = 5 >= 5 => REJECT.
+		var dbClockResult = await new PreTradeRiskService()
+			.ValidateAsync(connection, transaction, portfolioId, securityId, "B", 1m, 150.00m, CancellationToken);
+		dbClockResult.IsValid.AssertFalse();
+		dbClockResult.RejectReason.AssertNotNull();
+		dbClockResult.RejectReason.ToLowerInvariant().Contains("frequency").AssertTrue();
+
+		// (b) A service whose APP clock is skewed +1h into the future. If the gate trusted this app clock (the
+		// M3 bug), cutoff = (dbNow + 1h) - 60s would sit AFTER the seeded rows, they would NOT be counted, and
+		// the order would be wrongly ACCEPTED. Observing that ACCEPT here demonstrates the loosening an app
+		// clock would cause - and therefore that the DEFAULT (DB-clock) path in (a) is the safe one.
+		var skewedResult = await new PreTradeRiskService(() => dbNow.AddHours(1))
+			.ValidateAsync(connection, transaction, portfolioId, securityId, "B", 1m, 150.00m, CancellationToken);
+		skewedResult.IsValid.AssertTrue();
+
+		await transaction.RollbackAsync(CancellationToken);
+	}
+
+	/// <summary>
+	/// Helper for <see cref="RiskLimits_NegativeAndUnpairedFrequency_RejectedByCheckConstraints"/>: inserts a
+	/// fresh portfolio and attempts <paramref name="insertSql"/> (parameter <c>@pid</c> = that portfolio id) on
+	/// its own transaction, asserting the statement fails with SQLSTATE 23514 (check_violation), then rolls the
+	/// transaction back. A per-attempt transaction is required because a failed statement aborts the
+	/// surrounding PostgreSQL transaction.
+	/// </summary>
+	private async Task AssertRiskLimitsInsertViolatesCheckAsync(NpgsqlConnection connection, string insertSql)
+	{
+		await using var transaction = await connection.BeginTransactionAsync(CancellationToken);
+
+		var suffix = Guid.NewGuid().ToString("N");
+		var portfolioId = await InsertPortfolioAsync(connection, transaction, "NEGCHK_" + suffix);
+
+		var caught = false;
+		try
+		{
+			await using var command = new NpgsqlCommand(insertSql, connection, transaction);
+			command.Parameters.Add(PgP("pid", NpgsqlDbType.Integer, portfolioId));
+			await command.ExecuteNonQueryAsync(CancellationToken);
+		}
+		catch (PostgresException ex) when (ex.SqlState == "23514") // 23514 = check_violation
+		{
+			caught = true;
+		}
+
+		caught.AssertTrue();
+		await transaction.RollbackAsync(CancellationToken);
+	}
+
+	// =============================================================================================
+	// Phase M6/M9 - REVIEW-FINDING REGRESSIONS for TEST SAFETY, the AUDIT TRIGGER, SECURITY CASE
+	// parity, and DEMO failure behavior (findings M6, M9, and the M5 "add failure-path tests" item).
+	// =============================================================================================
+
+	/// <summary>
+	/// M6: the SQL Server characterization harness must REFUSE to run its destructive DDL against a database
+	/// that is not clearly disposable. This exercises the pure guard predicate directly (no SQL Server needed),
+	/// so the safety rule is verified even in a run where STOCKSHARP_LEGACY_MSSQL_CONNECTION is unset.
+	/// </summary>
+	[TestMethod]
+	public void MssqlHarness_RefusesNonDisposableDatabase()
+	{
+		// Production-looking names with no explicit opt-in are REFUSED.
+		MssqlDatabaseIsDisposable("StockSharpLegacy", explicitlyAllowed: false).AssertFalse();
+		MssqlDatabaseIsDisposable("master", explicitlyAllowed: false).AssertFalse();
+		MssqlDatabaseIsDisposable("", explicitlyAllowed: false).AssertFalse();
+		MssqlDatabaseIsDisposable(null, explicitlyAllowed: false).AssertFalse();
+
+		// A name that marks itself disposable (contains "test", any case) is ACCEPTED.
+		MssqlDatabaseIsDisposable("StockSharpLegacyTest", explicitlyAllowed: false).AssertTrue();
+		MssqlDatabaseIsDisposable("ci_TEST_db", explicitlyAllowed: false).AssertTrue();
+
+		// The explicit STOCKSHARP_LEGACY_MSSQL_ALLOW_DDL opt-in overrides the name check for any target.
+		MssqlDatabaseIsDisposable("StockSharpLegacy", explicitlyAllowed: true).AssertTrue();
+	}
+
+	/// <summary>
+	/// M9 (audit trigger): the kept, pure status-audit trigger <c>trg_Orders_StatusAudit</c> must append EXACTLY
+	/// one <c>OrderStatusHistory</c> row when an order's status genuinely changes, and must NOT fire for an
+	/// INSERT, a non-status column amendment, or a "change" to the same value (the AFTER UPDATE OF status +
+	/// IS DISTINCT FROM guards). This is the regression the docs previously CLAIMED existed (M9) but did not.
+	/// </summary>
+	[TestMethod]
+	public async Task Audit_StatusChange_WritesHistoryRow_PureAuditOnly()
+	{
+		await using var connection = await OpenPostgresAsync();
+		await using var transaction = await connection.BeginTransactionAsync(CancellationToken);
+
+		var suffix = Guid.NewGuid().ToString("N");
+		var portfolioId = await InsertPortfolioAsync(connection, transaction, "AUDIT_" + suffix);
+		var securityId = await InsertSecurityAsync(connection, transaction, "SEC_" + suffix);
+		var orderId = await PgInsertOrderReturningIdAsync(connection, transaction, portfolioId, securityId, "B", 100m, 150.00m, "PENDING");
+
+		// Baseline: the INSERT itself does NOT create a history row (trigger is AFTER UPDATE OF status).
+		(await CountHistoryAsync(connection, transaction, orderId)).AssertEqual(0L);
+
+		// (a) a genuine status change PENDING -> FILLED writes exactly one history row with the old/new pair.
+		await SetOrderStatusAsync(connection, transaction, orderId, "FILLED");
+		(await CountHistoryAsync(connection, transaction, orderId)).AssertEqual(1L);
+		await using (var hist = new NpgsqlCommand(
+			"SELECT old_status, new_status FROM orderstatushistory WHERE order_id = @id ORDER BY history_id DESC LIMIT 1",
+			connection, transaction))
+		{
+			hist.Parameters.Add(PgP("id", NpgsqlDbType.Bigint, orderId));
+			await using var reader = await hist.ExecuteReaderAsync(CancellationToken);
+			(await reader.ReadAsync(CancellationToken)).AssertTrue();
+			reader.GetString(0).AssertEqual("PENDING"); // old_status
+			reader.GetString(1).AssertEqual("FILLED");  // new_status
+		}
+
+		// (b) amending a NON-status column (price) does NOT create a history row (narrow, pure-audit).
+		await using (var amend = new NpgsqlCommand("UPDATE orders SET price = 151.00 WHERE order_id = @id", connection, transaction))
+		{
+			amend.Parameters.Add(PgP("id", NpgsqlDbType.Bigint, orderId));
+			await amend.ExecuteNonQueryAsync(CancellationToken);
+		}
+		(await CountHistoryAsync(connection, transaction, orderId)).AssertEqual(1L);
+
+		// (c) an UPDATE that sets status to its CURRENT value (no real change) does NOT create a row
+		//     (the IS DISTINCT FROM guard in the trigger function).
+		await SetOrderStatusAsync(connection, transaction, orderId, "FILLED");
+		(await CountHistoryAsync(connection, transaction, orderId)).AssertEqual(1L);
+
+		await transaction.RollbackAsync(CancellationToken);
+	}
+
+	/// <summary>
+	/// M9 (security case parity): the M4 case-insensitive functional unique index
+	/// <c>UQ_Securities_code_board</c> must fold case so that <c>('AAPL','NASDAQ')</c> and
+	/// <c>('aapl','nasdaq')</c> collide (the SQL Server default-CI-collation identity), and NULLS NOT DISTINCT
+	/// must make two <c>(code, NULL board)</c> rows collide too. Both attempts run in their own transaction
+	/// because the first duplicate aborts the surrounding transaction.
+	/// </summary>
+	[TestMethod]
+	public async Task Securities_CaseVariantIdentity_CollidesInUniqueIndex()
+	{
+		await using var connection = await OpenPostgresAsync();
+
+		var code = "CV" + Guid.NewGuid().ToString("N"); // unique base, mixed hex letters -> distinct upper/lower
+
+		// (a) case-variant code AND board collide.
+		await AssertSecondSecurityInsertCollidesAsync(connection,
+			code.ToLowerInvariant(), "nasdaq",
+			code.ToUpperInvariant(), "NASDAQ");
+
+		// (b) NULLS NOT DISTINCT: two (code, NULL board) rows collide despite the NULL board.
+		await AssertSecondSecurityInsertCollidesAsync(connection,
+			code.ToLowerInvariant(), null,
+			code.ToUpperInvariant(), null);
+	}
+
+	/// <summary>
+	/// M5 / M9 (demo failure behavior): runs the BUILT demo executable against an UNREACHABLE database and
+	/// asserts its documented failure contract - a non-zero exit code and a SANITIZED message that leaks
+	/// neither the connection password nor a provider stack trace / SQLSTATE. Reports Inconclusive (skips)
+	/// when the demo assembly has not been built, mirroring the harness's opt-in philosophy.
+	/// </summary>
+	[TestMethod]
+	public async Task Demo_FailurePath_ExitsNonZeroAndSanitized()
+	{
+		var demoDll = FindDemoAssembly();
+		if (demoDll is null)
+		{
+			Inconclusive("Demo assembly (03_Misc.LegacySqlDemo.dll) not found - build the demo to run this characterization.");
+			return;
+		}
+
+		var startInfo = new ProcessStartInfo
+		{
+			FileName = "dotnet",
+			RedirectStandardOutput = true,
+			RedirectStandardError = true,
+			UseShellExecute = false,
+		};
+		startInfo.ArgumentList.Add(demoDll);
+		// Point the demo at an unreachable database with a SECRET password we then prove is never printed.
+		startInfo.Environment["STOCKSHARP_LEGACY_SQL_CONNECTION"] =
+			"Host=localhost;Port=1;Database=nope;Username=demo;Password=THIS_MUST_NOT_LEAK;Timeout=3";
+
+		using var process = Process.Start(startInfo);
+		var stdout = await process.StandardOutput.ReadToEndAsync(CancellationToken);
+		var stderr = await process.StandardError.ReadToEndAsync(CancellationToken);
+		await process.WaitForExitAsync(CancellationToken);
+
+		// (1) a setup failure exits NON-ZERO (the demo contract: 1 = setup failure).
+		process.ExitCode.AssertEqual(1);
+		// (2) the failure is reported, sanitized, with actionable guidance.
+		stderr.Contains("Could not reach the legacy PostgreSQL database").AssertTrue();
+		// (3) NOTHING sensitive/internal leaks: no password, no provider stack frames, no SQLSTATE.
+		stderr.Contains("THIS_MUST_NOT_LEAK").AssertFalse();
+		stdout.Contains("THIS_MUST_NOT_LEAK").AssertFalse();
+		stderr.Contains("at Npgsql").AssertFalse();
+		stderr.Contains("at System.").AssertFalse();
+	}
+
+	// --- Phase M6/M9 helpers ------------------------------------------------------------------------------
+
+	/// <summary>Counts OrderStatusHistory rows for an order on the caller's transaction (audit-trigger test).</summary>
+	private async Task<long> CountHistoryAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, long orderId)
+	{
+		await using var command = new NpgsqlCommand(
+			"SELECT COUNT(*) FROM orderstatushistory WHERE order_id = @id", connection, transaction);
+		command.Parameters.Add(PgP("id", NpgsqlDbType.Bigint, orderId));
+		return (long)await command.ExecuteScalarAsync(CancellationToken);
+	}
+
+	/// <summary>Sets an order's status on the caller's transaction (audit-trigger test).</summary>
+	private async Task SetOrderStatusAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, long orderId, string status)
+	{
+		await using var command = new NpgsqlCommand(
+			"UPDATE orders SET status = @status WHERE order_id = @id", connection, transaction);
+		command.Parameters.Add(PgP("status", NpgsqlDbType.Varchar, status));
+		command.Parameters.Add(PgP("id", NpgsqlDbType.Bigint, orderId));
+		await command.ExecuteNonQueryAsync(CancellationToken);
+	}
+
+	/// <summary>Inserts a securities row with an explicit (code, nullable board) on the caller's transaction.</summary>
+	private async Task InsertSecurityRowAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, string code, string board)
+	{
+		await using var command = new NpgsqlCommand(
+			"INSERT INTO securities (security_code, board_code, security_type) VALUES (@code, @board, 'Stock')",
+			connection, transaction);
+		command.Parameters.Add(PgP("code", NpgsqlDbType.Varchar, code));
+		command.Parameters.Add(PgP("board", NpgsqlDbType.Varchar, board));
+		await command.ExecuteNonQueryAsync(CancellationToken);
+	}
+
+	/// <summary>Inserts the first (code1, board1) securities row, then asserts the second (code2, board2) row
+	/// violates the case-insensitive unique index with SQLSTATE 23505, on its own rolled-back transaction.</summary>
+	private async Task AssertSecondSecurityInsertCollidesAsync(NpgsqlConnection connection, string code1, string board1, string code2, string board2)
+	{
+		await using var transaction = await connection.BeginTransactionAsync(CancellationToken);
+
+		await InsertSecurityRowAsync(connection, transaction, code1, board1);
+
+		var caught = false;
+		try
+		{
+			await InsertSecurityRowAsync(connection, transaction, code2, board2);
+		}
+		catch (PostgresException ex) when (ex.SqlState == "23505") // 23505 = unique_violation
+		{
+			caught = true;
+		}
+
+		caught.AssertTrue();
+		await transaction.RollbackAsync(CancellationToken);
+	}
+
+	/// <summary>Locates the built demo assembly by walking up from the test output directory to the repo root
+	/// and searching the demo project's output; returns null when it has not been built.</summary>
+	private static string FindDemoAssembly()
+	{
+		var dir = new DirectoryInfo(AppContext.BaseDirectory);
+		while (dir is not null)
+		{
+			var demoProjectDir = Path.Combine(dir.FullName, "Samples", "08_Misc", "03_LegacySqlDemo");
+			if (Directory.Exists(demoProjectDir))
+				// The demo's entry assembly is namespace-derived (StockSharp.Samples.Misc.LegacySqlDemo.dll),
+				// not the .csproj file name. Prefer a Release build if both configurations are present.
+				return Directory.EnumerateFiles(demoProjectDir, "StockSharp.Samples.Misc.LegacySqlDemo.dll", SearchOption.AllDirectories)
+					.OrderByDescending(path => path.Contains($"{Path.DirectorySeparatorChar}Release{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase))
+					.FirstOrDefault();
+
+			dir = dir.Parent;
+		}
+
+		return null;
+	}
+
+	// =============================================================================================
 	// Phase M1 - MANDATED PRODUCTION-PATH COVERAGE (review finding M1).
 	//
 	// Phases A-H prove pure-logic parity and run ValidateAsync for two demo scenarios, but the
@@ -1039,8 +1457,11 @@ public class PreTradeRiskParityTests : BaseTestClass
 		// notional (order value)
 		await AssertUnlimitedAsync("value NULL", new GateVector { MaxOrderValue = null, MaxOrderFreqCount = hugeFreq, MaxOrderFreqWindowSec = 60 }, "B", 1000m, 1000m, 0);
 		await AssertUnlimitedAsync("value 0", new GateVector { MaxOrderValue = 0m, MaxOrderFreqCount = hugeFreq, MaxOrderFreqWindowSec = 60 }, "B", 1000m, 1000m, 0);
-		// frequency (10 recent orders would breach a small count; NULL/0 count disables the check)
-		await AssertUnlimitedAsync("freq NULL", new GateVector { MaxOrderFreqCount = null, MaxOrderFreqWindowSec = 60, MaxPositionSize = hugePos }, "B", 1m, null, 10);
+		// frequency (10 recent orders would breach a small count; the check is disabled/unlimited when the
+		// frequency pair is fully UNSET - both count and window NULL - or when the count is 0. The M2
+		// paired-frequency CHECK forbids a HALF-set pair (count NULL with a window, or vice versa), so the
+		// "disabled" case is represented as BOTH-NULL rather than count-NULL-with-a-window.
+		await AssertUnlimitedAsync("freq NULL (both unset)", new GateVector { MaxOrderFreqCount = null, MaxOrderFreqWindowSec = null, MaxPositionSize = hugePos }, "B", 1m, null, 10);
 		await AssertUnlimitedAsync("freq 0", new GateVector { MaxOrderFreqCount = 0, MaxOrderFreqWindowSec = 60, MaxPositionSize = hugePos }, "B", 1m, null, 10);
 		// resulting position
 		await AssertUnlimitedAsync("position NULL", new GateVector { MaxPositionSize = null, MaxOrderFreqCount = hugeFreq, MaxOrderFreqWindowSec = 60 }, "B", 999999m, null, 0);
@@ -1534,6 +1955,18 @@ public class PreTradeRiskParityTests : BaseTestClass
 	private static bool _sqlServerSchemaEnsured;
 
 	/// <summary>
+	/// M6 test-safety predicate: is <paramref name="databaseName"/> an acceptable target for the destructive
+	/// characterization DDL (CREATE TABLE / CREATE OR ALTER PROCEDURE)? True ONLY when the name marks it as a
+	/// disposable test database (contains "test", case-insensitive) OR the operator has explicitly opted in
+	/// via <paramref name="explicitlyAllowed"/>. Pure and side-effect-free so it is unit-testable WITHOUT a
+	/// live SQL Server (see <see cref="MssqlHarness_RefusesNonDisposableDatabase"/>). The twin copy in
+	/// PositionRecalculationTests is intentionally identical (that harness is duplicated per file).
+	/// </summary>
+	private static bool MssqlDatabaseIsDisposable(string databaseName, bool explicitlyAllowed)
+		=> explicitlyAllowed
+			|| (!databaseName.IsEmpty() && databaseName.Contains("test", StringComparison.OrdinalIgnoreCase));
+
+	/// <summary>
 	/// Materializes the ORIGINAL SQL Server characterization schema and the two retired procedures on the
 	/// given connection by executing the embedded <c>OriginalCharacterizationSetup.sql</c> resource. The
 	/// script is idempotent (guarded CREATEs / CREATE OR ALTER), so re-runs are safe; a static flag avoids
@@ -1550,6 +1983,18 @@ public class PreTradeRiskParityTests : BaseTestClass
 		{
 			if (_sqlServerSchemaEnsured)
 				return;
+
+			// M6 (test safety): this harness runs DDL that MUTATES the target database. Refuse to touch
+			// anything that is not clearly a DISPOSABLE test database, so a STOCKSHARP_LEGACY_MSSQL_CONNECTION
+			// accidentally aimed at a shared/production instance cannot be (re)initialized. Accept only when the
+			// database NAME marks it disposable (contains "test") OR the operator explicitly opts in via
+			// STOCKSHARP_LEGACY_MSSQL_ALLOW_DDL. See QA/README.md for disposable SQL Server provisioning.
+			if (!MssqlDatabaseIsDisposable(connection.Database,
+					!Environment.GetEnvironmentVariable("STOCKSHARP_LEGACY_MSSQL_ALLOW_DDL").IsEmpty()))
+				Fail($"Refusing to run characterization DDL against database '{connection.Database}': it is not a " +
+					"recognized disposable test database. Point STOCKSHARP_LEGACY_MSSQL_CONNECTION at a DISPOSABLE " +
+					"database whose name contains 'test', or set STOCKSHARP_LEGACY_MSSQL_ALLOW_DDL=1 to confirm the " +
+					"target is safe to (re)initialize (see QA/README.md).");
 
 			var assembly = typeof(PreTradeRiskParityTests).Assembly;
 			var resourceName = assembly.GetManifestResourceNames()

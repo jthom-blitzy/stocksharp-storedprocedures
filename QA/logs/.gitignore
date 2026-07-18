@@ -1,5 +1,0 @@
-# The raw capture logs in this folder are committed QA evidence of record
-# (they back the screenshots and transcripts, and are cited by QA/README.md).
-# The repository-root .gitignore ignores *.log globally; this scoped negation
-# re-includes only the logs under QA/logs/ so that evidence is not dropped.
-!*.log

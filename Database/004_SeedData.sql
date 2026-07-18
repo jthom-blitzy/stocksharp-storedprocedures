@@ -15,14 +15,16 @@
 INSERT INTO Portfolios (name, currency) VALUES ('DEMO', 'USD')
 	ON CONFLICT (LOWER(name)) DO NOTHING;
 
--- Securities has a unique key on (security_code, board_code)
--- (UQ_Securities_code_board); both seed rows carry a non-null board_code, so
--- the ON CONFLICT target is well-defined and the inserts stay idempotent.
+-- Securities has a case-INSENSITIVE unique key on (LOWER(security_code), LOWER(board_code)) - the
+-- functional index UQ_Securities_code_board (M4). The ON CONFLICT target must therefore be the SAME
+-- expression list, LOWER(security_code), LOWER(board_code), so the upsert infers that functional index;
+-- both seed rows carry a non-null board_code, so the target is well-defined and the inserts stay
+-- idempotent (and case-insensitive - re-seeding 'aapl' never duplicates the 'AAPL' row).
 INSERT INTO Securities (security_code, board_code, security_type) VALUES ('AAPL', 'NASDAQ', 'Stock')
-	ON CONFLICT (security_code, board_code) DO NOTHING;
+	ON CONFLICT (LOWER(security_code), LOWER(board_code)) DO NOTHING;
 
 INSERT INTO Securities (security_code, board_code, security_type) VALUES ('MSFT', 'NASDAQ', 'Stock')
-	ON CONFLICT (security_code, board_code) DO NOTHING;
+	ON CONFLICT (LOWER(security_code), LOWER(board_code)) DO NOTHING;
 
 -- Portfolio-wide defaults for DEMO: no single order over $500 price, 10k qty,
 -- $1M notional; frequency-capped at 5 orders / 60s; resulting position capped

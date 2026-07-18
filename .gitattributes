@@ -1,0 +1,22 @@
+# Line-ending and evidence handling for the legacy SQL -> PostgreSQL refactor.
+#
+# Scoped INTENTIONALLY to the artifacts this change owns. This is deliberately NOT
+# a repository-wide `* text=auto` renormalization: the surrounding StockSharp tree
+# keeps its existing per-file conventions untouched (minimal-change discipline,
+# AAP 0.7.2), and only the files introduced or migrated by this refactor are pinned.
+
+# --- QA evidence (see QA/README.md "File handling") ---------------------------------
+# Screenshots are binary PNGs: never diffed, never line-ending-normalized.
+QA/screenshots/*.png binary
+# The "recordings" are small TEXT transcripts (a sanctioned substitute for video,
+# AAP 0.7.2), not binary media. They are pinned to LF so they stay diff-able and
+# searchable in review. This is exactly why Git LFS is NOT used for them - tracking
+# small, reviewable text in LFS would make it opaque. See QA/README.md.
+QA/recordings/*.md text eol=lf
+QA/README.md         text eol=lf
+
+# --- migrated data-access project file ----------------------------------------------
+# Authored with LF (its original repository convention); pinned so editors/tooling
+# cannot silently reintroduce a CRLF flip on the migrated PackageReference block
+# (review finding N3).
+Algo/Algo.csproj text eol=lf
