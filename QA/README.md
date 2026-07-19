@@ -51,15 +51,15 @@ taken on **2026-07-19**.
 | | |
 |--|--|
 | Branch | `blitzy-e686e219-30ce-45cc-8608-8ea778391629` |
-| Evidence commit | `84ec3e89112022fca414e61efb9b11b8e23b346f` — the feature commit this evidence describes; the hash/size stamp itself was written by the immediately-following provenance commit |
+| Evidence commit | `b938e2336dbed6b42af3f1439552b3a471d76d69` — the feature commit this evidence describes; the hash/size stamp was written by this immediately-following provenance commit |
 | Baseline (pre-refactor) | `37dc57c9683653d09a9ec92979e0b6ad2c87cb61` |
 
 > **Commit-hash stamping (finding #23).** The evidence is regenerated from the **final** working
 > tree, but it must name the **final commit that contains it** — a chicken-and-egg. It is resolved
-> by stamping: the code/doc/test/QA changes are committed first; a dedicated **provenance commit**
-> made immediately afterward replaces the placeholder token `84ec3e89112022fca414e61efb9b11b8e23b346f` (present in
-> this file and in every transcript header) with the real commit hash and re-measures the `QA/`
-> folder size. Until that stamp lands, `84ec3e89112022fca414e61efb9b11b8e23b346f` marks every spot to be filled.
+> by stamping: the code/doc/test/QA changes were committed first (feature commit `b938e2336dbed6b42af3f1439552b3a471d76d69`); this dedicated **provenance commit**
+> made immediately afterward replaced the placeholder token `84ec3e89112022fca414e61efb9b11b8e23b346f` (previously present in
+> this file and in every transcript header) with that real feature-commit hash and re-measured the `QA/`
+> folder size (~2.0 MB, unchanged). The stamp has now landed.
 
 ## Authoritative raw logs (`QA/logs/`)
 

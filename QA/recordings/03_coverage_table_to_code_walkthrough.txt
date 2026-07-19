@@ -5,7 +5,7 @@ Substitution for 03_coverage_table_to_code_walkthrough.mp4 (screen-only, target 
 
 Provenance
   Branch          : blitzy-e686e219-30ce-45cc-8608-8ea778391629
-  Evidence commit : 84ec3e89112022fca414e61efb9b11b8e23b346f   (stamped here at the Phase-10 provenance commit; see QA/README.md)
+  Evidence commit : b938e2336dbed6b42af3f1439552b3a471d76d69   (stamped here at the Phase-10 provenance commit; see QA/README.md)
   Build/run TFM   : net10.0  (StockSharpTargets=net10.0; net6.0 is NOT a configured build target in this workspace)
   Captured (UTC)  : 2026-07-17T20:18:37Z
   Source of truth : the raw machine logs / TRX under QA/logs/ (this file quotes them verbatim)

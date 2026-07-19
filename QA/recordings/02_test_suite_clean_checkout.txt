@@ -5,7 +5,7 @@ Substitution for 02_test_suite_clean_checkout.mp4 (screen-only, target < 5:00) -
 
 Provenance
   Branch          : blitzy-e686e219-30ce-45cc-8608-8ea778391629
-  Evidence commit : 84ec3e89112022fca414e61efb9b11b8e23b346f   (stamped here at the Phase-10 provenance commit; see QA/README.md)
+  Evidence commit : b938e2336dbed6b42af3f1439552b3a471d76d69   (stamped here at the Phase-10 provenance commit; see QA/README.md)
   Build/run TFM   : net10.0  (primary target; net6.0 is a supported compile target per AAP 0.5.1 with a documented, out-of-scope live-DB runtime limitation - CFG-P6-03)
   Captured (UTC)  : 2026-07-19T07:46:47Z
   Source of truth : the raw machine logs / TRX under QA/logs/ (this file quotes them verbatim)
