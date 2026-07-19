@@ -434,6 +434,84 @@ public class PreTradeRiskServiceTests : BaseTestClass
 		RiskLimitSet.SelectMostSpecific(new[] { otherScope }, 1, 2).AssertNull();
 	}
 
+	// ---- DB-P5-01 : equal-scope, equal-effective-date tie is deterministic AND never less strict ----
+
+	[TestMethod]
+	public void SelectMostSpecific_EqualEffectiveDateTieIsDeterministicAndStrict()
+	{
+		var date = new DateTime(2024, 1, 1);
+
+		// Exact reproduction of finding DB-P5-01: two equally-specific rows with the SAME effective_date,
+		// one max_order_price=111 and one =222. Before the fix, insertion order A->B selected 111 and
+		// B->A selected 222 (nondeterministic). Now BOTH orders must select the stricter 111.
+		var a = new RiskLimitSet { PortfolioId = 1, SecurityId = 2, IsActive = true, MaxOrderPrice = 111m, EffectiveDate = date };
+		var b = new RiskLimitSet { PortfolioId = 1, SecurityId = 2, IsActive = true, MaxOrderPrice = 222m, EffectiveDate = date };
+
+		var ab = RiskLimitSet.SelectMostSpecific(new[] { a, b }, 1, 2);
+		var ba = RiskLimitSet.SelectMostSpecific(new[] { b, a }, 1, 2);
+
+		ab.AssertNotNull();
+		ba.AssertNotNull();
+		ab.MaxOrderPrice.Value.AssertEqual(111m);   // deterministic
+		ba.MaxOrderPrice.Value.AssertEqual(111m);   // independent of input order
+		ab.MaxOrderPrice.Value.AssertEqual(ba.MaxOrderPrice.Value); // and never the looser 222
+
+		// Multi-column incomparable tie: row X is stricter on price, row Y is stricter on qty. Neither is
+		// uniformly strictest, so the composed set must take the strictest of EACH column (never looser).
+		var x = new RiskLimitSet { PortfolioId = 1, SecurityId = 2, IsActive = true, MaxOrderPrice = 100m, MaxOrderQty = 5000m, EffectiveDate = date };
+		var y = new RiskLimitSet { PortfolioId = 1, SecurityId = 2, IsActive = true, MaxOrderPrice = 200m, MaxOrderQty = 1000m, EffectiveDate = date };
+		foreach (var seq in new[] { new[] { x, y }, new[] { y, x } })
+		{
+			var composed = RiskLimitSet.SelectMostSpecific(seq, 1, 2);
+			composed.AssertNotNull();
+			composed.MaxOrderPrice.Value.AssertEqual(100m);  // strictest (min) price
+			composed.MaxOrderQty.Value.AssertEqual(1000m);   // strictest (min) qty
+		}
+
+		// A null/unenforced ceiling on one tied row is ignored: the enforced value from the other row wins
+		// (a tie must never DISABLE a limit that at least one definition enforces).
+		var withPrice = new RiskLimitSet { PortfolioId = 1, SecurityId = 2, IsActive = true, MaxOrderPrice = 100m, EffectiveDate = date };
+		var withoutPrice = new RiskLimitSet { PortfolioId = 1, SecurityId = 2, IsActive = true, MaxOrderPrice = null, MaxOrderQty = 1000m, EffectiveDate = date };
+		var merged = RiskLimitSet.SelectMostSpecific(new[] { withoutPrice, withPrice }, 1, 2);
+		merged.MaxOrderPrice.Value.AssertEqual(100m);
+		merged.MaxOrderQty.Value.AssertEqual(1000m);
+
+		// Frequency tie: strictest is the smallest count paired with the largest window, so (5/60s) tied
+		// with (3/120s) composes to (3 orders / 120s) - the most restrictive rate. Carried as a coherent pair.
+		var freqLoose = new RiskLimitSet { PortfolioId = 1, SecurityId = 2, IsActive = true, MaxOrderFreqCount = 5, MaxOrderFreqWindowSeconds = 60, EffectiveDate = date };
+		var freqTight = new RiskLimitSet { PortfolioId = 1, SecurityId = 2, IsActive = true, MaxOrderFreqCount = 3, MaxOrderFreqWindowSeconds = 120, EffectiveDate = date };
+		var freq = RiskLimitSet.SelectMostSpecific(new[] { freqLoose, freqTight }, 1, 2);
+		freq.MaxOrderFreqCount.Value.AssertEqual(3);
+		freq.MaxOrderFreqWindowSeconds.Value.AssertEqual(120);
+		freq.IsFrequencyEnforced.AssertTrue();
+
+		// Commission tie: a smaller total ceiling AND a higher rate are both stricter, so they compose to
+		// (min total, max rate). The composed row must still validate as a real, well-formed configuration.
+		var commA = new RiskLimitSet { PortfolioId = 1, SecurityId = 2, IsActive = true, MaxCommissionTotal = 1000m, CommissionRate = 0.001m, EffectiveDate = date };
+		var commB = new RiskLimitSet { PortfolioId = 1, SecurityId = 2, IsActive = true, MaxCommissionTotal = 2000m, CommissionRate = 0.002m, EffectiveDate = date };
+		var comm = RiskLimitSet.SelectMostSpecific(new[] { commA, commB }, 1, 2);
+		comm.MaxCommissionTotal.Value.AssertEqual(1000m);
+		comm.CommissionRate.AssertEqual(0.002m);
+		comm.EffectiveDate.AssertEqual(date);
+		comm.IsActive.AssertTrue();
+		comm.Validate(); // composed set is well-formed and never throws
+
+		// Three-way tie is still order-independent: every permutation selects the same strictest price.
+		var p1 = new RiskLimitSet { PortfolioId = 1, SecurityId = 2, IsActive = true, MaxOrderPrice = 300m, EffectiveDate = date };
+		var p2 = new RiskLimitSet { PortfolioId = 1, SecurityId = 2, IsActive = true, MaxOrderPrice = 150m, EffectiveDate = date };
+		var p3 = new RiskLimitSet { PortfolioId = 1, SecurityId = 2, IsActive = true, MaxOrderPrice = 250m, EffectiveDate = date };
+		RiskLimitSet.SelectMostSpecific(new[] { p1, p2, p3 }, 1, 2).MaxOrderPrice.Value.AssertEqual(150m);
+		RiskLimitSet.SelectMostSpecific(new[] { p3, p1, p2 }, 1, 2).MaxOrderPrice.Value.AssertEqual(150m);
+		RiskLimitSet.SelectMostSpecific(new[] { p2, p3, p1 }, 1, 2).MaxOrderPrice.Value.AssertEqual(150m);
+
+		// A tie must NOT override a strictly-more-specific single row: a portfolio+security row still
+		// outranks any portfolio-only tie, so composition only ever runs WITHIN the winning tier.
+		var specific = new RiskLimitSet { PortfolioId = 1, SecurityId = 2, IsActive = true, MaxOrderPrice = 400m, EffectiveDate = date };
+		var portfolioTieA = new RiskLimitSet { PortfolioId = 1, SecurityId = null, IsActive = true, MaxOrderPrice = 10m, EffectiveDate = date };
+		var portfolioTieB = new RiskLimitSet { PortfolioId = 1, SecurityId = null, IsActive = true, MaxOrderPrice = 20m, EffectiveDate = date };
+		RiskLimitSet.SelectMostSpecific(new[] { portfolioTieA, specific, portfolioTieB }, 1, 2).MaxOrderPrice.Value.AssertEqual(400m);
+	}
+
 	// ---- CR-32 : SelectMostSpecific excludes future-effective rows when a UTC cutoff is supplied --
 
 	[TestMethod]
@@ -671,6 +749,38 @@ public class PreTradeRiskServiceTests : BaseTestClass
 			var r = await svc.ValidateAsync(c, t, pid, sid, Sides.Buy, 10m, 100m, OrderTypes.Limit);
 			r.IsValid.AssertTrue();
 			r.RejectReason.AssertNull();
+		});
+
+	// ---- DB-P5-01 live regression : an equal-scope, equal-effective-date tie loads deterministically ----
+	// Reproduces the finding against the real RiskLimits table + LoadLimitsAsync query path: two active
+	// rows for the SAME (portfolio, security) scope with the SAME effective_date, differing only in
+	// max_order_price (111 vs 222). Whichever physical order the rows are inserted in, the loaded canonical
+	// limit must be the stricter 111 - never the looser 222, and never order-dependent.
+	[TestMethod]
+	public Task Live_EqualEffectiveDateTieLoadsStrictAndDeterministic()
+		=> RunWithFreshScopeAsync(async (svc, c, t, pid, sid) =>
+		{
+			var shared = new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc); // safely in force (<= now)
+
+			// Insert order A(111) -> B(222) into the first scope.
+			await InsertLimitsAsync(c, t, pid, sid, default, price: 111m, effectiveDate: shared);
+			await InsertLimitsAsync(c, t, pid, sid, default, price: 222m, effectiveDate: shared);
+
+			var ab = await svc.LoadLimitsAsync(c, t, pid, sid);
+			ab.AssertNotNull();
+			ab.MaxOrderPrice.Value.AssertEqual(111m);
+
+			// Fresh scope, reversed physical insert order B(222) -> A(111): must still load 111.
+			var (pid2, sid2) = await InsertScopeAsync(c, t, default);
+			await InsertLimitsAsync(c, t, pid2, sid2, default, price: 222m, effectiveDate: shared);
+			await InsertLimitsAsync(c, t, pid2, sid2, default, price: 111m, effectiveDate: shared);
+
+			var ba = await svc.LoadLimitsAsync(c, t, pid2, sid2);
+			ba.AssertNotNull();
+			ba.MaxOrderPrice.Value.AssertEqual(111m);
+
+			// Both insertion orders resolve identically to the stricter limit.
+			ab.MaxOrderPrice.Value.AssertEqual(ba.MaxOrderPrice.Value);
 		});
 
 	[TestMethod]
@@ -1033,6 +1143,137 @@ public class PreTradeRiskServiceTests : BaseTestClass
 				""", cleanup);
 			cmd.Parameters.Add(NInt("@p", portfolioId));
 			cmd.Parameters.Add(NInt("@s", securityId));
+			await cmd.ExecuteNonQueryAsync();
+		}
+	}
+
+	// ---- DB-P5-02 live regression : concurrent FIRST-CREATE Ensure* converges, never leaks 2601/2627 ----
+	// Many callers race to create the SAME brand-new portfolio through EnsurePortfolioAsync. Before the fix
+	// the losers of the UQ_Portfolios_name race surfaced a raw unique-key SqlException (2627/2601); now
+	// every racing caller must converge on the one committed portfolio_id, exactly one row is created, and
+	// no unique-key exception escapes - proven because Task.WhenAll completes without throwing.
+	[TestMethod]
+	public async Task Live_ConcurrentEnsurePortfolioFirstCreateConvergesToSingleId()
+	{
+		await using (var probe = await TryOpenLegacyAsync())
+		{
+			if (probe is null)
+			{
+				Inconclusive("StockSharpLegacy SQL Server is not reachable; skipping live Ensure-portfolio concurrency test.");
+				return;
+			}
+		}
+
+		var connectionString = SqlLegacyConnection.Resolve();
+		// A brand-new, collision-free name so the very first create is what races (GUID-tagged so it can
+		// never clash with the shared DEMO seed or any parallel scope row).
+		var name = "DBP502_PF_" + Guid.NewGuid().ToString("N");
+		var portfolio = new Portfolio { Name = name };
+
+		try
+		{
+			var gateway = new SqlLegacyOrderGateway(connectionString);
+
+			// Release all workers at once so they hit the SELECT-miss -> INSERT race simultaneously.
+			const int concurrency = 24;
+			var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+			var workers = Enumerable.Range(0, concurrency)
+				.Select(async _ =>
+				{
+					await gate.Task;
+					return await gateway.EnsurePortfolioAsync(portfolio);
+				})
+				.ToArray();
+
+			gate.SetResult();
+
+			// If ANY worker leaked a unique-key SqlException, WhenAll rethrows here and the test fails.
+			var ids = await Task.WhenAll(workers);
+
+			// Every racing caller converged on the same, single portfolio_id.
+			ids.Distinct().Count().AssertEqual(1);
+			(ids[0] > 0).AssertTrue();
+
+			// A later call is idempotent - it returns that same id rather than creating another row.
+			(await gateway.EnsurePortfolioAsync(portfolio)).AssertEqual(ids[0]);
+
+			// Exactly one physical row exists for the raced name (no duplicate created).
+			await using var verify = new SqlConnection(connectionString);
+			await verify.OpenAsync();
+			await using var count = new SqlCommand("SELECT COUNT(*) FROM dbo.Portfolios WHERE name = @name", verify);
+			count.Parameters.AddWithValue("@name", name);
+			((int)await count.ExecuteScalarAsync()).AssertEqual(1);
+		}
+		finally
+		{
+			// The test creates only a Portfolios row (no orders/positions/limits), so a delete by the
+			// unique name fully restores the database.
+			await using var cleanup = new SqlConnection(connectionString);
+			await cleanup.OpenAsync();
+			await using var cmd = new SqlCommand("DELETE FROM dbo.Portfolios WHERE name = @name", cleanup);
+			cmd.Parameters.AddWithValue("@name", name);
+			await cmd.ExecuteNonQueryAsync();
+		}
+	}
+
+	// Same race for EnsureSecurityAsync, keyed on UQ_Securities_code_board (security_code + board_code).
+	[TestMethod]
+	public async Task Live_ConcurrentEnsureSecurityFirstCreateConvergesToSingleId()
+	{
+		await using (var probe = await TryOpenLegacyAsync())
+		{
+			if (probe is null)
+			{
+				Inconclusive("StockSharpLegacy SQL Server is not reachable; skipping live Ensure-security concurrency test.");
+				return;
+			}
+		}
+
+		var connectionString = SqlLegacyConnection.Resolve();
+		// A brand-new, collision-free security_code (<= 50 chars); fixed NASDAQ board so the (code, board)
+		// key is unique to this test run.
+		var code = "DBP502SEC" + Guid.NewGuid().ToString("N")[..20];
+		var boardCode = ExchangeBoard.Nasdaq.Code;
+		var security = new Security { Id = code + "@" + boardCode, Code = code, Board = ExchangeBoard.Nasdaq, Type = SecurityTypes.Stock };
+
+		try
+		{
+			var gateway = new SqlLegacyOrderGateway(connectionString);
+
+			const int concurrency = 24;
+			var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+			var workers = Enumerable.Range(0, concurrency)
+				.Select(async _ =>
+				{
+					await gate.Task;
+					return await gateway.EnsureSecurityAsync(security);
+				})
+				.ToArray();
+
+			gate.SetResult();
+
+			var ids = await Task.WhenAll(workers);
+
+			ids.Distinct().Count().AssertEqual(1);
+			(ids[0] > 0).AssertTrue();
+			(await gateway.EnsureSecurityAsync(security)).AssertEqual(ids[0]);
+
+			await using var verify = new SqlConnection(connectionString);
+			await verify.OpenAsync();
+			await using var count = new SqlCommand(
+				"SELECT COUNT(*) FROM dbo.Securities WHERE security_code = @code AND (board_code = @board OR (@board IS NULL AND board_code IS NULL))", verify);
+			count.Parameters.AddWithValue("@code", code);
+			count.Parameters.AddWithValue("@board", (object)boardCode ?? DBNull.Value);
+			((int)await count.ExecuteScalarAsync()).AssertEqual(1);
+		}
+		finally
+		{
+			await using var cleanup = new SqlConnection(connectionString);
+			await cleanup.OpenAsync();
+			await using var cmd = new SqlCommand(
+				"DELETE FROM dbo.Securities WHERE security_code = @code AND (board_code = @board OR (@board IS NULL AND board_code IS NULL))", cleanup);
+			cmd.Parameters.AddWithValue("@code", code);
+			cmd.Parameters.AddWithValue("@board", (object)boardCode ?? DBNull.Value);
 			await cmd.ExecuteNonQueryAsync();
 		}
 	}

@@ -1,21 +1,23 @@
 # Genuine apply of Database/001..004 in run order against the live SQL Server 2022 container
-# Captured (UTC): 2026-07-17T20:25:55Z
-# Command per file: docker exec -i stocksharp-legacy-sql /opt/mssql-tools18/bin/sqlcmd -S localhost,1433 -U sa -P *** -C -b -i <file>
-# (scripts are guarded/idempotent - proven by applying twice cleanly in prior validation)
+# Captured (UTC): 2026-07-19T07:12:35Z
+# Corrected fresh-provision loop (findings INF-P6-01/INF-P6-02): 001 -> master (creates+USEs the DB),
+#   002-004 -> StockSharpLegacy; flags -C -b -V 11 make sqlcmd exit NONZERO on any SQL error (sev >= 11),
+#   and an explicit $? check aborts on the first failure. Scripts are guarded/idempotent (re-applied here
+#   against the already-provisioned canonical DB with no data loss).
 
-=== apply Database/001_Schema.sql ===
-Changed database context to 'StockSharpLegacy'.
+=== apply Database/001_Schema.sql  (-d master) ===
+   Changed database context to 'StockSharpLegacy'.
    exit=0
 
-=== apply Database/002_StoredProcedures.sql ===
-Changed database context to 'StockSharpLegacy'.
+=== apply Database/002_StoredProcedures.sql  (-d StockSharpLegacy) ===
+   Changed database context to 'StockSharpLegacy'.
    exit=0
 
-=== apply Database/003_Triggers.sql ===
-Changed database context to 'StockSharpLegacy'.
+=== apply Database/003_Triggers.sql  (-d StockSharpLegacy) ===
+   Changed database context to 'StockSharpLegacy'.
    exit=0
 
-=== apply Database/004_SeedData.sql ===
-Changed database context to 'StockSharpLegacy'.
+=== apply Database/004_SeedData.sql  (-d StockSharpLegacy) ===
+   Changed database context to 'StockSharpLegacy'.
    exit=0
 

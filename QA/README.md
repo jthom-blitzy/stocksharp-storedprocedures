@@ -44,7 +44,7 @@ photographic/"screenshot" claim, and none carries a generator or branding tag.**
 Every PNG carries the same **uniform, truthful** metadata keys — `Title`, `Artifact`, `Branch`,
 `Framework` (`net10.0`), `EvidenceCommit`, `AuthoritativeSource`, `CaptureMode`, and `CapturedUTC`
 — none of which asserts a photographic capture or a stale commit. All captures in this index were
-taken on **2026-07-17**.
+taken on **2026-07-19**.
 
 **Exact commit identity (findings CR-1 / MA-19 / #23).**
 
@@ -72,8 +72,8 @@ These are the genuine machine logs the rest of this folder renders. They are cap
 | [`logs/01_build_algo_net10.0_release.log`](logs/01_build_algo_net10.0_release.log) | `dotnet build Algo/Algo.csproj -c Release -f net10.0 --no-incremental` | **0 Error(s)**, 2 pre-existing `CS0618` warnings |
 | [`logs/02_build_tests_net10.0_release.log`](logs/02_build_tests_net10.0_release.log) | `dotnet build Tests/Tests.csproj -c Release -f net10.0 --no-incremental` | **0 Error(s)**, 48 pre-existing warnings (none in modified files) |
 | [`logs/03_build_demo_net10.0_release.log`](logs/03_build_demo_net10.0_release.log) | `dotnet build .../03_Misc.LegacySqlDemo.csproj -c Release -f net10.0 --no-incremental` | **0 Error(s)**, 2 pre-existing warnings |
-| [`logs/04_test_targeted_net10.0.log`](logs/04_test_targeted_net10.0.log) | `dotnet test` (four-class filter, live SQL) | **Passed!  Failed: 0, Passed: 196, Skipped: 0, Total: 196** |
-| [`logs/test_targeted_net10.0.trx`](logs/test_targeted_net10.0.trx) | machine-generated TRX for that run | `total="196" passed="196" failed="0" notExecuted="0"` |
+| [`logs/04_test_targeted_net10.0.log`](logs/04_test_targeted_net10.0.log) | `dotnet test` (four-class filter, live SQL) | **Passed!  Failed: 0, Passed: 201, Skipped: 0, Total: 201** |
+| [`logs/test_targeted_net10.0.trx`](logs/test_targeted_net10.0.trx) | machine-generated TRX for that run | `total="201" passed="201" failed="0" notExecuted="0"` |
 | [`logs/05_demo_run_net10.0.log`](logs/05_demo_run_net10.0.log) | `dotnet run` console demo (live SQL) | three outcomes + circuit-breaker seeding (8 rules, ceiling 500.0000) |
 | [`logs/06_sql_no_business_logic.log`](logs/06_sql_no_business_logic.log) | `sqlcmd` catalog introspection | `stored_procedure_count = 0`; one audit trigger `trg_Orders_StatusAudit` |
 | [`logs/07_docker_recovery.log`](logs/07_docker_recovery.log) | `docker logs … | grep` | `SQL Server is now ready` + `Recovery is complete` |
@@ -89,10 +89,22 @@ The primary, Linux-buildable solution is **`StockSharp_Tests.slnx`** (22 project
 ambiguous across projects, always name the project **and** the framework **and** the configuration
 explicitly, exactly as below.
 
-**Target framework.** The affected projects build and run on **`net10.0`** in this workspace
-(`StockSharpTargets=net10.0`). **`net6.0` is not a configured build target here** (and is out of
-mainstream support); the .NET 6 SDK is present on the machine but this evidence neither builds nor
-tests against it, and makes no net6.0 claim.
+**Target framework.** Per the AAP target contract (§0.5.1) the affected projects declare **`net10.0`**
+as the primary target and **`net6.0`** as the legacy target, and the refactored C# (the new risk
+services and rules, the gateway, and the demo) **compiles under both** — `dotnet build … -c Release`
+succeeds with **0 errors** for `net10.0` by default and for `net6.0` via
+`-p:StockSharpTargets=net6.0`. This evidence builds, tests, and runs the **live-database** flow
+against **`net10.0`**, the primary target, because **`net6.0` live SQL operations currently fail at
+runtime** inside `Microsoft.Data.SqlClient.SqlConnection.OpenAsync` — a **pre-existing limitation of
+the transitive SQL-client / runtime package graph** (the wildcard-versioned transitive packages, e.g.
+`System.Text.Encoding.CodePages`, resolve to `10.*` builds that are not net6.0-compatible at runtime),
+tracked as finding **CFG-P6-03**. That limitation is **independent of this refactor** — it is not
+caused by the consolidated risk logic and reproduces on the pre-refactor code — and resolving it would
+require **target-specific package pinning in the shared build files** (`common_versions.props` /
+`Algo/Algo.csproj`), which is **out of scope** for this refactor (**AAP §0.5.2**: "No dependency
+added/removed/version-bumped … no `.csproj` edits, no build-file changes"). net6.0 is therefore a
+supported **compile** target that matches the AAP contract, carrying a **documented, out-of-scope
+runtime limitation** for live database execution; this is not a claim of net6.0 live-database parity.
 
 ### 1. Stand up the SQL Server container
 
@@ -127,9 +139,18 @@ Safe to re-run against an already-provisioned database without data loss (see
 [`logs/08_apply_scripts_net10.0.log`](logs/08_apply_scripts_net10.0.log): `exit=0` per script).
 
 ```bash
+# Fresh-provision safe (findings INF-P6-01, INF-P6-02):
+#   * 001_Schema.sql runs against `master` - it CREATEs the StockSharpLegacy database if absent (in its
+#     own batch) and then USEs it; targeting `-d StockSharpLegacy` here would fail on a fresh instance
+#     because that database does not exist yet.
+#   * 002-004 run against `StockSharpLegacy` (it exists by then; the scripts also self-`USE` it).
+#   * `-b` + `-V 11` make sqlcmd exit NON-ZERO on any SQL error (severity >= 11), and the explicit
+#     `$?` check aborts on the first failure so a failed script can never be reported as success.
 for f in 001_Schema.sql 002_StoredProcedures.sql 003_Triggers.sql 004_SeedData.sql; do
+  if [ "$f" = "001_Schema.sql" ]; then db=master; else db=StockSharpLegacy; fi
   docker exec -i -e "SQLCMDPASSWORD=$MSSQL_SA_PASSWORD" stocksharp-legacy-sql \
-    /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -C -b -d StockSharpLegacy -i /dev/stdin < "Database/$f"
+    /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -C -b -V 11 -d "$db" -i /dev/stdin < "Database/$f"
+  if [ $? -ne 0 ]; then echo "ERROR: $f failed to apply; aborting deployment." >&2; exit 1; fi
 done
 ```
 
@@ -146,7 +167,7 @@ Server=localhost,14330;Database=StockSharpLegacy;User Id=sa;Password=<sa-passwor
 # Build the refactored assembly (net10.0 Release): 0 errors.
 dotnet build Algo/Algo.csproj -c Release --framework net10.0
 
-# Run the focused risk-consolidation suite — the FOUR classes that cover this refactor: 196/196.
+# Run the focused risk-consolidation suite — the FOUR classes that cover this refactor: 201/201.
 dotnet test Tests/Tests.csproj -c Release --framework net10.0 --no-build \
   --filter "FullyQualifiedName~PreTradeRiskServiceTests|FullyQualifiedName~PositionRecalculationTests|FullyQualifiedName~CommissionTests|FullyQualifiedName~RiskTests" \
   --logger "trx;LogFileName=test_targeted_net10.0.trx" --results-directory QA/logs
@@ -180,7 +201,7 @@ The `DEMO` portfolio (USD) and the `AAPL`/`MSFT` (NASDAQ) securities exist after
 2. **Consolidated** the logic into the canonical C# definitions (`RiskLimitSet`) plus the two
    services (`PreTradeRiskService`, `PositionRecalculationService`), and reduced the SQL to CRUD.
 3. **Proved parity**: every rule has passing tests asserting the reconciled thresholds are
-   at-least-as-strict and never looser. **47** of the tests (`Live_*`) execute against the real
+   at-least-as-strict and never looser. **51** of the tests (`Live_*`) execute against the real
    SQL Server 2022 container. Parity is proven by the characterization + parity assertions inside
    the four owned classes (the earlier over-engineered differential-oracle fixture was reverted as
    out of AAP scope; see findings #3/#5 in the resolution report).
@@ -200,7 +221,7 @@ and diffable.
 |---|------|----------------------------|-----------|
 | 1 | [`screenshots/01_clean_build.png`](screenshots/01_clean_build.png) | **Build succeeded, 0 errors** for Algo, Tests, and the demo on `net10.0`. Warnings are non-zero but **all pre-existing** `CS0618` obsolete-API notices in *unmodified* files (`Algo/TraderHelper.cs:1196`, `Algo/Storages/Csv/CsvEntityList.cs:157`, and unrelated Tests fixtures); **no warning originates in any refactored file.** | `logs/00..03_*.log` |
 | 2 | [`screenshots/02_demo_three_scenarios.png`](screenshots/02_demo_three_scenarios.png) | The three outcomes: `BUY 100 @ 150` **accepted** (`is_valid=True`); `BUY 10 @ 999` **rejected** with `Order price 999.0000 meets/exceeds limit 500.0000` (`is_valid=False`); a `100 @ 150` trade **recomputes the position** to `qty=100.0000 avg_price=150.0000 realized_pnl=0.0000`. It also seeds the portfolio-wide circuit breaker (8 rules) from the *same* canonical `RiskLimitSet` the gate uses. | `logs/05_demo_run_net10.0.log` |
-| 3 | [`screenshots/03_test_suite_passing.png`](screenshots/03_test_suite_passing.png) | The **four** risk-consolidation classes: **196 passed, 0 failed, 0 skipped** (47 `Live_*` against the real container). Per-class (from the TRX): RiskTests 85, CommissionTests 34, PreTradeRiskServiceTests 40, PositionRecalculationTests 37. Scope of the full suite is disclosed honestly in the note below. | `logs/04_*.log` + `logs/…trx` |
+| 3 | [`screenshots/03_test_suite_passing.png`](screenshots/03_test_suite_passing.png) | The **four** risk-consolidation classes: **201 passed, 0 failed, 0 skipped** (51 `Live_*` against the real container). Per-class (from the TRX): RiskTests 85, CommissionTests 34, PreTradeRiskServiceTests 44, PositionRecalculationTests 38. Scope of the full suite is disclosed honestly in the note below. | `logs/04_*.log` + `logs/…trx` |
 | 4 | [`screenshots/04_sql_business_logic_removed.png`](screenshots/04_sql_business_logic_removed.png) | `stored_procedure_count = 0`; exactly **one** user trigger, `trg_Orders_StatusAudit`, whose `sp_helptext` body is a best-effort status→history INSERT — **no thresholds, no accept/reject decision, no P&L math.** | `logs/06_sql_no_business_logic.log` |
 | 5 | [`screenshots/05_legacy_layer_before_after.png`](screenshots/05_legacy_layer_before_after.png) | The consolidated `LEGACY_LAYER.md` rule-by-rule coverage table (the AFTER state), with a note on the BEFORE state (logic split across T-SQL and C#): every rule now has one canonical `RiskLimitSet` threshold consumed by **both** the circuit breaker and the pre-trade gate. | `../LEGACY_LAYER.md` |
 | 6 | [`screenshots/06_docker_recovery_complete.png`](screenshots/06_docker_recovery_complete.png) | The container `Up`, publishing on the **loopback interface** `127.0.0.1:14330->1433/tcp` (MA-13 — bound to `127.0.0.1`, **not** `0.0.0.0`), and the `SQL Server is now ready` + `Recovery is complete.` markers. | `logs/07_docker_recovery.log` |
@@ -210,9 +231,9 @@ and diffable.
 Screenshot #3 is scoped to the **four test classes this refactor owns** — `RiskTests`,
 `CommissionTests`, `PreTradeRiskServiceTests`, `PositionRecalculationTests` — because that is the
 authoritative, fast (~7 s), deterministic, fully-green evidence for the work delivered:
-**196/196, 0 failed, 0 skipped**, of which **47** are `Live_*` tests against the real container.
+**201/201, 0 failed, 0 skipped**, of which **51** are `Live_*` tests against the real container.
 Its machine-generated TRX ([`logs/test_targeted_net10.0.trx`](logs/test_targeted_net10.0.trx))
-records `total="196" executed="196" passed="196" failed="0" notExecuted="0"`.
+records `total="201" executed="201" passed="201" failed="0" notExecuted="0"`.
 
 For completeness and honesty: running the **entire** `Tests/Tests.csproj` unfiltered is a
 different matter. That project spans the whole StockSharp platform (thousands of test methods
@@ -220,7 +241,7 @@ across many subsystems — indicators, backtesting, candle compression, live-ada
 storage, …), a large fraction of which require external market-data feeds, network access, or
 other infrastructure absent from a headless CI container, so it is very long-running and is not
 executed to completion here. **Therefore this evidence makes NO full-solution pass/fail/skip tally
-claim** — it limits its claim to the observed 196/196 focused run, for which the complete raw
+claim** — it limits its claim to the observed 201/201 focused run, for which the complete raw
 `.log` and `.trx` are retained under [`logs/`](logs/). No claim is made about the number of
 failures in the unfiltered suite.
 
@@ -233,8 +254,8 @@ can be verified against its source. **Frame counts are indexed exactly (finding 
 
 | # | Scenario | Substitution artifacts shipped | Frames |
 |---|----------|--------------------------------|--------|
-| 1 | End-to-end: container healthy → apply scripts `001 → 004` → clean build → focused suite 196/196 → demo three outcomes | [`01_end_to_end_docker_scripts_demo.txt`](recordings/01_end_to_end_docker_scripts_demo.txt) + `01_end_to_end_docker_scripts_demo_01.png … _05.png` | **5** |
-| 2 | Test suite from a clean checkout: build Tests (net10.0), run the focused suite (196/196), per-class tally from the TRX | [`02_test_suite_clean_checkout.txt`](recordings/02_test_suite_clean_checkout.txt) + `02_test_suite_clean_checkout_01.png … _03.png` | **3** |
+| 1 | End-to-end: container healthy → apply scripts `001 → 004` → clean build → focused suite 201/201 → demo three outcomes | [`01_end_to_end_docker_scripts_demo.txt`](recordings/01_end_to_end_docker_scripts_demo.txt) + `01_end_to_end_docker_scripts_demo_01.png … _05.png` | **5** |
+| 2 | Test suite from a clean checkout: build Tests (net10.0), run the focused suite (201/201), per-class tally from the TRX | [`02_test_suite_clean_checkout.txt`](recordings/02_test_suite_clean_checkout.txt) + `02_test_suite_clean_checkout_01.png … _03.png` | **3** |
 | 3 | Coverage-table → code walkthrough: each `LEGACY_LAYER.md` row mapped to its C# implementation (`RiskLimitSet`, `PreTradeRiskService`, the rules, `PositionRecalculationService`, and the `RiskManager.CreateRules`/`ApplyCanonicalLimits` wiring) | [`03_coverage_table_to_code_walkthrough.txt`](recordings/03_coverage_table_to_code_walkthrough.txt) + `03_coverage_table_to_code_walkthrough_01.png … _06.png` | **6** |
 
 ## Large-file / Git LFS note
@@ -244,6 +265,22 @@ Every artifact here is small — the largest PNG is ~0.17 MB and the whole `QA/`
 **no `.gitattributes` / Git LFS is used**. (Per the plan, a root `.gitattributes` with
 `git lfs track "QA/recordings/*.mp4"` would be added only if some artifact exceeded ~50 MB; none
 does, and there are no `.mp4` files.)
+
+## Out-of-scope / deferred findings
+
+The QA report enumerated additional findings whose **root-cause fix falls outside the boundaries of
+this refactor** as fixed by the AAP. They are indexed here for completeness and honesty; each cites
+the AAP clause that places it out of scope. None is caused by the consolidated risk logic, and each
+reproduces independently of this refactor.
+
+| Finding | Summary | Why deferred (AAP citation) | Disposition |
+|---------|---------|-----------------------------|-------------|
+| **SEC-P7-01** | Transitive `SharpCompress 1.0.0` (pulled in via `Ecng.IO.Compression`) carries a known advisory. | Remediation requires bumping/pinning a NuGet package, i.e. a dependency and build-file change — **AAP §0.5.2**: "No dependency added/removed/version-bumped … no `.csproj` edits, no build-file changes." The headless container also has **no internet** to restore a patched version. | Deferred to a dependency-maintenance change outside this refactor. Not reachable from the consolidated risk code paths. |
+| **SEC-P7-02** | The `mcr.microsoft.com/mssql/server:2022-latest` base image ships a `wget` with a known advisory. | The SQL Server container image is **external third-party infrastructure** — **AAP §0.2.2** excludes changes to systems outside the in-scope files (no StockSharp/source change can alter a Microsoft base image). | Deferred to image/infrastructure maintenance (rebase to a patched tag). Mitigated operationally by binding the endpoint to loopback (see MA-13 note above). |
+| **TEST-P4-01** | `AsyncMessageChannelTests.Close_StopsProcessing` hangs when the full unfiltered suite runs. | The test targets core platform messaging, **not** an in-scope file — **AAP §0.2.2**: "Any StockSharp platform change outside the files listed as in scope." | Deferred; excluded via `--filter` per the setup guidance so the focused suite runs deterministically. Not a regression of the refactor. |
+| **TEST-P4-02** | `MessageChannelTests` is flaky under full-suite parallelism. | Core-platform test outside the in-scope set — **AAP §0.2.2**. | Deferred; passes **30/30 in isolation**. Independent of the risk-consolidation code. |
+| **TEST-P4-03** | `ConnectorRoutingTests` is flaky under full-suite parallelism. | Core-platform test outside the in-scope set — **AAP §0.2.2**. | Deferred; passes **30/30 in isolation**. Independent of the risk-consolidation code. |
+| **CFG-P6-03** (dependency-graph root cause) | `net6.0` live-DB execution fails inside `Microsoft.Data.SqlClient` because wildcard transitive packages resolve to `10.*` builds. | The **documentation half** of this finding is fixed above; the **root-cause fix** would require target-specific package pinning in the shared build files (`common_versions.props` / `Algo/Algo.csproj`) — **AAP §0.5.2** forbids build-file/dependency changes. | Doc-part **resolved**; root-cause fix deferred. `net6.0` remains a supported **compile** target with the documented live-DB runtime limitation (it is not a net6.0 live-database parity claim). |
 
 ## Cross-references
 

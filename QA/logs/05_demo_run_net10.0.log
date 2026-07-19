@@ -7,10 +7,10 @@ Seeded the portfolio-wide RiskManager circuit breaker from the canonical RiskLim
      The per-order gate (below) and this circuit breaker now read the same canonical thresholds.
 
 Submitting BUY 100 @ 150.00 (within limits)...
-  -> order_id=330 is_valid=True reject_reason=(none)
+  -> order_id=673 is_valid=True reject_reason=(none)
 
 Submitting BUY 10 @ 999.00 (price exceeds the seeded max_order_price limit)...
-  -> order_id=331 is_valid=False reject_reason=Order price 999.0000 meets/exceeds limit 500.0000
+  -> order_id=674 is_valid=False reject_reason=Order price 999.0000 meets/exceeds limit 500.0000
      Note: this rejection comes from the C# PreTradeRiskService (the per-order pre-trade
      gate), which reads the applicable RiskLimits row and enforces it in C#. The C#
      RiskManager (Algo/Risk) is the portfolio-wide circuit breaker - a distinct

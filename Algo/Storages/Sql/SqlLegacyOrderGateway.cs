@@ -66,6 +66,18 @@ public class SqlLegacyOrderGateway
 	/// if it doesn't exist yet. Matched by name - there is no shared surrogate key
 	/// between <see cref="Portfolio"/> and dbo.Portfolios.
 	/// </summary>
+	/// <remarks>
+	/// <b>Concurrent-first-create convergence (finding DB-P5-02).</b> This is a check-then-act upsert:
+	/// it SELECTs by name and, only if no row exists, INSERTs. Two callers racing to create the SAME new
+	/// portfolio can both observe "not found" and both attempt the INSERT; the second loses the
+	/// <c>UQ_Portfolios_name</c> race and SQL Server raises a unique-key violation (error 2627/2601).
+	/// Because each command here runs in autocommit (there is no wrapping transaction), the winner's row
+	/// is already committed when the loser's INSERT fails, so the loser converges on the canonical id by
+	/// re-reading instead of leaking the raw <see cref="SqlException"/> to the caller. The convergence and
+	/// its defense-in-depth deadlock retry are centralized in <see cref="EnsureRowAsync"/>. The method is
+	/// therefore idempotent under concurrency: every racing caller returns the same portfolio_id and no
+	/// duplicate row is created.
+	/// </remarks>
 	public async Task<int> EnsurePortfolioAsync(Portfolio portfolio, CancellationToken cancellationToken = default)
 	{
 		if (portfolio is null)
@@ -74,28 +86,43 @@ public class SqlLegacyOrderGateway
 		await using var connection = CreateConnection();
 		await connection.OpenAsync(cancellationToken);
 
-		await using (var select = new SqlCommand("SELECT portfolio_id FROM dbo.Portfolios WHERE name = @name", connection))
+		// Read used both for the initial lookup and for the post-conflict reconciliation below. Each call
+		// builds its own command/parameters so it can be re-run safely after a unique-violation catch.
+		async Task<int?> SelectExistingAsync()
 		{
+			await using var select = new SqlCommand("SELECT portfolio_id FROM dbo.Portfolios WHERE name = @name", connection);
 			select.Parameters.AddWithValue("@name", portfolio.Name);
 
-			if (await select.ExecuteScalarAsync(cancellationToken) is int existingId)
-				return existingId;
+			return await select.ExecuteScalarAsync(cancellationToken) is int id ? id : null;
 		}
 
-		// currency isn't modeled on BusinessEntities.Portfolio the way it is on
-		// dbo.Portfolios, so newly auto-created rows always land on the column
-		// default ('USD') regardless of what the security/portfolio actually trades in
-		await using var insert = new SqlCommand(
-			"INSERT INTO dbo.Portfolios (name) OUTPUT INSERTED.portfolio_id VALUES (@name)", connection);
-		insert.Parameters.AddWithValue("@name", portfolio.Name);
+		// currency isn't modeled on BusinessEntities.Portfolio the way it is on dbo.Portfolios, so newly
+		// auto-created rows always land on the column default ('USD') regardless of what the
+		// security/portfolio actually trades in.
+		async Task<int> InsertNewAsync()
+		{
+			await using var insert = new SqlCommand(
+				"INSERT INTO dbo.Portfolios (name) OUTPUT INSERTED.portfolio_id VALUES (@name)", connection);
+			insert.Parameters.AddWithValue("@name", portfolio.Name);
 
-		return (int)await insert.ExecuteScalarAsync(cancellationToken);
+			return (int)await insert.ExecuteScalarAsync(cancellationToken);
+		}
+
+		return await EnsureRowAsync(SelectExistingAsync, InsertNewAsync, cancellationToken);
 	}
 
 	/// <summary>
 	/// Finds the SQL-side security_id for a <see cref="Security"/>, creating the row
 	/// if it doesn't exist yet. Matched by Code + Board.Code.
 	/// </summary>
+	/// <remarks>
+	/// <b>Concurrent-first-create convergence (finding DB-P5-02).</b> Like <see cref="EnsurePortfolioAsync"/>
+	/// this is a check-then-act upsert keyed on <c>UQ_Securities_code_board</c> (security_code + board_code).
+	/// Concurrent callers racing to create the same new security can both miss on the SELECT and race on the
+	/// INSERT; the loser hits a unique-key violation (2627/2601) and converges on the winner's committed
+	/// security_id by re-reading rather than leaking the <see cref="SqlException"/>. The method is idempotent
+	/// under concurrency and never creates a duplicate (security_code, board_code) row.
+	/// </remarks>
 	public async Task<int> EnsureSecurityAsync(Security security, CancellationToken cancellationToken = default)
 	{
 		if (security is null)
@@ -106,26 +133,33 @@ public class SqlLegacyOrderGateway
 		await using var connection = CreateConnection();
 		await connection.OpenAsync(cancellationToken);
 
-		await using (var select = new SqlCommand(
-			"""
-			SELECT security_id FROM dbo.Securities
-			WHERE security_code = @code AND (board_code = @board OR (@board IS NULL AND board_code IS NULL))
-			""", connection))
+		// Read used both for the initial lookup and for the post-conflict reconciliation below. The
+		// board_code predicate treats a null board as the single NULL row the UNIQUE constraint permits.
+		async Task<int?> SelectExistingAsync()
 		{
+			await using var select = new SqlCommand(
+				"""
+				SELECT security_id FROM dbo.Securities
+				WHERE security_code = @code AND (board_code = @board OR (@board IS NULL AND board_code IS NULL))
+				""", connection);
 			select.Parameters.AddWithValue("@code", security.Code);
 			select.Parameters.AddWithValue("@board", (object)boardCode ?? DBNull.Value);
 
-			if (await select.ExecuteScalarAsync(cancellationToken) is int existingId)
-				return existingId;
+			return await select.ExecuteScalarAsync(cancellationToken) is int id ? id : null;
 		}
 
-		await using var insert = new SqlCommand(
-			"INSERT INTO dbo.Securities (security_code, board_code, security_type) OUTPUT INSERTED.security_id VALUES (@code, @board, @type)", connection);
-		insert.Parameters.AddWithValue("@code", security.Code);
-		insert.Parameters.AddWithValue("@board", (object)boardCode ?? DBNull.Value);
-		insert.Parameters.AddWithValue("@type", (object)security.Type?.ToString() ?? DBNull.Value);
+		async Task<int> InsertNewAsync()
+		{
+			await using var insert = new SqlCommand(
+				"INSERT INTO dbo.Securities (security_code, board_code, security_type) OUTPUT INSERTED.security_id VALUES (@code, @board, @type)", connection);
+			insert.Parameters.AddWithValue("@code", security.Code);
+			insert.Parameters.AddWithValue("@board", (object)boardCode ?? DBNull.Value);
+			insert.Parameters.AddWithValue("@type", (object)security.Type?.ToString() ?? DBNull.Value);
 
-		return (int)await insert.ExecuteScalarAsync(cancellationToken);
+			return (int)await insert.ExecuteScalarAsync(cancellationToken);
+		}
+
+		return await EnsureRowAsync(SelectExistingAsync, InsertNewAsync, cancellationToken);
 	}
 
 	/// <summary>
@@ -351,6 +385,71 @@ public class SqlLegacyOrderGateway
 
 	// A SQL Server deadlock victim surfaces as SqlException with error number 1205.
 	private static bool IsDeadlockVictim(SqlException exception) => exception.Number == 1205;
+
+	// A unique-key violation surfaces as SqlException 2627 (violation of a UNIQUE CONSTRAINT, e.g.
+	// UQ_Portfolios_name / UQ_Securities_code_board) or 2601 (violation of a unique INDEX). Both mean
+	// another connection already committed a row with the same key; the Ensure* upserts treat either as a
+	// signal to converge on the existing row rather than to fail (finding DB-P5-02).
+	private static bool IsUniqueViolation(SqlException exception) => exception.Number is 2601 or 2627;
+
+	/// <summary>
+	/// Shared check-then-act upsert body for <see cref="EnsurePortfolioAsync"/> and
+	/// <see cref="EnsureSecurityAsync"/> that makes a first-create idempotent and race-safe (finding
+	/// DB-P5-02): it SELECTs the existing row and, only when absent, INSERTs it. The two callers differ
+	/// only in the SELECT/INSERT SQL, which they supply as the <paramref name="selectExisting"/> and
+	/// <paramref name="insertNew"/> delegates.
+	/// </summary>
+	/// <remarks>
+	/// Concurrency handling:
+	/// <list type="bullet">
+	/// <item><description>
+	/// <b>Lost unique-key race (2627/2601):</b> a concurrent caller committed the same key between our
+	/// SELECT and INSERT. The violation proves the row now exists and is committed (each attempt runs in
+	/// autocommit), so we converge by re-reading and returning the winner's id instead of surfacing the
+	/// exception. This needs no retry - the row is guaranteed present - so we return immediately; if the
+	/// re-read somehow finds nothing the original exception is rethrown rather than returning a bogus id.
+	/// </description></item>
+	/// <item><description>
+	/// <b>Transient deadlock (1205):</b> under heavy same-key INSERT contention SQL Server may pick this
+	/// connection as the deadlock victim. Because there is no wrapping transaction there is nothing to roll
+	/// back, so the whole check-then-act is simply retried on the same open connection after a brief,
+	/// increasing backoff - mirroring the bounded deadlock retry the fill path already uses
+	/// (<see cref="RecordTradeWithRetryAsync"/>). This is defense-in-depth: single-key autocommit inserts
+	/// rarely deadlock, and the retry is bounded so the method never hangs and rethrows once exhausted.
+	/// </description></item>
+	/// </list>
+	/// In the ordinary uncontended case the loop makes exactly one pass (SELECT-miss then INSERT), so the
+	/// helper adds no overhead outside a genuine race.
+	/// </remarks>
+	private static async Task<int> EnsureRowAsync(Func<Task<int?>> selectExisting, Func<Task<int>> insertNew, CancellationToken cancellationToken)
+	{
+		const int maxAttempts = 3;
+
+		for (var attempt = 1; ; attempt++)
+		{
+			if (await selectExisting() is int existingId)
+				return existingId;
+
+			try
+			{
+				return await insertNew();
+			}
+			catch (SqlException ex) when (IsUniqueViolation(ex))
+			{
+				// A concurrent caller won the unique-key race; converge on the committed winner's id.
+				if (await selectExisting() is int racedId)
+					return racedId;
+
+				// The conflict was on this exact key, so the row must be present; if not, rethrow.
+				throw;
+			}
+			catch (SqlException ex) when (IsDeadlockVictim(ex) && attempt < maxAttempts)
+			{
+				// Transient: retry the whole check-then-act after a brief, increasing backoff.
+				await Task.Delay(TimeSpan.FromMilliseconds(25 * attempt), cancellationToken);
+			}
+		}
+	}
 
 	/// <summary>
 	/// Records a fill against a SQL-side order and recomputes the affected position. The dbo.Trades

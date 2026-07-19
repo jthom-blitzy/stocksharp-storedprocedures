@@ -1390,6 +1390,16 @@ public class PositionRecalculationTests : BaseTestClass
 
 	// Inserts a portfolio+security-scoped RiskLimits row. Only the ceilings supplied are enforced; every
 	// other max_* column is left NULL ("not enforced"), and commission_rate takes the schema default.
+	//
+	// effective_date is seeded one second in the PAST (via the DB clock), NOT a bare SYSUTCDATETIME().
+	// A bare SYSUTCDATETIME() is stored rounded up to the DATETIME2(3) column scale, which can land a
+	// fraction of a millisecond AFTER the gate's immediately-following "effective_date <= SYSUTCDATETIME()"
+	// cutoff clock and spuriously exclude the just-seeded row - leaving the scope with NO applicable limit
+	// so a would-be-rejected order is instead accepted. This is a same-scope seed-then-query timing artifact
+	// that never occurs in production (limits are seeded long before orders arrive) and was observed as an
+	// intermittent false failure of Live_RejectedOrderCannotBeFilled under full-suite load. The one-second
+	// backdate makes the seeded row unambiguously already in force, matching the proven sibling helper
+	// Tests/PreTradeRiskServiceTests.cs InsertLimitsAsync.
 	private static async Task InsertRiskLimitsAsync(
 		SqlConnection c, SqlTransaction t, int portfolioId, int securityId,
 		decimal? price, decimal? position, decimal? daily)
@@ -1398,7 +1408,7 @@ public class PositionRecalculationTests : BaseTestClass
 			"""
 			INSERT INTO dbo.RiskLimits
 			  (portfolio_id, security_id, max_order_price, max_position_size, max_daily_volume, is_active, effective_date)
-			VALUES (@p, @s, @price, @pos, @daily, 1, SYSUTCDATETIME())
+			VALUES (@p, @s, @price, @pos, @daily, 1, DATEADD(SECOND, -1, SYSUTCDATETIME()))
 			""", c, t);
 
 		cmd.Parameters.Add(IntParam("@p", portfolioId));

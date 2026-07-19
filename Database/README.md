@@ -65,9 +65,20 @@ Wait for it to finish initializing (`docker logs stocksharp-legacy-sql | grep "R
 
 ```bash
 docker cp Database stocksharp-legacy-sql:/tmp/Database
+
+# Fresh-provision safe and fail-fast (findings INF-P6-01, INF-P6-02):
+#   * 001_Schema.sql runs against `master` - it CREATEs the StockSharpLegacy database if absent (in its
+#     own batch) and then USEs it; on a brand-new instance that database does not exist yet, so it must
+#     NOT be targeted with `-d StockSharpLegacy`.
+#   * 002-004 run against `StockSharpLegacy` (it exists by then; the scripts also self-`USE` it).
+#   * `-b` + `-V 11` make sqlcmd exit NON-ZERO on any SQL error (a Level-16 error such as a missing table
+#     would otherwise print its message but still exit 0), and the explicit `$?` check stops the loop on
+#     the first failed script so deployment never continues after - or claims success following - an error.
 for f in 001_Schema.sql 002_StoredProcedures.sql 003_Triggers.sql 004_SeedData.sql; do
+  if [ "$f" = "001_Schema.sql" ]; then db=master; else db=StockSharpLegacy; fi
   docker exec -e "SQLCMDPASSWORD=$MSSQL_SA_PASSWORD" stocksharp-legacy-sql \
-    /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -C -i "/tmp/Database/$f"
+    /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -C -b -V 11 -d "$db" -i "/tmp/Database/$f"
+  if [ $? -ne 0 ]; then echo "ERROR: $f failed to apply; aborting deployment." >&2; exit 1; fi
 done
 ```
 

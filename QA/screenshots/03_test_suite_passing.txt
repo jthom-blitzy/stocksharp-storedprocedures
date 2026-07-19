@@ -1,13 +1,13 @@
 ================================================================================
-Screenshot 03 - Targeted risk-consolidation suite: 196/196 passed
+Screenshot 03 - Targeted risk-consolidation suite: 201/201 passed
 ================================================================================
-Failed: 0, Passed: 196, Skipped: 0; raw log + full TRX retained in QA/logs/
+Failed: 0, Passed: 201, Skipped: 0; raw log + full TRX retained in QA/logs/
 
 Provenance
   Branch          : blitzy-e686e219-30ce-45cc-8608-8ea778391629
   Evidence commit : 84ec3e89112022fca414e61efb9b11b8e23b346f   (stamped here at the Phase-10 provenance commit; see QA/README.md)
-  Build/run TFM   : net10.0  (StockSharpTargets=net10.0; net6.0 is NOT a configured build target in this workspace)
-  Captured (UTC)  : 2026-07-17T20:18:37Z
+  Build/run TFM   : net10.0  (primary target; net6.0 is a supported compile target per AAP 0.5.1 with a documented, out-of-scope live-DB runtime limitation - CFG-P6-03)
+  Captured (UTC)  : 2026-07-19T07:46:47Z
   Source of truth : the raw machine logs / TRX under QA/logs/ (this file quotes them verbatim)
   Capture mode    : headless CI Linux container - no desktop/window-manager/video device; per AAP 0.6.7
                     the "screenshot" ships as this captioned text plus a faithful terminal-styled PNG
@@ -18,18 +18,18 @@ Test run for /tmp/blitzy/stocksharp-storedprocedures/blitzy-e686e219-30ce-45cc-8
 A total of 1 test files matched the specified pattern.
 Results File: /tmp/blitzy/stocksharp-storedprocedures/blitzy-e686e219-30ce-45cc-8608-8ea778391629_28a5ac/QA/logs/test_targeted_net10.0.trx
 
-Passed!  - Failed:     0, Passed:   196, Skipped:     0, Total:   196, Duration: 7 s - StockSharp.Tests.dll (net10.0)
+Passed!  - Failed:     0, Passed:   201, Skipped:     0, Total:   201, Duration: 7 s - StockSharp.Tests.dll (net10.0)
 
 # Per-class breakdown parsed from the genuine TRX (QA/logs/test_targeted_net10.0.trx):
 #   RiskTests 85
 #   CommissionTests 34
-#   PreTradeRiskServiceTests 40
-#   PositionRecalculationTests 37
+#   PreTradeRiskServiceTests 44
+#   PositionRecalculationTests 38
 #   -------------------------------
-#   TOTAL 196   (of which 47 are Live_* integration tests run against the real SQL Server 2022 container)
+#   TOTAL 201   (of which 51 are Live_* integration tests run against the real SQL Server 2022 container)
 #
 # Scope note (finding #21): this is the FOCUSED risk-consolidation suite - the four test classes
 # this refactor owns (RiskTests, CommissionTests, PreTradeRiskServiceTests, PositionRecalculationTests).
 # The full multi-project solution suite also contains external-dependency/integration tests outside
-# this refactor's scope; no full-solution pass/fail tally is claimed here - only this observed 196/196 run,
+# this refactor's scope; no full-solution pass/fail tally is claimed here - only this observed 201/201 run,
 # for which the complete raw TRX is retained under QA/logs/.

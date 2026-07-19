@@ -344,6 +344,23 @@ public class RiskLimitSet
 	/// (or are null/wildcard) are considered.
 	/// </summary>
 	/// <remarks>
+	/// <b>Deterministic, fail-closed tie resolution (finding DB-P5-01).</b> When two or more equally
+	/// specific rows share the <em>same</em> most-recent <see cref="EffectiveDate"/>, ordering by scope
+	/// specificity and effective date alone leaves the winner undetermined: the previous implementation
+	/// stopped at effective date and returned whichever row the candidate sequence (i.e. the database's
+	/// arbitrary, index-order-dependent row order) yielded first, so the same dataset could select
+	/// <c>max_order_price = 111</c> when inserted A→B and <c>222</c> when inserted B→A - a
+	/// nondeterministic choice that could silently pick the <em>looser</em> limit. This is resolved by
+	/// folding the tied rows into a single STRICTEST canonical set via <see cref="ComposeStrictest"/>:
+	/// the result is identical regardless of input order (each field takes the strictest tied value, and
+	/// min/max are order-independent) and is provably at-least-as-strict as every tied row, honouring the
+	/// AAP mandate (§0.6.1, §0.7.1) that a reconciled rule "must never be less strict than the stricter of
+	/// the two originals". A conflicting scope+effective-date tie is a configuration ambiguity, so failing
+	/// toward the most restrictive interpretation is the correct fail-closed behaviour. When exactly one
+	/// row wins outright (the ordinary case) it is returned unchanged, so this adds no behaviour change
+	/// outside a genuine tie.
+	/// </remarks>
+	/// <remarks>
 	/// When <paramref name="nowUtc"/> is supplied, rows whose <see cref="EffectiveDate"/> is in the
 	/// future relative to that instant are excluded, so a limit set scheduled to take effect later cannot
 	/// supersede the current row before its effective date. This is the injectable analogue of the
@@ -372,16 +389,137 @@ public class RiskLimitSet
 		if (candidates is null)
 			throw new ArgumentNullException(nameof(candidates));
 
-		return candidates
+		// Scope-specificity rank: portfolio+security (0) outranks portfolio-only (1), which outranks
+		// security-only / global (2) - the same precedence dbo.usp_ValidatePreTradeRisk applied.
+		static int SpecificityRank(RiskLimitSet c) =>
+			c.PortfolioId is not null && c.SecurityId is not null ? 0
+			: c.PortfolioId is not null ? 1
+			: 2;
+
+		var applicable = candidates
 			.Where(c => c is not null
 				&& c.IsActive
 				&& (c.PortfolioId == portfolioId || c.PortfolioId is null)
 				&& (c.SecurityId == securityId || c.SecurityId is null)
 				&& (nowUtc is null || c.EffectiveDate <= nowUtc.Value))
-			.OrderBy(c => c.PortfolioId is not null && c.SecurityId is not null ? 0
-				: c.PortfolioId is not null ? 1
-				: 2)
-			.ThenByDescending(c => c.EffectiveDate)
-			.FirstOrDefault();
+			.ToList();
+
+		if (applicable.Count == 0)
+			return null;
+
+		// The winning bucket is the most-specific rank and, within it, the most recent effective date -
+		// exactly what OrderBy(rank).ThenByDescending(EffectiveDate) picked before. Computing it
+		// explicitly lets us detect a residual tie (multiple rows sharing that rank AND date) instead of
+		// silently taking the first in an arbitrary sequence.
+		var bestRank = applicable.Min(SpecificityRank);
+		var tier = applicable.Where(c => SpecificityRank(c) == bestRank).ToList();
+		var bestDate = tier.Max(c => c.EffectiveDate);
+		var winners = tier.Where(c => c.EffectiveDate == bestDate).ToList();
+
+		// Ordinary case: a single row wins outright - return it unchanged (no behaviour change).
+		if (winners.Count == 1)
+			return winners[0];
+
+		// DB-P5-01: an equally-specific, equally-dated tie. Resolve it deterministically and fail-closed
+		// by composing the strictest tied row so selection never depends on candidate/row order and is
+		// never less strict than any tied definition.
+		return ComposeStrictest(winners, portfolioId, securityId, bestDate);
+	}
+
+	/// <summary>
+	/// Folds a set of tied, equally-specific, equally-dated limit rows (finding DB-P5-01) into one
+	/// canonical <see cref="RiskLimitSet"/> whose every threshold is the <b>strictest</b> among the tied
+	/// rows. The result is deterministic (order-independent, because min/max are commutative) and provably
+	/// at-least-as-strict as each input row, so a scope+date tie can never yield a looser limit than any of
+	/// the definitions it reconciles.
+	/// </summary>
+	/// <remarks>
+	/// Per-field strictness direction:
+	/// <list type="bullet">
+	/// <item><description>
+	/// Ceilings (price, qty, notional value, position size, daily volume, commission total): the smallest
+	/// <see cref="IsCeilingEnforced(decimal?)">enforced</see> value wins; a null/non-positive ("not
+	/// enforced") value is ignored, and a ceiling no tied row enforces stays unenforced.
+	/// </description></item>
+	/// <item><description>
+	/// Order-frequency: strictest is the smallest count paired with the largest window. A smaller count
+	/// rejects at fewer orders and a longer window counts more orders, so <c>(minCount, maxWindow)</c>
+	/// rejects at least whenever any individual <c>(count, window)</c> pair would. Only
+	/// <see cref="IsFrequencyEnforced">enforced</see> pairs participate, and count/window are always
+	/// carried together so the composed pair is never malformed.
+	/// </description></item>
+	/// <item><description>
+	/// Commission rate: a <em>higher</em> rate is stricter because it inflates the pre-fill commission
+	/// estimate (which then reaches <see cref="MaxCommissionTotal"/> sooner), so the maximum rate wins.
+	/// </description></item>
+	/// </list>
+	/// The composed set carries the tied rows' shared scope (their <see cref="EffectiveDate"/> and the
+	/// most-specific scope keys) and is <see cref="IsActive"/>; it therefore passes <see cref="Validate"/>
+	/// like any real row.
+	/// </remarks>
+	/// <param name="tied">The two-or-more tied rows to reconcile. Must be non-empty.</param>
+	/// <param name="portfolioId">The portfolio identifier the selection was made for.</param>
+	/// <param name="securityId">The security identifier the selection was made for.</param>
+	/// <param name="effectiveDate">The shared effective date of the tied rows.</param>
+	/// <returns>A single canonical limit set that is the strictest reconciliation of the tied rows.</returns>
+	private static RiskLimitSet ComposeStrictest(IReadOnlyList<RiskLimitSet> tied, int portfolioId, int securityId, DateTime effectiveDate)
+	{
+		// Strictest ceiling = the smallest ENFORCED value across the tied rows (null/non-positive means
+		// "not enforced" and is skipped); stays null when no tied row enforces it.
+		static decimal? StrictestCeiling(IReadOnlyList<RiskLimitSet> rows, Func<RiskLimitSet, decimal?> selector)
+		{
+			decimal? strictest = null;
+
+			foreach (var row in rows)
+			{
+				var value = selector(row);
+
+				if (IsCeilingEnforced(value) && (strictest is null || value.Value < strictest.Value))
+					strictest = value;
+			}
+
+			return strictest;
+		}
+
+		// Frequency: min enforced count, max enforced window (see remarks). Both are set together or not
+		// at all, so the composed pair is coherent (never a half-specified/malformed pair).
+		int? strictestCount = null;
+		int? strictestWindow = null;
+
+		foreach (var row in tied)
+		{
+			if (!row.IsFrequencyEnforced)
+				continue;
+
+			var count = row.MaxOrderFreqCount.Value;
+			var window = row.MaxOrderFreqWindowSeconds.Value;
+
+			strictestCount = strictestCount is null ? count : Math.Min(strictestCount.Value, count);
+			strictestWindow = strictestWindow is null ? window : Math.Max(strictestWindow.Value, window);
+		}
+
+		return new RiskLimitSet
+		{
+			// The composed set represents the winning tier's scope. Within a rank the portfolio key is
+			// uniform; the security key is the concrete securityId when any tied row is security-scoped,
+			// otherwise the null/global wildcard.
+			PortfolioId = tied[0].PortfolioId is null ? null : portfolioId,
+			SecurityId = tied.Any(r => r.SecurityId is not null) ? securityId : null,
+			IsActive = true,
+			EffectiveDate = effectiveDate,
+
+			MaxOrderPrice = StrictestCeiling(tied, r => r.MaxOrderPrice),
+			MaxOrderQty = StrictestCeiling(tied, r => r.MaxOrderQty),
+			MaxOrderValue = StrictestCeiling(tied, r => r.MaxOrderValue),
+			MaxPositionSize = StrictestCeiling(tied, r => r.MaxPositionSize),
+			MaxDailyVolume = StrictestCeiling(tied, r => r.MaxDailyVolume),
+			MaxCommissionTotal = StrictestCeiling(tied, r => r.MaxCommissionTotal),
+
+			MaxOrderFreqCount = strictestCount,
+			MaxOrderFreqWindowSeconds = strictestWindow,
+
+			// Higher commission rate = stricter estimate (see remarks); take the maximum.
+			CommissionRate = tied.Max(r => r.CommissionRate),
+		};
 	}
 }

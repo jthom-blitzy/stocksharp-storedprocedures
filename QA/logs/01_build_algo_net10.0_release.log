@@ -3,9 +3,9 @@
   Localization.Generator -> /tmp/blitzy/stocksharp-storedprocedures/blitzy-e686e219-30ce-45cc-8608-8ea778391629_28a5ac/Localization.Generator/bin/Release/netstandard2.0/StockSharp.Localization.Generator.dll
   Localization -> /tmp/blitzy/stocksharp-storedprocedures/blitzy-e686e219-30ce-45cc-8608-8ea778391629_28a5ac/Localization/bin/Release/net10.0/StockSharp.Localization.dll
   Messages -> /tmp/blitzy/stocksharp-storedprocedures/blitzy-e686e219-30ce-45cc-8608-8ea778391629_28a5ac/Messages/bin/Release/net10.0/StockSharp.Messages.dll
+  BusinessEntities -> /tmp/blitzy/stocksharp-storedprocedures/blitzy-e686e219-30ce-45cc-8608-8ea778391629_28a5ac/BusinessEntities/bin/Release/net10.0/StockSharp.BusinessEntities.dll
   Configuration -> /tmp/blitzy/stocksharp-storedprocedures/blitzy-e686e219-30ce-45cc-8608-8ea778391629_28a5ac/Configuration/bin/Release/net10.0/StockSharp.Configuration.dll
   Reporting -> /tmp/blitzy/stocksharp-storedprocedures/blitzy-e686e219-30ce-45cc-8608-8ea778391629_28a5ac/Reporting/bin/Release/net10.0/StockSharp.Reporting.dll
-  BusinessEntities -> /tmp/blitzy/stocksharp-storedprocedures/blitzy-e686e219-30ce-45cc-8608-8ea778391629_28a5ac/BusinessEntities/bin/Release/net10.0/StockSharp.BusinessEntities.dll
   Charting.Interfaces -> /tmp/blitzy/stocksharp-storedprocedures/blitzy-e686e219-30ce-45cc-8608-8ea778391629_28a5ac/Charting.Interfaces/bin/Release/net10.0/StockSharp.Charting.Interfaces.dll
 /tmp/blitzy/stocksharp-storedprocedures/blitzy-e686e219-30ce-45cc-8608-8ea778391629_28a5ac/Algo/TraderHelper.cs(1196,6): warning CS0618: 'CompressionHelper.Uncompress<TCompressStream>(byte[], int?, int?, int)' is obsolete: 'Blocking sync-over-async wrapper. Use UncompressAsync instead.' [/tmp/blitzy/stocksharp-storedprocedures/blitzy-e686e219-30ce-45cc-8608-8ea778391629_28a5ac/Algo/Algo.csproj::TargetFramework=net10.0]
 /tmp/blitzy/stocksharp-storedprocedures/blitzy-e686e219-30ce-45cc-8608-8ea778391629_28a5ac/Algo/Storages/Csv/CsvEntityList.cs(157,11): warning CS0618: 'CompressionHelper.Compress<TCompressStream>(byte[], int?, int?, CompressionLevel, int)' is obsolete: 'Blocking sync-over-async wrapper. Use CompressAsync instead.' [/tmp/blitzy/stocksharp-storedprocedures/blitzy-e686e219-30ce-45cc-8608-8ea778391629_28a5ac/Algo/Algo.csproj::TargetFramework=net10.0]
@@ -18,4 +18,4 @@ Build succeeded.
     2 Warning(s)
     0 Error(s)
 
-Time Elapsed 00:00:12.61
+Time Elapsed 00:00:14.37

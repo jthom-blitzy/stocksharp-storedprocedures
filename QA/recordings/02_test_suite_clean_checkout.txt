@@ -6,8 +6,8 @@ Substitution for 02_test_suite_clean_checkout.mp4 (screen-only, target < 5:00) -
 Provenance
   Branch          : blitzy-e686e219-30ce-45cc-8608-8ea778391629
   Evidence commit : 84ec3e89112022fca414e61efb9b11b8e23b346f   (stamped here at the Phase-10 provenance commit; see QA/README.md)
-  Build/run TFM   : net10.0  (StockSharpTargets=net10.0; net6.0 is NOT a configured build target in this workspace)
-  Captured (UTC)  : 2026-07-17T20:18:37Z
+  Build/run TFM   : net10.0  (primary target; net6.0 is a supported compile target per AAP 0.5.1 with a documented, out-of-scope live-DB runtime limitation - CFG-P6-03)
+  Captured (UTC)  : 2026-07-19T07:46:47Z
   Source of truth : the raw machine logs / TRX under QA/logs/ (this file quotes them verbatim)
   Capture mode    : headless CI Linux container - no desktop/window-manager/video device; per AAP 0.6.7
                     the "screenshot" ships as this captioned text plus a faithful terminal-styled PNG
@@ -19,21 +19,21 @@ Each frame is a faithful terminal-styled rendering of the real, unaltered comman
 content named in QA/logs/ (for logs) or the repository (for code). No photographic/screenshot claim.
 
 WHAT THIS RECORDING PROVES
-The FOCUSED risk-consolidation suite passes all-green: 196 passed / 0 failed / 0 skipped across the FOUR
+The FOCUSED risk-consolidation suite passes all-green: 201 passed / 0 failed / 0 skipped across the FOUR
 test classes this refactor owns - the NEW Tests/PreTradeRiskServiceTests.cs and Tests/PositionRecalculationTests.cs
 and the UPDATED Tests/RiskTests.cs and Tests/CommissionTests.cs.
-47 of the 196 are Live_* tests that run against the real SQL Server 2022 container. This is the automated
+51 of the 201 are Live_* tests that run against the real SQL Server 2022 container. This is the automated
 coverage that makes the SQL->C# consolidation verifiable (the legacy custom SQL layer previously had none).
-Scope note (finding #21): no full-solution tally is claimed - only this observed 196/196 run, whose complete
+Scope note (finding #21): no full-solution tally is claimed - only this observed 201/201 run, whose complete
 raw TRX is retained under QA/logs/.
 
 CAPTION TRACK  (screen-only; runs under five minutes: [00:00] -> [~04:40])
   [00:00]  (-> frame _01)
           Build Tests (net10.0 Release): 0 Error(s) (QA/logs/02_build_tests_net10.0_release.log).
   [01:30]  (-> frame _02)
-          Run the four-class filter against live SQL: Passed! Failed 0 / Passed 196 (QA/logs/04_*.log).
+          Run the four-class filter against live SQL: Passed! Failed 0 / Passed 201 (QA/logs/04_*.log).
   [03:10]  (-> frame _03)
-          Per-class tally from the TRX: RiskTests 85, CommissionTests 34, PreTradeRiskServiceTests 40, PositionRecalculationTests 37.
+          Per-class tally from the TRX: RiskTests 85, CommissionTests 34, PreTradeRiskServiceTests 44, PositionRecalculationTests 38.
 
 FRAME INDEX  (3 frames)
   02_test_suite_clean_checkout_01.png

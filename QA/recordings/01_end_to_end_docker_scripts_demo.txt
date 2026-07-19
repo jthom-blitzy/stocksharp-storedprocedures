@@ -6,8 +6,8 @@ Substitution for 01_end_to_end_docker_scripts_demo.mp4 (screen-only, target < 5:
 Provenance
   Branch          : blitzy-e686e219-30ce-45cc-8608-8ea778391629
   Evidence commit : 84ec3e89112022fca414e61efb9b11b8e23b346f   (stamped here at the Phase-10 provenance commit; see QA/README.md)
-  Build/run TFM   : net10.0  (StockSharpTargets=net10.0; net6.0 is NOT a configured build target in this workspace)
-  Captured (UTC)  : 2026-07-17T20:18:37Z
+  Build/run TFM   : net10.0  (primary target; net6.0 is a supported compile target per AAP 0.5.1 with a documented, out-of-scope live-DB runtime limitation - CFG-P6-03)
+  Captured (UTC)  : 2026-07-19T07:46:47Z
   Source of truth : the raw machine logs / TRX under QA/logs/ (this file quotes them verbatim)
   Capture mode    : headless CI Linux container - no desktop/window-manager/video device; per AAP 0.6.7
                     the "screenshot" ships as this captioned text plus a faithful terminal-styled PNG
@@ -25,7 +25,7 @@ count, AAP 0.6.1; a non-positive ceiling means "not enforced" under the NULL/0 c
 (1) the container comes up healthy ('Recovery is complete');
 (2) scripts 001->004 apply in run order (exit=0 each), after which SQL is pure storage - 0 stored
     procedures, 1 audit-only trigger, no thresholds / accept-reject / P&L math in SQL;
-(3) a clean net10.0 Release build (0 errors); (4) the focused suite is green (196/196, live SQL);
+(3) a clean net10.0 Release build (0 errors); (4) the focused suite is green (201/201, live SQL);
 (5) the console demo reproduces the THREE outcomes - order ACCEPTED within limits, order REJECTED by
     the seeded max_order_price ceiling, and a recorded trade that RECOMPUTES the position in C#.
 
@@ -37,7 +37,7 @@ CAPTION TRACK  (screen-only; runs under five minutes: [00:00] -> [~04:40])
   [02:00]  (-> frame _03)
           dotnet build -c Release -f net10.0 -> Build succeeded, 0 Error(s) (QA/logs/01_build_algo_net10.0_release.log).
   [02:55]  (-> frame _04)
-          Targeted suite: Passed! Failed 0 / Passed 196 / Skipped 0 (QA/logs/04_test_targeted_net10.0.log + .trx).
+          Targeted suite: Passed! Failed 0 / Passed 201 / Skipped 0 (QA/logs/04_test_targeted_net10.0.log + .trx).
   [03:45]  (-> frame _05)
           Demo prints the three outcomes and seeds the circuit breaker (8 rules) from the same canonical RiskLimitSet.
 

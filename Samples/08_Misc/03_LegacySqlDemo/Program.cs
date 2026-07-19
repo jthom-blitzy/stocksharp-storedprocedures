@@ -27,7 +27,14 @@ using StockSharp.Messages;
 /// </summary>
 class Program
 {
-	static async Task Main()
+	/// <summary>
+	/// Runs the end-to-end walkthrough and returns a process exit code so an orchestrator or CI can tell
+	/// success from failure (finding INF-P6-04): <c>0</c> when the three observable outcomes all reproduced,
+	/// <c>1</c> when the database could not be reached / provisioned (the caught fatal error), and <c>2</c>
+	/// when the compliant order #1 was unexpectedly rejected so the fill and position outcomes could not run.
+	/// </summary>
+	/// <returns>The process exit code: 0 on success, non-zero on failure.</returns>
+	static async Task<int> Main()
 	{
 		var connectionString = SqlLegacyConnection.Resolve();
 		var gateway = new SqlLegacyOrderGateway(connectionString);
@@ -41,9 +48,10 @@ class Program
 		// this single try/catch (QA finding: canonical-fallback demo smoke). If the StockSharpLegacy database
 		// cannot be reached, OR its schema predates an object this build depends on (for example a shared or
 		// pre-provisioned instance left by an earlier build against which the current Database/001-004 scripts
-		// were never re-applied), the demo prints one guiding message and exits cleanly instead of terminating
-		// with an unhandled exception. On a correctly provisioned database the three observable outcomes
-		// (accept / reject-by-price / trade-recomputes-position) are unchanged.
+		// were never re-applied), the demo prints one guiding message and exits with a NON-ZERO status - a
+		// controlled failure signal rather than an unhandled exception - so an orchestrator/CI detects it
+		// (finding INF-P6-04). On a correctly provisioned database the three observable outcomes
+		// (accept / reject-by-price / trade-recomputes-position) are unchanged and the program returns 0.
 		try
 		{
 			var portfolioId = await gateway.EnsurePortfolioAsync(portfolio);
@@ -107,7 +115,15 @@ class Program
 			Console.WriteLine();
 
 			if (!order1.IsValid)
-				return;
+			{
+				// The compliant order #1 (BUY 100 @ 150, within every seeded ceiling) is expected to be
+				// ACCEPTED on a correctly provisioned database. If it was rejected, the demo cannot record a
+				// fill or show the recomputed position, so its expected outcomes were NOT reproduced. Exit
+				// non-zero (finding INF-P6-04) so an orchestrator/CI sees the anomaly instead of a false success.
+				Console.WriteLine($"Compliant order #1 was unexpectedly rejected ({order1.RejectReason ?? "(no reason)"}); " +
+					"the demo could not complete its trade/position outcomes.");
+				return 2;
+			}
 
 			// --- record a fill against the accepted order; RecordTradeAsync inserts the trade and then
 			//     invokes PositionRecalculationService once to recompute dbo.Positions in C# ---
@@ -116,15 +132,21 @@ class Program
 
 			var position = await gateway.GetPositionAsync(portfolioId, securityId);
 			Console.WriteLine($"  -> position after C# recompute: qty={position.Quantity} avg_price={position.AveragePrice} realized_pnl={position.RealizedPnL}");
+
+			// All three observable outcomes reproduced (accept / reject-by-price / trade-recomputes-position):
+			// signal success so an orchestrator/CI can distinguish a good run from a failure (finding INF-P6-04).
+			return 0;
 		}
 		catch (Exception ex)
 		{
 			Console.WriteLine($"Could not reach StockSharpLegacy ({ex.Message}).");
 			Console.WriteLine("See Database/README.md for how to stand up the SQL Server instance this demo needs");
 			Console.WriteLine("and to (re)apply the 001-004 scripts so its schema matches this build.");
-			return;
-		}
 
+			// A fatal, unrecoverable failure (unreachable/misprovisioned database): exit non-zero rather than
+			// returning 0, so the failure is not silently reported as success (finding INF-P6-04).
+			return 1;
+		}
 	}
 
 	/// <summary>

@@ -1,14 +1,3 @@
-# StockSharpLegacy SQL->C# risk-consolidation — QA environment capture
-# Captured (UTC): 2026-07-17T20:18:37Z
-# NOTE: git HEAD below is the PRE-remediation-commit tree; the final evidence commit hash is stamped in QA/README.md after the Phase-10 commit.
-# Working-tree HEAD at capture: cd266cd4b917c178c2978c42c7c84a8bb7389ad1
-# Branch: blitzy-e686e219-30ce-45cc-8608-8ea778391629
-
-## dotnet --version
-10.0.302
-
-## dotnet build target (Algo StockSharpTargets)
-
-
-## docker ps (SQL container)
-stocksharp-legacy-sql | Up 7 hours | 127.0.0.1:14330->1433/tcp | mcr.microsoft.com/mssql/server:2022-latest
+# Environment capture (UTC): 2026-07-19T07:12:01Z
+dotnet --version = 10.0.302
+container: stocksharp-legacy-sql Up 7 hours 127.0.0.1:14330->1433/tcp
